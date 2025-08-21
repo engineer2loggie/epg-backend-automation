@@ -47,101 +47,103 @@ def parse_xmltv_datetime(dt_str):
 
 def fetch_and_process_epg(supabase: Client):
     """Fetches, parses, and upserts EPG data into Supabase."""
-    print(f"🚀 Starting EPG update process...")
-    print(f"📡 Fetching EPG data from {IPTV_ORG_EPG_URL}...")
-    
-    try:
-        response = requests.get(IPTV_ORG_EPG_URL, stream=True, timeout=60)
-        response.raise_for_status()
+    print("🚀 Starting EPG update process...")
 
-        with gzip.GzipFile(fileobj=response.raw) as f:
-            xml_content = f.read()
+    # Your list of EPG filenames
+    epg_filenames = [
+        "9tv.co.il.channels.xml",
+        "allente.dk.channels.xml",
+        # Add all other filenames from SITES.md here
+    ]
+
+    all_channels_to_upsert = []
+    all_programs_to_upsert = []
+    valid_channel_ids = set()
+
+    # Loop through each URL
+    for filename in epg_filenames:
+        full_url = BASE_URL + filename
+        is_gzipped = filename.endswith('.gz')
         
-        print("✅ Successfully downloaded and decompressed EPG data.")
-        root = ET.fromstring(xml_content)
+        print(f"\n📡 Fetching EPG data from {full_url}...")
         
-        # --- Process Channels ---
-        print("\n--- Processing Channels ---")
-        channels_to_upsert = []
-        valid_channel_ids = set()
-        for channel_node in root.findall('channel'):
-            try:
+        try:
+            response = requests.get(full_url, stream=True, timeout=60)
+            response.raise_for_status()
+
+            if is_gzipped:
+                # Decompress gzipped content
+                with gzip.GzipFile(fileobj=response.raw) as f:
+                    xml_content = f.read()
+            else:
+                # Read regular XML content
+                xml_content = response.content
+            
+            print("✅ Successfully downloaded and decompressed/read EPG data.")
+            root = ET.fromstring(xml_content)
+
+            # --- Process Channels from this file ---
+            for channel_node in root.findall('channel'):
                 channel_id = channel_node.get('id')
                 display_name_node = channel_node.find('display-name')
                 icon_node = channel_node.find('icon')
-
-                if channel_id and display_name_node is not None and display_name_node.text:
-                    channels_to_upsert.append({
+                if channel_id and channel_id not in valid_channel_ids and display_name_node is not None and display_name_node.text:
+                    all_channels_to_upsert.append({
                         'id': channel_id,
                         'display_name': display_name_node.text,
                         'icon_url': icon_node.get('src') if icon_node is not None else None
                     })
                     valid_channel_ids.add(channel_id)
-            except Exception as e:
-                print(f"⚠️ WARNING: Skipping malformed channel node. Error: {e}")
-        
-        if channels_to_upsert:
-            print(f"Found {len(channels_to_upsert)} channels. Upserting to Supabase...")
-            try:
-                supabase.table('channels').upsert(channels_to_upsert).execute()
-                print("✅ Channels upserted successfully.")
-            except Exception as e:
-                print(f"❌ ERROR: Failed to upsert channels: {e}", file=sys.stderr)
-        else:
-            print("🟡 No channels found to process.")
 
-        # --- Process Programs ---
-        print("\n--- Processing Programs ---")
-        programs_to_upsert = []
-        total_programs_found = 0
-        for program_node in root.findall('programme'):
-            total_programs_found += 1
-            try:
+            # --- Process Programs from this file ---
+            for program_node in root.findall('programme'):
                 channel_id = program_node.get('channel')
-                # CRITICAL FIX: Only process programs for channels that we know are valid.
-                if channel_id not in valid_channel_ids:
-                    continue
-
                 start_dt = parse_xmltv_datetime(program_node.get('start'))
                 end_dt = parse_xmltv_datetime(program_node.get('stop'))
-                
+
                 if not start_dt or not end_dt:
                     continue
 
                 title_node = program_node.find('title')
                 desc_node = program_node.find('desc')
                 
-                # Create a unique ID for each program to enable upserting
+                # Create a unique ID for each program
                 program_id = f"{channel_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
-                
-                programs_to_upsert.append({
-                    'id': program_id, # Using a generated primary key for upsert
+
+                all_programs_to_upsert.append({
+                    'id': program_id,
                     'channel_id': channel_id,
                     'start_time': start_dt.isoformat(),
                     'end_time': end_dt.isoformat(),
                     'title': title_node.text if title_node is not None else 'No Title',
                     'description': desc_node.text if desc_node is not None else None
                 })
-            except Exception as e:
-                print(f"⚠️ WARNING: Skipping malformed program node. Error: {e}")
+        
+        except requests.exceptions.RequestException as e:
+            print(f"❌ ERROR: Failed to fetch EPG data from {full_url}: {e}", file=sys.stderr)
+            continue # Skip to the next URL on failure
+        except ET.ParseError as e:
+            print(f"❌ ERROR: Failed to parse XML data from {full_url}: {e}", file=sys.stderr)
+            continue # Skip to the next URL on failure
+    
+    # --- Bulk Upsert Channels and Programs ---
+    if all_channels_to_upsert:
+        print(f"\n--- Upserting {len(all_channels_to_upsert)} Channels ---")
+        try:
+            supabase.table('channels').upsert(all_channels_to_upsert).execute()
+            print("✅ Channels upserted successfully.")
+        except Exception as e:
+            print(f"❌ ERROR: Failed to upsert channels: {e}", file=sys.stderr)
 
-        print(f"Found {total_programs_found} total programs in file.")
-        if programs_to_upsert:
-            print(f"Processing {len(programs_to_upsert)} valid programs.")
-            
-            print(" Upserting new program data in batches...")
-            # For programs, we need to add a primary key column named 'id' (text) to the table
-            # in Supabase for upsert to work correctly.
-            batch_size = 400 # Smaller batch size for upsert
-            for i in range(0, len(programs_to_upsert), batch_size):
-                batch = programs_to_upsert[i:i + batch_size]
-                try:
-                    supabase.table('programs').upsert(batch, on_conflict='id').execute()
-                    print(f"  - Batch {i//batch_size + 1} upserted successfully.")
-                except Exception as e:
-                    print(f"❌ ERROR: Failed to upsert program batch {i//batch_size + 1}: {e}", file=sys.stderr)
-        else:
-            print("🟡 No valid programs found to process.")
+    if all_programs_to_upsert:
+        print(f"\n--- Upserting {len(all_programs_to_upsert)} Programs ---")
+        try:
+            supabase.table('programs').upsert(all_programs_to_upsert).execute()
+            print("✅ Programs upserted successfully.")
+        except Exception as e:
+            print(f"❌ ERROR: Failed to upsert programs: {e}", file=sys.stderr)
+    
+    print("\n✅ EPG update process completed!")
 
         # --- Cleanup Old Programs ---
         print("\n--- Cleaning up old programs ---")
