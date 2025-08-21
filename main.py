@@ -62,7 +62,7 @@ def fetch_and_process_epg(supabase: Client):
     valid_channel_ids = set()
 
     # Loop through each EPG URL and process it
-    for url in EPG_URLS: # Changed 'epg_filenames' to 'EPG_URLS'
+    for url in EPG_URLS: # Your loop variable is named 'url'
         is_gzipped = url.endswith('.gz')
         
         print(f"\n📡 Fetching EPG data from {url}...")
@@ -72,14 +72,14 @@ def fetch_and_process_epg(supabase: Client):
             response.raise_for_status()
 
             if is_gzipped:
-                # Decompress gzipped content
                 with gzip.GzipFile(fileobj=response.raw) as f:
                     xml_content = f.read()
             else:
-                # Read regular XML content
                 xml_content = response.content
             
-            print(f"✅ Successfully downloaded data from {filename}.")
+            # This is the line you need to change.
+            # Change 'filename' to 'url'.
+            print(f"✅ Successfully downloaded data from {url}.")
             root = ET.fromstring(xml_content)
 
             # --- Process Channels from this file ---
