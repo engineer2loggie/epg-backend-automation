@@ -10,12 +10,12 @@ import sys
 # --- Configuration ---
 # Your list of EPG filenames from https://github.com/iptv-org/epg/blob/master/SITES.md
 IPTV_ORG_EPG_FILENAMES = [
-    "https://github.com/iptv-org/epg/blob/master/sites/9tv.co.il/9tv.co.il.channels.xml",
-    "https://github.com/iptv-org/epg/blob/master/sites/abc.net.au/abc.net.au_adl.channels.xml",
+    "9tv.co.il/9tv.co.il.channels.xml",
+    "abc.net.au/abc.net.au_adl.channels.xml",
 ]
 
 # The base URL for IPTV-org EPG guides
-BASE_URL = "https://iptv-org.github.io/epg/guides/"
+BASE_URL = "https://github.com/iptv-org/epg/blob/master/sites/"
 
 # --- Supabase Configuration ---
 # These will be loaded from environment variables (GitHub Secrets)
