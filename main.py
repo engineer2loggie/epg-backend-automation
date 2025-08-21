@@ -9,13 +9,20 @@ import sys
 
 # --- Configuration ---
 # Your list of EPG filenames from https://github.com/iptv-org/epg/blob/master/SITES.md
-IPTV_ORG_EPG_FILENAMES = [
-    "9tv.co.il/9tv.co.il.channels.xml",
-    "abc.net.au/abc.net.au_adl.channels.xml",
+EPG_URLS = [
+    "https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_ES1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_CA1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_DE1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_IT1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_IE1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_CO1.xml.gz",
+    "https://epgshare01.online/epgshare01/epg_ripper_AU1.xml.gz",
 ]
 
-# The base URL for IPTV-org EPG guides
-BASE_URL = "https://github.com/iptv-org/epg/blob/master/sites/"
+
 
 # --- Supabase Configuration ---
 # These will be loaded from environment variables (GitHub Secrets)
@@ -54,15 +61,14 @@ def fetch_and_process_epg(supabase: Client):
     all_programs_to_upsert = []
     valid_channel_ids = set()
 
-    # Loop through each EPG filename and process it
-    for filename in IPTV_ORG_EPG_FILENAMES:
-        full_url = BASE_URL + filename
-        is_gzipped = filename.endswith('.gz')
+    # Loop through each EPG URL and process it
+    for url in EPG_URLS: # Changed 'epg_filenames' to 'EPG_URLS'
+        is_gzipped = url.endswith('.gz')
         
-        print(f"\n📡 Fetching EPG data from {full_url}...")
+        print(f"\n📡 Fetching EPG data from {url}...")
         
         try:
-            response = requests.get(full_url, stream=True, timeout=60)
+            response = requests.get(url, stream=True, timeout=60)
             response.raise_for_status()
 
             if is_gzipped:
