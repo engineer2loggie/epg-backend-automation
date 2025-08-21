@@ -35,12 +35,13 @@ def initialize_supabase_client():
 def parse_xmltv_datetime(dt_str):
     """Parses the unique XMLTV datetime format into a timezone-aware datetime object."""
     try:
+        # Some XMLTV formats have a space before the timezone, this handles that.
         if ' ' in dt_str:
             parts = dt_str.rsplit(' ', 1)
             dt_str = ''.join(parts)
         return datetime.strptime(dt_str, '%Y%m%d%H%M%S%z')
     except (ValueError, TypeError):
-        return None # Return None if format is invalid
+        return None  # Return None if format is invalid
 
 def fetch_and_process_epg(supabase: Client):
     """Fetches, parses, and upserts EPG data into Supabase."""
@@ -48,6 +49,7 @@ def fetch_and_process_epg(supabase: Client):
 
     all_channels_to_upsert = []
     all_programs_to_upsert = []
+    valid_channel_ids = set()
 
     # Loop through each EPG URL and process it
     for url in EPG_URLS:
@@ -61,7 +63,7 @@ def fetch_and_process_epg(supabase: Client):
             if url.endswith('.gz'):
                 with gzip.GzipFile(fileobj=response.raw) as f:
                     context = ET.iterparse(f, events=('start', 'end'))
-                    # Skip the root element
+                    # Skip the root element to start parsing on child elements
                     event, root = next(context)
             else:
                 context = ET.iterparse(response.raw, events=('start', 'end'))
@@ -80,20 +82,28 @@ def fetch_and_process_epg(supabase: Client):
                         icon_node = elem.find('icon')
 
                         if channel_id and display_name_node is not None and display_name_node.text:
-                            all_channels_to_upsert.append({
-                                'id': channel_id,
-                                'display_name': display_name_node.text,
-                                'icon_url': icon_node.get('src') if icon_node is not None else None
-                            })
-                            channels_in_this_file += 1
-                        elem.clear() # Clear the element to free memory
+                            # Avoid adding duplicate channels
+                            if channel_id not in valid_channel_ids:
+                                all_channels_to_upsert.append({
+                                    'id': channel_id,
+                                    'display_name': display_name_node.text,
+                                    'icon_url': icon_node.get('src') if icon_node is not None else None
+                                })
+                                valid_channel_ids.add(channel_id)
+                                channels_in_this_file += 1
+                        elem.clear() # Clear the element and its children to free memory
 
                     elif elem.tag == 'programme':
+                        # Diagnostic print to check if programs are being found
+                        print(f"Found a program element. Current count: {programs_in_this_file + 1}")
+                        
                         channel_id = elem.get('channel')
                         start_dt = parse_xmltv_datetime(elem.get('start'))
                         end_dt = parse_xmltv_datetime(elem.get('stop'))
 
+                        # Skip if essential data is missing or invalid
                         if not start_dt or not end_dt:
+                            print("Warning: Skipping program due to invalid start/end time.")
                             elem.clear()
                             continue
 
@@ -111,9 +121,9 @@ def fetch_and_process_epg(supabase: Client):
                             'description': desc_node.text if desc_node is not None else None
                         })
                         programs_in_this_file += 1
-                        elem.clear() # Clear the element to free memory
+                        elem.clear() # Clear the element and its children to free memory
             
-            print(f"Found {channels_in_this_file} channels and {programs_in_this_file} programs.")
+            print(f"\nCompleted parsing. Found {channels_in_this_file} unique channels and {programs_in_this_file} programs.")
 
         except requests.exceptions.RequestException as e:
             print(f"❌ ERROR: Failed to download data from {url}: {e}", file=sys.stderr)
