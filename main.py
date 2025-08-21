@@ -11,8 +11,11 @@ import sys
 # Choose an EPG source from https://github.com/iptv-org/epg/blob/master/SITES.md
 # e.g., 'guides/tvguide.com.epg.xml.gz' for a comprehensive US guide.
 EPG_SOURCE_PATH = 'guides/tvguide.com.epg.xml.gz'
-IPTV_ORG_EPG_URL = f'https://github.com/iptv-org/epg/raw/master/{EPG_SOURCE_PATH}'
-
+IPTV_ORG_EPG_URLS = [
+    "9tv.co.il.channels.xml",
+    "allente.dk.channels.xml",
+    
+]
 # --- Supabase Configuration ---
 # These will be loaded from environment variables (GitHub Secrets)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
