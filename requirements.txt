@@ -1,4 +1,4 @@
-requirements.txt
+
 requests 
 supabase-py
 
