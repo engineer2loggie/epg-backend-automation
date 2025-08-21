@@ -1,1 +1,4 @@
-requirements.txtrequests supabase
+requirements.txt
+requests 
+supabase
+
