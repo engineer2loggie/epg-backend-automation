@@ -8,14 +8,15 @@ from supabase import create_client, Client
 import sys
 
 # --- Configuration ---
-# Choose an EPG source from https://github.com/iptv-org/epg/blob/master/SITES.md
-# e.g., 'guides/tvguide.com.epg.xml.gz' for a comprehensive US guide.
-EPG_SOURCE_PATH = 'guides/tvguide.com.epg.xml.gz'
-IPTV_ORG_EPG_URL = [
+# Your list of EPG filenames from https://github.com/iptv-org/epg/blob/master/SITES.md
+IPTV_ORG_EPG_FILENAMES = [
     "9tv.co.il.channels.xml",
     "allente.dk.channels.xml",
-    
 ]
+
+# The base URL for IPTV-org EPG guides
+BASE_URL = "https://iptv-org.github.io/epg/guides/"
+
 # --- Supabase Configuration ---
 # These will be loaded from environment variables (GitHub Secrets)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -49,19 +50,12 @@ def fetch_and_process_epg(supabase: Client):
     """Fetches, parses, and upserts EPG data into Supabase."""
     print("🚀 Starting EPG update process...")
 
-    # Your list of EPG filenames
-    epg_filenames = [
-        "9tv.co.il.channels.xml",
-        "allente.dk.channels.xml",
-        # Add all other filenames from SITES.md here
-    ]
-
     all_channels_to_upsert = []
     all_programs_to_upsert = []
     valid_channel_ids = set()
 
-    # Loop through each URL
-    for filename in epg_filenames:
+    # Loop through each EPG filename and process it
+    for filename in IPTV_ORG_EPG_FILENAMES:
         full_url = BASE_URL + filename
         is_gzipped = filename.endswith('.gz')
         
@@ -79,7 +73,7 @@ def fetch_and_process_epg(supabase: Client):
                 # Read regular XML content
                 xml_content = response.content
             
-            print("✅ Successfully downloaded and decompressed/read EPG data.")
+            print(f"✅ Successfully downloaded data from {filename}.")
             root = ET.fromstring(xml_content)
 
             # --- Process Channels from this file ---
@@ -126,7 +120,7 @@ def fetch_and_process_epg(supabase: Client):
             print(f"❌ ERROR: Failed to parse XML data from {full_url}: {e}", file=sys.stderr)
             continue # Skip to the next URL on failure
     
-    # --- Bulk Upsert Channels and Programs ---
+    # --- Bulk Upsert Channels and Programs after looping through all files ---
     if all_channels_to_upsert:
         print(f"\n--- Upserting {len(all_channels_to_upsert)} Channels ---")
         try:
@@ -138,42 +132,24 @@ def fetch_and_process_epg(supabase: Client):
     if all_programs_to_upsert:
         print(f"\n--- Upserting {len(all_programs_to_upsert)} Programs ---")
         try:
-            supabase.table('programs').upsert(all_programs_to_upsert).execute()
+            # We use `on_conflict='id'` to ensure we update existing rows if they exist
+            supabase.table('programs').upsert(all_programs_to_upsert, on_conflict='id').execute()
             print("✅ Programs upserted successfully.")
         except Exception as e:
             print(f"❌ ERROR: Failed to upsert programs: {e}", file=sys.stderr)
     
+    # --- Cleanup Old Programs ---
+    print("\n--- Cleaning up old programs ---")
+    try:
+        # Delete programs that ended more than 24 hours ago
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        supabase.table('programs').delete().lt('end_time', yesterday).execute()
+        print("✅ Successfully deleted old programs.")
+    except Exception as e:
+        print(f"⚠️ WARNING: Could not delete old programs. Error: {e}")
+    
     print("\n✅ EPG update process completed!")
 
-        # --- Cleanup Old Programs ---
-        print("\n--- Cleaning up old programs ---")
-        try:
-            # Delete programs that ended more than 24 hours ago
-            yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-            supabase.table('programs').delete().lt('end_time', yesterday).execute()
-            print("✅ Successfully deleted old programs.")
-        except Exception as e:
-            print(f"⚠️ WARNING: Could not delete old programs. Error: {e}")
-
-
-        print("\n� EPG update process completed!")
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ ERROR: Failed to fetch EPG data: {e}", file=sys.stderr)
-        sys.exit(1)
-    except ET.ParseError as e:
-        print(f"❌ ERROR: Failed to parse XML data. It might be corrupted. Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ ERROR: An unexpected error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
-
 if __name__ == "__main__":
-    # IMPORTANT: You must modify your 'programs' table in Supabase.
-    # 1. Go to Table Editor -> programs table -> Table Settings
-    # 2. Disable Row Level Security (RLS) for now to simplify debugging.
-    # 3. Go to Columns, delete the existing 'id' (uuid) primary key.
-    # 4. Add a new column named 'id' of type 'text' and make it the Primary Key.
     supabase_client = initialize_supabase_client()
     fetch_and_process_epg(supabase_client)
-
