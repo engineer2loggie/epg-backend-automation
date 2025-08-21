@@ -171,4 +171,4 @@ if __name__ == "__main__":
     # 4. Add a new column named 'id' of type 'text' and make it the Primary Key.
     supabase_client = initialize_supabase_client()
     fetch_and_process_epg(supabase_client)
-�
+
