@@ -81,42 +81,71 @@ def open_xml_stream(resp: requests.Response):
 # ---------- Robust datetime parsing ----------
 
 _DT_PATTERNS = (
-    ("%Y%m%d%H%M%S%z", None),      # 20250822170000+0000
-    ("%Y%m%d%H%M%S", "compact"),   # 20250822170000 (naive)
-    ("%Y-%m-%d %H:%M:%S%z", None), # 2025-08-22 17:00:00+00:00
-    ("%Y-%m-%d %H:%M:%S", "dashed")# 2025-08-22 17:00:00 (naive)
+    # compact, seconds
+    ("%Y%m%d%H%M%S%z", None),      # 20250822100000+0000 (after normalization)
+    ("%Y%m%d%H%M%S",  "compact"),  # 20250822100000        (naive)
+
+    # compact, minutes (some guides omit seconds)
+    ("%Y%m%d%H%M%z",  None),       # 202508221000+0000
+    ("%Y%m%d%H%M",    "compact"),  # 202508221000          (naive)
+
+    # dashed, seconds
+    ("%Y-%m-%d %H:%M:%S%z", None), # 2025-08-22 10:00:00+0000
+    ("%Y-%m-%d %H:%M:%S",  "dashed"),
+
+    # dashed, minutes
+    ("%Y-%m-%d %H:%M%z",   None),  # 2025-08-22 10:00+0000
+    ("%Y-%m-%d %H:%M",     "dashed"),
 )
 
 def _normalize_tz_tail(s: str) -> str:
+    """
+    Normalize various TZ tails:
+      - 'Z'           -> '+0000'
+      - ' +HH:MM'     -> '+HHMM'
+      - ' +HHMM'      -> '+HHMM'
+      - remove any stray space before the tz
+    Leaves strings without tz untouched.
+    """
     s = s.strip()
-    if " " in s:
-        a, b = s.rsplit(" ", 1)
-        if b.upper() == "Z": return a + " +0000"
-        if re.fullmatch(r"[+-]\d{2}:\d{2}", b): return a + " " + b.replace(":", "")
-    elif s.endswith("Z"):
+
+    # Easy case: trailing Z
+    if s.endswith("Z") or s.endswith("z"):
         return s[:-1] + "+0000"
+
+    # General case: capture optional space + TZ
+    m = re.match(r"^(.*?)(?:\s+)?([+-]\d{2})(:?)(\d{2})$", s)
+    if m:
+        core, hh, colon, mm = m.groups()
+        return f"{core}{hh}{mm}"
+
+    # Nothing to normalize
     return s
 
 def parse_xmltv_datetime(raw: Optional[str], naive_tz: str = DEFAULT_NAIVE_TZ) -> Optional[datetime]:
-    if not raw: return None
+    """Parse many common XMLTV datetime flavors; attach `naive_tz` if no tz present."""
+    if not raw:
+        return None
     s = _normalize_tz_tail(raw)
+
     for fmt, kind in _DT_PATTERNS:
         try:
+            dt = datetime.strptime(s, fmt)
             if kind is None:
-                dt = datetime.strptime(s, fmt)
                 return dt.astimezone(timezone.utc)
-            else:
-                dt = datetime.strptime(s, fmt)  # naive
-                m = re.fullmatch(r"([+-])(\d{2})(\d{2})", naive_tz.strip())
-                if not m:
-                    return dt.replace(tzinfo=timezone.utc)
-                sign, hh, mm = m.groups()
-                offset = int(hh) * 60 + int(mm)
-                if sign == "-": offset = -offset
-                tz = timezone(timedelta(minutes=offset))
-                return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+            # naive -> assume `naive_tz`
+            m = re.fullmatch(r"([+-])(\d{2})(\d{2})", naive_tz.strip())
+            if not m:
+                return dt.replace(tzinfo=timezone.utc)
+            sign, hh, mm = m.groups()
+            offset = int(hh) * 60 + int(mm)
+            if sign == "-":
+                offset = -offset
+            tz = timezone(timedelta(minutes=offset))
+            return dt.replace(tzinfo=tz).astimezone(timezone.utc)
         except Exception:
             continue
+
     return None
 
 # ---------- XML helpers ----------
