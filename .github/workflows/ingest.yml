@@ -1,501 +1,77 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-from __future__ import annotations
-import os, sys, time, gzip, logging, itertools, random, re, io
-from datetime import datetime, timezone, timedelta
-from typing import Iterable, List, Dict, Optional, Tuple
-
-import requests
-import xml.etree.ElementTree as ET
-from supabase import create_client, Client
-from postgrest.exceptions import APIError
-
-# ====================== Config ======================
-
-OPEN_EPG_FILES = [
-    "https://www.open-epg.com/files/puertorico1.xml",
-    "https://www.open-epg.com/files/puertorico2.xml",
-]
-env_files = os.environ.get("OPEN_EPG_FILES")
-if env_files:
-    OPEN_EPG_FILES = [u.strip() for u in env_files.split(",") if u.strip() and not u.strip().endswith(".gz")]
-
-WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "0"))
-ENFORCE_LIVE  = os.environ.get("ENFORCE_LIVE", "0") not in ("0","false","False","")
-SKIP_EMPTY_TITLES = os.environ.get("SKIP_EMPTY_TITLES", "0") not in ("0","false","False","")
-PREFER_LANGS: Tuple[str, ...] = tuple(x.strip().lower() for x in os.environ.get("PREFER_LANGS", "es-pr,es,en").split(","))
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-
-REQUEST_TIMEOUT = (10, 180)
-BATCH_CHANNELS = 2000
-BATCH_PROGRAMS = 1000
-MAX_RETRIES = 4
-
-REFRESH_MV = os.environ.get("REFRESH_MV", "1") not in ("0","false","False","")
-REFRESH_MV_FUNC = os.environ.get("REFRESH_MV_FUNC", "refresh_programs_next_12h")
-
-DEBUG_CHANNEL_SAMPLES = int(os.environ.get("DEBUG_CHANNEL_SAMPLES", "10"))
-DEBUG_PROGRAM_SAMPLES = int(os.environ.get("DEBUG_PROGRAM_SAMPLES", "10"))
-DEBUG_DUMP_PROGRAM_CHILDREN = int(os.environ.get("DEBUG_DUMP_PROGRAM_CHILDREN", "6"))
-SAVE_FETCHED_XML = os.environ.get("SAVE_FETCHED_XML", "0") not in ("0","false","False","")
-
-TEST_LOOKUP_CHANNEL = os.environ.get("TEST_LOOKUP_CHANNEL", "").strip()
-TEST_LOOKUP_START   = os.environ.get("TEST_LOOKUP_START", "").strip()
-
-DEFAULT_NAIVE_TZ = os.environ.get("DEFAULT_NAIVE_TZ", "-0400")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("open-epg-xml")
-
-# ================== Generic helpers ==================
-
-def chunked(seq: Iterable[dict], size: int) -> Iterable[List[dict]]:
-    it = iter(seq)
-    while True:
-        block = list(itertools.islice(it, size))
-        if not block: return
-        yield block
-
-def rand_jitter() -> float:
-    return 0.25 + random.random() * 0.75
-
-def open_xml_stream(resp: requests.Response):
-    resp.raw.decode_content = True
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    gz = ("gzip" in ct)
-    return gzip.GzipFile(fileobj=resp.raw) if gz else resp.raw
-
-# -------------- Robust datetime parsing --------------
-
-_DT_PATTERNS = (
-    ("%Y%m%d%H%M%S%z", None),
-    ("%Y%m%d%H%M%S",  "compact"),
-    ("%Y%m%d%H%M%z",  None),
-    ("%Y%m%d%H%M",    "compact"),
-    ("%Y-%m-%d %H:%M:%S%z", None),
-    ("%Y-%m-%d %H:%M:%S",  "dashed"),
-    ("%Y-%m-%d %H:%M%z",   None),
-    ("%Y-%m-%d %H:%M",     "dashed"),
-)
-
-def _normalize_tz_tail(s: str) -> str:
-    s = s.strip()
-    if s.endswith(("Z","z")): return s[:-1] + "+0000"
-    m = re.match(r"^(.*?)(?:\s+)?([+-]\d{2})(:?)(\d{2})$", s)
-    if m:
-        core, hh, _, mm = m.groups()
-        return f"{core}{hh}{mm}"
-    return s
-
-def parse_xmltv_datetime(raw: Optional[str], naive_tz: str = DEFAULT_NAIVE_TZ) -> Optional[datetime]:
-    if not raw: return None
-    s = _normalize_tz_tail(raw)
-    for fmt, kind in _DT_PATTERNS:
-        try:
-            dt = datetime.strptime(s, fmt)
-            if kind is None:
-                return dt.astimezone(timezone.utc)
-            # naive -> apply default tz
-            m = re.fullmatch(r"([+-])(\d{2})(\d{2})", naive_tz.strip())
-            if not m:
-                return dt.replace(tzinfo=timezone.utc)
-            sign, hh, mm = m.groups()
-            offset = int(hh)*60 + int(mm)
-            if sign == "-": offset = -offset
-            tz = timezone(timedelta(minutes=offset))
-            return dt.replace(tzinfo=tz).astimezone(timezone.utc)
-        except Exception:
-            continue
-    return None
-
-# -------------------- XML helpers --------------------
-
-def localname(tag: str) -> str:
-    return tag.split("}", 1)[1] if tag and tag.startswith("{") else (tag or "")
-
-def text_from(el: Optional[ET.Element]) -> str:
-    return "".join(el.itertext()).strip() if el is not None else ""
-
-def icon_src(channel_el: ET.Element) -> Optional[str]:
-    for child in list(channel_el):
-        if localname(child.tag).lower() == "icon":
-            for k, v in child.attrib.items():
-                if localname(k).lower() == "src" and v:
-                    return v.strip()
-    return None
-
-def collect_program_children(el: ET.Element):
-    items = []
-    for child in list(el):
-        tag = localname(child.tag).lower()
-        lang = (child.attrib.get("lang") or "").strip().lower()
-        txt = text_from(child)
-        if not txt:
-            v = child.attrib.get("value")
-            if v: txt = (v or "").strip()
-        items.append((tag, lang, (txt or "")))
-    return items
-
-def choose_last_nonempty(items, want_tag: str, prefer_langs: Tuple[str,...]) -> str:
-    cands = [(idx, lang, txt) for idx,(tag,lang,txt) in enumerate(items) if tag == want_tag and (txt or "").strip()]
-    if not cands: return ""
-    pref = [(i,l,t) for (i,l,t) in cands if l in prefer_langs]
-    if pref: return pref[-1][2]
-    return cands[-1][2]
-
-def extract_title_desc(program_el: ET.Element) -> Tuple[str, str, list]:
-    items = collect_program_children(program_el)
-    title = choose_last_nonempty(items, "title", PREFER_LANGS)
-    if not title:
-        st = choose_last_nonempty(items, "sub-title", PREFER_LANGS)
-        if st: title = st
-    desc = choose_last_nonempty(items, "desc", PREFER_LANGS)
-
-    if not title:
-        for k in ("title","name"):
-            v = (program_el.attrib.get(k) or "").strip()
-            if v: title = v; break
-    if not desc:
-        for k in ("desc","description","summary","synopsis"):
-            v = (program_el.attrib.get(k) or "").strip()
-            if v: desc = v; break
-    if not desc:
-        for tag, lang, txt in items:
-            if tag not in ("title","sub-title","desc") and (txt or "").strip():
-                desc = txt; break
-    if (not title) and (desc or "").strip():
-        first = desc.splitlines()[0].strip()
-        if first: title = first[:140]
-    return (title or ""), (desc or ""), items
-
-# =================== HTTP / Session ===================
-
-BROWSER_HEADERS_DESKTOP = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/123.0.0.0 Safari/537.36"),
-    "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-PR,es;q=0.9,en;q=0.8",
-    "Referer": "https://www.open-epg.com/app/index.php",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-}
-
-BROWSER_HEADERS_MOBILE = {
-    "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                   "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                   "Version/17.0 Mobile/15E148 Safari/604.1"),
-    "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-PR,es;q=0.9,en;q=0.8",
-    "Referer": "https://www.open-epg.com/app/index.php",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "DNT": "1",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-}
-
-def warm_open_epg_session(sess: requests.Session, headers: dict):
-    sess.headers.update(headers)
-    try:
-        r = sess.get("https://www.open-epg.com/app/index.php", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        if "PHPSESSID" in r.headers.get("Set-Cookie","") or any("PHPSESSID" in c.name for c in sess.cookies):
-            log.info("Open-EPG session cookie acquired.")
-    except Exception as e:
-        log.warning("Warm-up GET failed (still proceeding): %s", e)
-
-def fetch_xml_bytes(url: str) -> Optional[bytes]:
-    # First attempt: desktop UA
-    sess = requests.Session()
-    warm_open_epg_session(sess, BROWSER_HEADERS_DESKTOP)
-    try:
-        r = sess.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 404:
-            log.warning("404 for %s", url); return None
-        r.raise_for_status()
-        body = r.content
-        if SAVE_FETCHED_XML:
-            out = f"/tmp/open_epg_fetch_{int(time.time())}_desktop_{os.path.basename(url)}"
-            try:
-                with open(out, "wb") as f: f.write(body)
-                log.info("Saved fetched XML (desktop) to %s (%d bytes)", out, len(body))
-            except Exception: pass
-        # quick pre-parse sanity: any non-empty <title> or <desc>?
-        if re.search(rb"<title>\s*[^<\s]", body) or re.search(rb"<desc>\s*[^<\s]", body):
-            log.info("Desktop fetch shows non-empty <title>/<desc> in body.")
-            return body
-        else:
-            log.warning("Desktop fetch looks thin (empty <title>/<desc>). Retrying with mobile UA …")
-    except Exception as e:
-        log.warning("Desktop fetch failed (%s). Retrying with mobile UA …", e)
-
-    # Second attempt: mobile UA
-    sess2 = requests.Session()
-    warm_open_epg_session(sess2, BROWSER_HEADERS_MOBILE)
-    try:
-        r2 = sess2.get(url, timeout=REQUEST_TIMEOUT)
-        if r2.status_code == 404:
-            log.warning("404 for %s (mobile)", url); return None
-        r2.raise_for_status()
-        body2 = r2.content
-        if SAVE_FETCHED_XML:
-            out = f"/tmp/open_epg_fetch_{int(time.time())}_mobile_{os.path.basename(url)}"
-            try:
-                with open(out, "wb") as f: f.write(body2)
-                log.info("Saved fetched XML (mobile) to %s (%d bytes)", out, len(body2))
-            except Exception: pass
-        if re.search(rb"<title>\s*[^<\s]", body2) or re.search(rb"<desc>\s*[^<\s]", body2):
-            log.info("Mobile fetch shows non-empty <title>/<desc> in body.")
-            return body2
-        else:
-            log.warning("Mobile fetch still thin (empty <title>/<desc>).")
-            return body2  # return anyway so we can debug downstream
-    except Exception as e:
-        log.warning("Mobile fetch failed: %s", e)
-        return None
-
-# ================ Supabase / upsert =================
-
-def init_supabase() -> Client:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        log.error("❌ SUPABASE_URL and SUPABASE_SERVICE_KEY must be set."); sys.exit(1)
-    try:
-        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        log.info("✅ Connected to Supabase."); return sb
-    except Exception as e:
-        log.exception("Failed to create Supabase client: %s", e); sys.exit(1)
-
-def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, base_batch: int):
-    total = 0
-    queue: List[List[dict]] = list(chunked(rows, base_batch))
-    while queue:
-        batch = queue.pop(0)
-        if conflict == "id":
-            dedup: Dict[str, dict] = {}
-            for r in batch:
-                k = r.get("id")
-                if not k: continue
-                dedup[k] = r
-            batch = list(dedup.values())
-        for attempt in range(1, MAX_RETRIES+1):
-            try:
-                sb.table(table).upsert(batch, on_conflict=conflict).execute()
-                total += len(batch); break
-            except APIError as e:
-                msg = str(e)
-                need_split = any(s in msg for s in ("21000","duplicate key value violates","500","413","Payload"))
-                if need_split and len(batch) > 1:
-                    mid = len(batch)//2
-                    queue.insert(0, batch[mid:]); queue.insert(0, batch[:mid])
-                    log.warning("Splitting %s batch (%d) due to error: %s", table, len(batch), msg); break
-                if attempt == MAX_RETRIES:
-                    log.error("Giving up on %s batch (%d): %s", table, len(batch), msg)
-                else:
-                    sleep = attempt * rand_jitter()
-                    log.warning("Retry %d/%d for %s (%d rows) in %.2fs: %s",
-                                attempt, MAX_RETRIES, table, len(batch), sleep, msg)
-                    time.sleep(sleep)
-            except Exception as e:
-                if attempt == MAX_RETRIES:
-                    log.exception("Unexpected error upserting %s (%d rows): %s", table, len(batch), e)
-                else:
-                    sleep = attempt * rand_jitter()
-                    log.warning("Retry %d/%d for %s (%d rows) in %.2fs (unexpected): %s",
-                                attempt, MAX_RETRIES, table, len(batch), sleep, e)
-                    time.sleep(sleep)
-    log.info("Upserted %d rows into %s.", total, table)
-
-def refresh_mv(sb: Client):
-    if not REFRESH_MV: return
-    try:
-        sb.rpc(REFRESH_MV_FUNC).execute()
-        log.info("✅ MV refreshed.")
-    except Exception as e:
-        log.warning("MV refresh failed: %s", e)
-
-# ====================== Core ingest ======================
-
-def fetch_and_process(sb: Client):
-    log.info("Windowing: %s", ("OFF" if WINDOW_HOURS <= 0 else f"now→+{WINDOW_HOURS}h"))
-    now_utc = datetime.now(timezone.utc)
-    horizon_utc = now_utc + timedelta(hours=WINDOW_HOURS) if WINDOW_HOURS > 0 else None
-
-    channels: Dict[str, dict] = {}
-    programs: Dict[str, dict] = {}
-
-    for url in OPEN_EPG_FILES:
-        log.info("Fetching EPG (XML only): %s", url)
-        body = fetch_xml_bytes(url)
-        if not body:
-            log.warning("No body for %s; skipping", url); continue
-
-        # quick body-level sanity (count non-empty tags)
-        nonempty_titles = len(re.findall(rb"<title>\s*[^<\s]", body))
-        nonempty_descs  = len(re.findall(rb"<desc>\s*[^<\s]", body))
-        log.info("Pre-parse non-empty counts: title=%d, desc=%d", nonempty_titles, nonempty_descs)
-
-        stream = io.BytesIO(body)
-        context = ET.iterparse(stream, events=("start","end"))
-        _, root = next(context)
-
-        c_seen = p_seen = p_kept = good_titles = dumped_children = 0
-        local_channels: Dict[str, dict] = {}
-        local_programs: Dict[str, dict] = {}
-
-        for ev, el in context:
-            if ev != "end": continue
-            tag = localname(el.tag)
-
-            if tag == "channel":
-                c_seen += 1
-                ch_id = el.get("id") or ""
-                disp = None
-                for child in list(el):
-                    if localname(child.tag).lower() == "display-name":
-                        t = text_from(child).strip()
-                        if t and not disp: disp = t
-                if not disp: disp = ch_id or "Unknown"
-                if ch_id and ch_id not in local_channels:
-                    local_channels[ch_id] = {"id": ch_id, "display_name": disp, "icon_url": icon_src(el)}
-                el.clear(); continue
-
-            if tag == "programme":
-                p_seen += 1
-                ch_id = el.get("channel") or ""
-                s = parse_xmltv_datetime(el.get("start")); e = parse_xmltv_datetime(el.get("stop"))
-                if not (s and e):
-                    el.clear(); continue
-                if WINDOW_HOURS > 0 and not (s <= horizon_utc and e >= now_utc):
-                    el.clear(); continue
-
-                title, desc, items = extract_title_desc(el)
-                if DEBUG_DUMP_PROGRAM_CHILDREN and dumped_children < DEBUG_DUMP_PROGRAM_CHILDREN:
-                    dumped_children += 1
-                    lines = []
-                    for tg, ln, tx in items:
-                        shown = (tx[:80] + "…") if len(tx) > 80 else tx
-                        lines.append(f"    <{tg} lang='{ln}'> {('∅' if not tx else shown)}")
-                    log.info("DEBUG children ch=%s start=%s\n%s\n    -> chosen title=%r, desc_len=%d",
-                             ch_id, s.isoformat(), "\n".join(lines) if lines else "    (no child nodes)",
-                             title, len(desc or ""))
-
-                if title.strip(): good_titles += 1
-                if SKIP_EMPTY_TITLES and not title.strip():
-                    el.clear(); continue
-
-                pid = f"{ch_id}_{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}"
-                row = {
-                    "id": pid,
-                    "channel_id": ch_id,
-                    "start_time": s.isoformat(),
-                    "end_time": e.isoformat(),
-                    "title": (title or None),
-                    "description": (desc or None)
-                }
-                old = local_programs.get(pid)
-                if old is None:
-                    local_programs[pid] = row; p_kept += 1
-                else:
-                    old_t = (old.get("title") or "").strip()
-                    new_t = (row.get("title") or "").strip()
-                    old_d = (old.get("description") or "") or ""
-                    new_d = (row.get("description") or "") or ""
-                    replace = False
-                    if not old_t and new_t: replace = True
-                    elif (bool(new_t) == bool(old_t)) and (len(new_d) > len(old_d)):
-                        replace = True
-                    if replace: local_programs[pid] = row
-
-                el.clear()
-                if (p_kept % 8000) == 0:
-                    root.clear()
-                continue
-
-            el.clear()
-
-        ratio = (good_titles / p_seen) if p_seen else 0.0
-        log.info("Parsed %s: channels(seen)=%d, programs_found=%d, kept=%d, titled_ratio=%.3f",
-                 url, c_seen, p_seen, p_kept, ratio)
-
-        for ch_id, ch_row in local_channels.items():
-            if ch_id not in channels: channels[ch_id] = ch_row
-        for pid, new_row in local_programs.items():
-            old = programs.get(pid)
-            if old is None:
-                programs[pid] = new_row
-            else:
-                old_t = (old.get("title") or "").strip()
-                new_t = (new_row.get("title") or "").strip()
-                old_d = (old.get("description") or "") or ""
-                new_d = (new_row.get("description") or "") or ""
-                replace = False
-                if not old_t and new_t: replace = True
-                elif (bool(new_t) == bool(old_t)) and (len(new_d) > len(old_d)):
-                    replace = True
-                if replace: programs[pid] = new_row
-
-    # One-shot lookup for verification
-    if TEST_LOOKUP_CHANNEL and TEST_LOOKUP_START:
-        s = parse_xmltv_datetime(TEST_LOOKUP_START)
-        if s:
-            prefix = f"{TEST_LOOKUP_CHANNEL}_{s.strftime('%Y%m%d%H%M%S')}_"
-            hits = [r for pid, r in programs.items() if pid.startswith(prefix)]
-            if hits:
-                r = sorted(hits, key=lambda x: x["end_time"])[0]
-                log.info("TEST LOOKUP: %s @ %s -> title=%r, desc=%r",
-                         TEST_LOOKUP_CHANNEL, TEST_LOOKUP_START, r["title"], (r["description"] or "")[:240])
-            else:
-                log.info("TEST LOOKUP: no match for channel=%s start=%s", TEST_LOOKUP_CHANNEL, TEST_LOOKUP_START)
-
-    # Ensure channels for referenced programmes
-    referenced = {r["channel_id"] for r in programs.values()}
-    for ch_id in referenced:
-        if ch_id and ch_id not in channels:
-            channels[ch_id] = {"id": ch_id, "display_name": ch_id, "icon_url": None}
-
-    # Upserts
-    if channels:
-        upsert_with_retry(sb, "channels", list(channels.values()), conflict="id", base_batch=BATCH_CHANNELS)
-    else:
-        log.warning("No channels to upsert.")
-
-    prog_rows = list(programs.values())
-    log.info("Programs to upsert (deduped): %d", len(prog_rows))
-    if prog_rows:
-        prog_rows.sort(key=lambda r: (r["channel_id"], r["start_time"]))
-        upsert_with_retry(sb, "programs", prog_rows, conflict="id", base_batch=BATCH_PROGRAMS)
-    else:
-        log.warning("No programmes parsed (check feeds).")
-
-    # Verify count
-    try:
-        res = sb.table("programs").select("id", count="exact").execute()
-        cnt = getattr(res, "count", None) or 0
-        log.info("✅ Supabase now has %d total programmes.", cnt)
-    except Exception as e:
-        log.warning("Count query failed: %s", e)
-
-    if REFRESH_MV:
-        refresh_mv(sb)
-
-# ====================== Entrypoint ======================
-
-def main() -> int:
-    log.info("Open-EPG ingest (PR, XML only). WINDOW_HOURS=%d, ENFORCE_LIVE=%s, SKIP_EMPTY_TITLES=%s, PREFER_LANGS=%s",
-             WINDOW_HOURS, ENFORCE_LIVE, SKIP_EMPTY_TITLES, ",".join(PREFER_LANGS))
-    sb = init_supabase()
-    t0 = time.time()
-    fetch_and_process(sb)
-    log.info("Finished in %.1fs", time.time() - t0)
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
+name: Open-EPG PR ingest (XML-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      save_xml:
+        description: "Upload fetched XML as artifact?"
+        required: false
+        default: "0"
+      debug_dump_count:
+        description: "How many <programme> nodes to dump?"
+        required: false
+        default: "6"
+      window_hours:
+        description: "Hours to window (0 = OFF)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: ingest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    env:
+      # Supabase credentials (store these in repo/org Secrets)
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      # Open-EPG Puerto Rico (XML only)
+      OPEN_EPG_FILES: "https://www.open-epg.com/files/puertorico1.xml,https://www.open-epg.com/files/puertorico2.xml"
+
+      # Parsing/runtime knobs
+      WINDOW_HOURS: ${{ inputs.window_hours }}
+      ENFORCE_LIVE: "0"
+      PREFER_LANGS: "es-pr,es,en"
+      SKIP_EMPTY_TITLES: "0"
+
+      # Debug controls
+      DEBUG_DUMP_PROGRAM_CHILDREN: ${{ inputs.debug_dump_count }}
+      TEST_LOOKUP_CHANNEL: "3ABN LATINO WTPM DT3 PUERTO RICO.pr"
+      TEST_LOOKUP_START: "20250822223000 +0000"
+
+      # Materialized view RPC (adjust only if your SQL uses another name)
+      REFRESH_MV: "1"
+      REFRESH_MV_FUNC: "refresh_programs_next_12h"
+
+      # Optional: upload raw XML fetched by the job (set to "1" via input)
+      SAVE_FETCHED_XML: ${{ inputs.save_xml }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "supabase>=2" postgrest requests
+
+      - name: Run ingest
+        run: python main.py
+
+      - name: Upload fetched XML (optional)
+        if: ${{ env.SAVE_FETCHED_XML == '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-epg-xml
+          path: /tmp/open_epg_fetch_*.xml
+          if-no-files-found: ignore
