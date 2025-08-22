@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Refactored XMLTV -> Supabase ingester
-- Streams & parses .xml or .xml.gz
-- Normalizes XMLTV timestamps
-- Writes channels + next-24h programmes to Supabase
-- Deletes programmes that ended >24h ago
-
-ENV:
-  SUPABASE_URL           (required)
-  SUPABASE_SERVICE_KEY   (required)
-  EPG_URLS               (optional, comma-separated; defaults to epgshare01 ALL_SOURCES)
-"""
 
 from __future__ import annotations
 import os
@@ -36,14 +24,11 @@ DEFAULT_EPG_URLS = [
 
 BATCH_SIZE_CHANNELS = 5000
 BATCH_SIZE_PROGRAMS = 5000
-REQUEST_TIMEOUT = (10, 180)  # (connect, read) seconds
+REQUEST_TIMEOUT = (10, 180)  # (connect, read)
 
 # ----------------------- Logging ----------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("epg")
 
 # ----------------------- Env --------------------------
@@ -52,10 +37,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 _raw_urls = os.environ.get("EPG_URLS", "")
-if _raw_urls.strip():
-    EPG_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
-else:
-    EPG_URLS = DEFAULT_EPG_URLS[:]
+EPG_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()] if _raw_urls.strip() else DEFAULT_EPG_URLS[:]
 
 # ----------------------- Helpers ----------------------
 
@@ -71,38 +53,36 @@ def chunked(seq: Iterable[dict], size: int) -> Iterable[List[dict]]:
 
 def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
     """
-    Accepts common XMLTV forms:
-      - YYYYMMDDHHMMSS Z         (note the space before offset)
-      - YYYYMMDDHHMMSSZ          (Z)
-      - YYYYMMDDHHMMSS+HH:MM
-      - YYYYMMDDHHMMSS+HHMM
-      - YYYYMMDDHHMMSS           (assume UTC)
-    Returns aware UTC datetime, or None.
+    Accepts:
+      YYYYMMDDHHMMSSZ
+      YYYYMMDDHHMMSS Z
+      YYYYMMDDHHMMSS+HHMM
+      YYYYMMDDHHMMSS+HH:MM
+      YYYYMMDDHHMMSS      (assume UTC)
+    Returns aware UTC datetime or None.
     """
     if not raw:
         return None
-
     s = raw.strip()
 
-    # Remove whitespace between datetime and tz if present, e.g. "20250820103000 +0000"
-    if " " in s and (s.endswith("Z") or s[-5] in ["+", "-"]):
+    # Remove space before TZ if present
+    if " " in s and (s.endswith("Z") or s[-5:s-4] in ["+", "-"]):
         parts = s.rsplit(" ", 1)
         s = "".join(parts)
 
     # Normalize +HH:MM -> +HHMM
-    if len(s) >= 5 and (s[-3] == ":" and (s[-6] in ["+", "-"])):
+    if len(s) >= 6 and s[-3:] != "Z" and s[-3] == ":" and s[-6] in ["+", "-"]:
         s = s[:-3] + s[-2:]
 
-    # Add UTC if missing tz entirely
+    # Add UTC if no tz
     if len(s) == 14:  # YYYYMMDDHHMMSS
-        s = s + "+0000"
+        s += "+0000"
 
     # Handle trailing Z
-    if s.endswith("Z") and len(s) == 15:  # 14 + "Z"
+    if s.endswith("Z") and len(s) == 15:
         s = s[:-1] + "+0000"
 
     try:
-        # Expect exactly 'YYYYMMDDHHMMSS±HHMM'
         dt = datetime.strptime(s, "%Y%m%d%H%M%S%z")
         return dt.astimezone(timezone.utc)
     except Exception:
@@ -110,35 +90,18 @@ def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
 
 
 def time_windows_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
-    """True if [a_start, a_end] intersects [b_start, b_end]."""
     return a_start <= b_end and a_end >= b_start
 
 
 def open_xml_stream(resp: requests.Response, url: str):
-    """
-    Returns a file-like object suitable for ET.iterparse().
-    Handles .gz by wrapping in gzip.GzipFile.
-    """
-    # Ensure urllib3 will decompress if the server used Content-Encoding
     resp.raw.decode_content = True
-
     ct = (resp.headers.get("Content-Type") or "").lower()
     is_gz = url.lower().endswith(".gz") or "gzip" in ct or "application/gzip" in ct
-
-    raw_stream = resp.raw  # file-like
-
-    if is_gz:
-        # Wrap in GzipFile to get raw XML stream
-        return gzip.GzipFile(fileobj=raw_stream)
-    else:
-        return raw_stream
+    return gzip.GzipFile(fileobj=resp.raw) if is_gz else resp.raw
 
 
 def preferred_text(elem: ET.Element, tag: str) -> Optional[str]:
-    """
-    Return the first non-empty text for the given tag under elem.
-    (XMLTV can include multiple <title> / <desc> with lang attributes.)
-    """
+    # First non-empty text among possibly many localized tags
     for child in elem.findall(tag):
         if child.text and child.text.strip():
             return child.text.strip()
@@ -192,9 +155,8 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
     now_utc = datetime.now(timezone.utc)
     horizon_utc = now_utc + timedelta(hours=24)
 
-    # Accumulators across all files
-    all_channels: Dict[str, dict] = {}  # id -> row
-    programs: List[dict] = []
+    all_channels: Dict[str, dict] = {}     # id -> channel row
+    program_map: Dict[str, dict] = {}      # unique programme id -> programme row
 
     for url in urls:
         log.info("Fetching EPG: %s", url)
@@ -203,7 +165,6 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                 resp.raise_for_status()
                 stream = open_xml_stream(resp, url)
                 context = ET.iterparse(stream, events=("start", "end"))
-                # Advance to get the root element
                 _, root = next(context)
 
                 found_channels = 0
@@ -220,10 +181,7 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                         ch_id = elem.get("id")
                         if ch_id:
                             display_name = preferred_text(elem, "display-name") or ch_id
-                            icon_url = None
-                            icon_node = elem.find("icon")
-                            if icon_node is not None:
-                                icon_url = icon_node.get("src")
+                            icon_url = elem.find("icon").get("src") if elem.find("icon") is not None else None
                             if ch_id not in all_channels:
                                 all_channels[ch_id] = {
                                     "id": ch_id,
@@ -239,39 +197,54 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                         ch_id = elem.get("channel")
                         start_dt = parse_xmltv_datetime(elem.get("start"))
                         end_dt = parse_xmltv_datetime(elem.get("stop"))
-
                         if not (ch_id and start_dt and end_dt):
-                            elem.clear()
-                            continue
+                            elem.clear(); continue
 
-                        # Keep only if overlaps [now, now+24h]
+                        # Only keep items that overlap now..+24h
                         if not time_windows_overlap(start_dt, end_dt, now_utc, horizon_utc):
-                            elem.clear()
-                            continue
+                            elem.clear(); continue
 
                         title = preferred_text(elem, "title") or "No Title"
                         desc = preferred_text(elem, "desc")
 
-                        # Programme unique id: channel + start timestamp
-                        prog_id = f"{ch_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
+                        # >>> NEW: include END in the ID to reduce natural collisions
+                        prog_id = f"{ch_id}_{start_dt.strftime('%Y%m%d%H%M%S')}_{end_dt.strftime('%Y%m%d%H%M%S')}"
 
-                        programs.append({
+                        cand = {
                             "id": prog_id,
                             "channel_id": ch_id,
                             "start_time": start_dt.isoformat(),
                             "end_time": end_dt.isoformat(),
                             "title": title,
                             "description": desc
-                        })
-                        kept_programs += 1
+                        }
+
+                        # >>> NEW: de-dup within the same payload to avoid 21000 errors
+                        prev = program_map.get(prog_id)
+                        if prev is None:
+                            program_map[prog_id] = cand
+                            kept_programs += 1
+                        else:
+                            # pick the "better" one: non-empty title > longer desc > keep existing
+                            prev_title = (prev.get("title") or "").strip()
+                            prev_desc = (prev.get("description") or "") or ""
+                            cand_title = (cand.get("title") or "").strip()
+                            cand_desc = (cand.get("description") or "") or ""
+
+                            replace = False
+                            if prev_title == "No Title" and cand_title != "No Title":
+                                replace = True
+                            elif len(cand_desc) > len(prev_desc):
+                                replace = True
+
+                            if replace:
+                                program_map[prog_id] = cand
 
                         elem.clear()
-                        # Occasionally clear the root to free memory
                         if kept_programs % 5000 == 0:
                             root.clear()
                         continue
 
-                    # For any other end-tag, just clear to save memory
                     elem.clear()
 
                 log.info(
@@ -286,17 +259,13 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
         except Exception as e:
             log.exception("Unexpected error for %s: %s", url, e)
 
-    # Ensure all referenced channel_ids exist (in case some <programme> lacked a <channel> block)
-    referenced_ids = {p["channel_id"] for p in programs}
+    # Ensure all referenced channel_ids exist
+    referenced_ids = {p["channel_id"] for p in program_map.values()}
     missing = referenced_ids.difference(all_channels.keys())
     if missing:
         log.warning("Programs reference %d channels missing in <channel> list. Creating placeholders.", len(missing))
         for ch_id in missing:
-            all_channels[ch_id] = {
-                "id": ch_id,
-                "display_name": ch_id,
-                "icon_url": None,
-            }
+            all_channels[ch_id] = {"id": ch_id, "display_name": ch_id, "icon_url": None}
 
     # Upserts
     if all_channels:
@@ -304,18 +273,17 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
     else:
         log.warning("No channels parsed to upsert.")
 
+    programs = list(program_map.values())
+    log.info("Deduplicated programs total: %d (dropped %d duplicates).", len(programs), len(program_map) - len(programs))
+
     if programs:
-        # Sort (optional) for nicer batching by channel/time
         programs.sort(key=lambda r: (r["channel_id"], r["start_time"]))
         upsert_programs(sb, programs)
     else:
         log.warning("No programs kept for next 24h; check timestamp parsing and window.")
 
-    # Cleanup: delete programmes that ended more than 24h ago
-    cleanup_old_programs(sb, older_than_utc=now_utc - timedelta(hours=24))
-
-    log.info("Done. Channels total upserted: %d; Programs total upserted: %d",
-             len(all_channels), len(programs))
+    cleanup_old_programs(sb, older_than_utc=datetime.now(timezone.utc) - timedelta(hours=24))
+    log.info("Done. Channels upserted: %d; Programs upserted: %d", len(all_channels), len(programs))
 
 
 # ----------------------- Entrypoint -------------------
