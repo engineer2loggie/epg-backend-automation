@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import os, sys, io, gzip, time, logging, itertools, random
+import os, sys, gzip, time, logging, itertools, random
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, List, Dict, Optional
 
@@ -34,7 +34,6 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 _raw_urls = os.environ.get("EPG_URLS", "")
 EPG_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()] if _raw_urls else list(DEFAULT_EPG_URLS)
 
-
 # ----------------------- Helpers ----------------------
 
 def chunked(seq: Iterable[dict], size: int) -> Iterable[List[dict]]:
@@ -49,26 +48,27 @@ def rand_jitter() -> float:
     return 0.25 + random.random() * 0.75
 
 def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
+    """Parse XMLTV datetime to UTC-aware datetime."""
     if not raw:
         return None
     s = raw.strip()
 
-    # remove accidental space before tz
-    if " " in s and (s.endswith("Z") or s[-5:-4] in ["+", "-"]):
+    # remove accidental space before tz (e.g. '...  +0200')
+    if " " in s:
         a, b = s.rsplit(" ", 1)
         s = a + b
 
     # normalize +HH:MM -> +HHMM
-    if len(s) >= 6 and s[-3:] != "Z" and s[-3] == ":" and s[-6] in ["+", "-"]:
+    if len(s) >= 6 and (s.endswith("Z") is False) and s[-3] == ":" and s[-5] in "+-":
         s = s[:-3] + s[-2:]
+
+    # trailing 'Z' -> '+0000'
+    if s.endswith("Z"):
+        s = s[:-1] + "+0000"
 
     # add UTC if no tz
     if len(s) == 14:  # YYYYMMDDHHMMSS
         s += "+0000"
-
-    # trailing Z -> +0000
-    if s.endswith("Z") and len(s) == 15:
-        s = s[:-1] + "+0000"
 
     try:
         dt = datetime.strptime(s, "%Y%m%d%H%M%S%z")
@@ -77,17 +77,52 @@ def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
         return None
 
 def open_xml_stream(resp: requests.Response, url: str):
+    """Return a file-like stream; transparently ungzip if needed."""
     resp.raw.decode_content = True
     ct = (resp.headers.get("Content-Type") or "").lower()
     gz = url.lower().endswith(".gz") or "gzip" in ct or "application/gzip" in ct
     return gzip.GzipFile(fileobj=resp.raw) if gz else resp.raw
 
-def preferred_text(elem: ET.Element, tag: str) -> Optional[str]:
-    for child in elem.findall(tag):
-        if child.text and child.text.strip():
-            return child.text.strip()
+# ---- Namespace-agnostic XML utilities ----
+
+def localname(tag: str) -> str:
+    """Return the local tag name without namespace."""
+    if not tag:
+        return tag
+    if tag[0] == '{':
+        return tag.split('}', 1)[1]
+    return tag
+
+def text_from(elem: ET.Element) -> str:
+    """Concatenate all text from an element (handles CDATA/nested tags)."""
+    return ''.join(elem.itertext()).strip() if elem is not None else ''
+
+def first_text_by_names(elem: ET.Element, *names: str) -> str:
+    """Find first child by local tag name in `names`, return combined text."""
+    wanted = {n.lower() for n in names}
+    for child in list(elem):
+        if localname(child.tag).lower() in wanted:
+            txt = text_from(child)
+            if txt:
+                return txt
+    return ''
+
+def find_child(elem: ET.Element, name: str) -> Optional[ET.Element]:
+    lname = name.lower()
+    for child in list(elem):
+        if localname(child.tag).lower() == lname:
+            return child
     return None
 
+def icon_src(elem: ET.Element) -> Optional[str]:
+    """Get <icon src='...'> handling namespaces on tag/attr."""
+    ic = find_child(elem, 'icon')
+    if ic is None:
+        return None
+    for k, v in ic.attrib.items():
+        if localname(k).lower() == 'src' and v:
+            return v.strip()
+    return None
 
 # ----------------------- Supabase ---------------------
 
@@ -104,8 +139,8 @@ def init_supabase() -> Client:
         sys.exit(1)
 
 def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, base_batch: int):
-    """Upsert rows with retries; if we hit server/duplicate-within-batch errors,
-    split the batch (binary split) and retry smaller pieces."""
+    """Upsert rows with retries; if we hit duplicate-within-batch or server errors,
+    split the batch and retry smaller pieces."""
     total = 0
     queue: List[List[dict]] = list(chunked(rows, base_batch))
 
@@ -113,10 +148,10 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
         batch = queue.pop(0)
         # de-dupe IDs inside the batch to prevent 21000
         if conflict == "id":
-            dedup = {}
+            dedup: Dict[str, dict] = {}
             for r in batch:
                 k = r.get("id")
-                if k is None:
+                if not k:
                     continue
                 keep = dedup.get(k)
                 if keep is None:
@@ -204,7 +239,6 @@ def refresh_next_24h_mv(sb: Client) -> None:
             log.warning("Retry %d/%d refreshing MV in %.2fs: %s", attempt, MAX_RETRIES, sleep_s, e)
             time.sleep(sleep_s)
 
-
 # ----------------------- Core ingest ------------------
 
 def fetch_and_process_epg(sb: Client, urls: List[str]):
@@ -227,24 +261,31 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                 c_new = 0
                 p_seen = 0
                 p_kept = 0
+                empty_titles = 0
 
                 for ev, el in context:
                     if ev != "end":
                         continue
 
-                    tag = el.tag
+                    tag = localname(el.tag)
 
+                    # --- channels ---
                     if tag == "channel":
                         ch_id = el.get("id")
                         if ch_id:
-                            name = preferred_text(el, "display-name") or ch_id
-                            icon = el.find("icon").get("src") if el.find("icon") is not None else None
+                            name = first_text_by_names(el, "display-name") or ch_id
+                            icon = icon_src(el)
                             if ch_id not in channels:
-                                channels[ch_id] = {"id": ch_id, "display_name": name, "icon_url": icon}
+                                channels[ch_id] = {
+                                    "id": ch_id,
+                                    "display_name": name,
+                                    "icon_url": icon
+                                }
                                 c_new += 1
                         el.clear()
                         continue
 
+                    # --- programmes ---
                     if tag == "programme":
                         p_seen += 1
                         ch_id = el.get("channel")
@@ -257,8 +298,10 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                         if not (s <= horizon_utc and e >= now_utc):
                             el.clear(); continue
 
-                        title = preferred_text(el, "title") or "No Title"
-                        desc = preferred_text(el, "desc")
+                        title = (first_text_by_names(el, "title", "sub-title") or "No Title").strip()
+                        desc  = first_text_by_names(el, "desc").strip() or None
+                        if title == "No Title":
+                            empty_titles += 1
 
                         pid = f"{ch_id}_{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}"
                         row = {
@@ -293,8 +336,10 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
 
                     el.clear()
 
-                log.info("Parsed file done: channels=%d (new), programs_found=%d, programs_kept_24h=%d",
-                         c_new, p_seen, p_kept)
+                log.info(
+                    "Parsed file done: channels=%d (new), programs_found=%d, programs_kept_24h=%d, no_title=%d",
+                    c_new, p_seen, p_kept, empty_titles
+                )
 
         except requests.exceptions.RequestException as e:
             log.error("HTTP error for %s: %s", url, e)
@@ -348,7 +393,6 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
     refresh_next_24h_mv(sb)
 
     log.info("Done. Channels upserted: %d; Programs considered: %d", len(channels), len(prog_rows))
-
 
 # ----------------------- Entrypoint -------------------
 
