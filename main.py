@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import os, sys, io, gzip, time, logging, itertools, math, random
+import os, sys, io, gzip, time, logging, itertools, random
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Optional
 
 import requests
 import xml.etree.ElementTree as ET
@@ -21,6 +21,9 @@ REQUEST_TIMEOUT = (10, 180)  # (connect, read)
 BATCH_CHANNELS = 2000
 BATCH_PROGRAMS = 1000        # smaller to avoid PostgREST payload issues
 MAX_RETRIES = 4
+
+# Refresh MV after ingest? (default yes)
+REFRESH_MV = os.environ.get("REFRESH_MV", "1") not in ("0", "false", "False", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("epg")
@@ -113,7 +116,6 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
             dedup = {}
             for r in batch:
                 k = r.get("id")
-                # keep the "best" by longer description, then non-empty title
                 if k is None:
                     continue
                 keep = dedup.get(k)
@@ -140,7 +142,6 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                 break
             except APIError as e:
                 msg = str(e)
-                # Duplicate within same payload, server 5xx, payload too large -> split
                 need_split = (
                     "21000" in msg or
                     "duplicate key value violates" in msg or
@@ -174,7 +175,6 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
 
 def count_programs_in_window(sb: Client, start_utc: datetime, end_utc: datetime) -> int:
     try:
-        # `count='exact'` returns a count even when we limit columns
         res = sb.table("programs")\
             .select("id", count="exact")\
             .gte("end_time", start_utc.isoformat())\
@@ -184,6 +184,25 @@ def count_programs_in_window(sb: Client, start_utc: datetime, end_utc: datetime)
     except Exception as e:
         log.warning("Count query failed: %s", e)
         return -1
+
+def refresh_next_24h_mv(sb: Client) -> None:
+    """Calls the secure RPC to refresh the materialized view."""
+    if not REFRESH_MV:
+        log.info("Skipping materialized view refresh (REFRESH_MV disabled).")
+        return
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            log.info("Refreshing materialized view: programs_next_24h …")
+            sb.rpc("refresh_programs_next_24h").execute()
+            log.info("✅ Materialized view refreshed.")
+            return
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                log.error("❌ Failed to refresh MV after %d attempts: %s", attempt, e)
+                return
+            sleep_s = attempt * rand_jitter()
+            log.warning("Retry %d/%d refreshing MV in %.2fs: %s", attempt, MAX_RETRIES, sleep_s, e)
+            time.sleep(sleep_s)
 
 
 # ----------------------- Core ingest ------------------
@@ -251,7 +270,6 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                             "description": desc
                         }
 
-                        # dedupe by id; keep 'better' record
                         prev = programs.get(pid)
                         if prev is None:
                             programs[pid] = row
@@ -302,12 +320,10 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
     prog_rows = list(programs.values())
     log.info("Programs to upsert (deduped): %d", len(prog_rows))
 
-    # Log a small sample for visibility
     for sample in prog_rows[:3]:
         log.info("Sample program row: %s", {k: sample[k] for k in ("id", "channel_id", "start_time", "end_time", "title")})
 
     if prog_rows:
-        # sort for stable batching
         prog_rows.sort(key=lambda r: (r["channel_id"], r["start_time"]))
         upsert_with_retry(sb, "programs", prog_rows, conflict="id", base_batch=BATCH_PROGRAMS)
     else:
@@ -327,6 +343,9 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
         log.info("Cleaned up programs with end_time < %s", cutoff.isoformat())
     except Exception as e:
         log.warning("Cleanup failed: %s", e)
+
+    # refresh MV (secure RPC)
+    refresh_next_24h_mv(sb)
 
     log.info("Done. Channels upserted: %d; Programs considered: %d", len(channels), len(prog_rows))
 
