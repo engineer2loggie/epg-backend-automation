@@ -1,58 +1,45 @@
-name: Open-EPG PR ingest (XML-only)
+name: Open-EPG ingest (self-hosted Pi)
 
 on:
   workflow_dispatch:
     inputs:
-      save_xml:
-        description: "Upload fetched XML as artifact?"
-        required: false
-        default: "0"
-      debug_dump_count:
-        description: "How many <programme> nodes to dump?"
-        required: false
-        default: "6"
       window_hours:
-        description: "Hours to window (0 = OFF)"
-        required: false
-        default: "0"
-
-concurrency:
-  group: ingest-${{ github.ref }}
-  cancel-in-progress: true
+        description: "Hours window (0 = off)"
+        type: number
+        default: 0
+      debug_dump_count:
+        description: "How many programme children to dump"
+        type: number
+        default: 10
+      save_xml:
+        description: "Upload fetched XML as artifact"
+        type: boolean
+        default: true
 
 jobs:
   ingest:
-    runs-on: ubuntu-latest
+    # 👉 Make sure these labels MATCH what you configured on the Pi
+    runs-on: [self-hosted, linux, pi, home, hiptv.ddns.net, arm64]
+    # If your Pi is 32-bit, use: runs-on: [self-hosted, linux, pi, home, hiptv.ddns.net, arm]
+    timeout-minutes: 60
 
     env:
-      # Supabase credentials (store these in repo/org Secrets)
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-
-      # Open-EPG Puerto Rico (XML only)
+      # For PR XML-only test
       OPEN_EPG_FILES: "https://www.open-epg.com/files/puertorico1.xml,https://www.open-epg.com/files/puertorico2.xml"
-
-      # Parsing/runtime knobs
-      WINDOW_HOURS: ${{ inputs.window_hours }}
+      WINDOW_HOURS: ${{ github.event.inputs.window_hours }}
       ENFORCE_LIVE: "0"
       PREFER_LANGS: "es-pr,es,en"
-      SKIP_EMPTY_TITLES: "0"
-
-      # Debug controls
-      DEBUG_DUMP_PROGRAM_CHILDREN: ${{ inputs.debug_dump_count }}
+      DEBUG_DUMP_PROGRAM_CHILDREN: ${{ github.event.inputs.debug_dump_count }}
+      SAVE_XML: ${{ github.event.inputs.save_xml }}
+      REFRESH_MV: "1"
+      REFRESH_MV_FUNC: "refresh_programs_next_12h"
       TEST_LOOKUP_CHANNEL: "3ABN LATINO WTPM DT3 PUERTO RICO.pr"
       TEST_LOOKUP_START: "20250822223000 +0000"
 
-      # Materialized view RPC (adjust only if your SQL uses another name)
-      REFRESH_MV: "1"
-      REFRESH_MV_FUNC: "refresh_programs_next_12h"
-
-      # Optional: upload raw XML fetched by the job (set to "1" via input)
-      SAVE_FETCHED_XML: ${{ inputs.save_xml }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -60,18 +47,20 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install "supabase>=2" postgrest requests
+          pip install -r requirements.txt
 
       - name: Run ingest
         run: python main.py
 
-      - name: Upload fetched XML (optional)
-        if: ${{ env.SAVE_FETCHED_XML == '1' }}
+      - name: Save XML (optional)
+        if: ${{ env.SAVE_XML == 'true' || env.SAVE_XML == '1' }}
         uses: actions/upload-artifact@v4
         with:
           name: open-epg-xml
-          path: /tmp/open_epg_fetch_*.xml
+          path: |
+            *.xml
+            /tmp/open_epg_fetch_*.xml
           if-no-files-found: ignore
