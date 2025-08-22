@@ -18,15 +18,13 @@ on:
 
 jobs:
   ingest:
-    # 👉 Make sure these labels MATCH what you configured on the Pi
-    runs-on: self-hosted
-    # If your Pi is 32-bit, use: runs-on: [self-hosted, linux, pi, home, hiptv.ddns.net, arm]
+    # ✅ Use the labels your Pi runner actually has, or just "self-hosted"
+    runs-on: [self-hosted]  # or [self-hosted, Linux, ARM64, pi, home, hiptv.ddns.net]
     timeout-minutes: 60
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      # For PR XML-only test
       OPEN_EPG_FILES: "https://www.open-epg.com/files/puertorico1.xml,https://www.open-epg.com/files/puertorico2.xml"
       WINDOW_HOURS: ${{ github.event.inputs.window_hours }}
       ENFORCE_LIVE: "0"
@@ -41,19 +39,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install deps
+      # Optional: ensure python3/venv/pip exist (most Pi Bookworm images already have them)
+      - name: Ensure system Python is present
         run: |
-          python -m pip install --upgrade pip
+          set -e
+          if ! command -v python3 >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y python3 python3-venv python3-pip
+          fi
+          python3 -V
+
+      - name: Create venv & install deps
+        run: |
+          set -e
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
       - name: Run ingest
-        run: python main.py
+        run: |
+          set -e
+          . .venv/bin/activate
+          python main.py
 
       - name: Save XML (optional)
         if: ${{ env.SAVE_XML == 'true' || env.SAVE_XML == '1' }}
