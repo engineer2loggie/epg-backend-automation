@@ -4,23 +4,32 @@
 from __future__ import annotations
 import os, sys, gzip, time, logging, itertools, random, re, unicodedata
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, List, Dict, Optional, Set
+from typing import Iterable, List, Dict, Optional, Set, Tuple
 import requests
 import xml.etree.ElementTree as ET
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 
-# ======== Config ========
+# ==================== Config ====================
+
 WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "12"))
-COUNTRY = "PR"  # Puerto Rico pilot
-FILTER_LIVE = True           # require at least one stream in iptv-org for PR
+
+# Puerto Rico pilot
+COUNTRY = os.environ.get("COUNTRY", "PR").upper()
+
+# If a programme time has **no timezone**, assume this offset.
+# For Puerto Rico the local offset is UTC-4 (no DST).
+DEFAULT_NAIVE_TZ = os.environ.get("DEFAULT_NAIVE_TZ", "-0400")
+
+FILTER_LIVE = True  # require at least one iptv-org stream for COUNTRY
 REFRESH_MV_FUNC = os.environ.get("REFRESH_MV_FUNC", "refresh_programs_next_12h")
+
 REQUEST_TIMEOUT = (10, 180)
 BATCH_CHANNELS = 2000
 BATCH_PROGRAMS = 1000
 MAX_RETRIES = 4
 
-# Open-EPG discovery targets for Puerto Rico
+# Open-EPG discovery for PR (we’ll HEAD these and also scrape the guide page)
 OPEN_EPG_INDEX = "https://www.open-epg.com/app/epgguide.php"
 OPEN_EPG_CANDIDATES = [
     "https://www.open-epg.com/files/puertorico1.xml.gz",
@@ -35,10 +44,17 @@ IPTV_STREAMS_URL  = "https://iptv-org.github.io/api/streams.json"
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
+# Debug knobs
+DEBUG_SAMPLE           = int(os.environ.get("DEBUG_SAMPLE", "12"))
+DEBUG_LOG_UNPARSEABLE  = int(os.environ.get("DEBUG_LOG_UNPARSEABLE", "6"))
+DEBUG_LOG_OUTOFWINDOW  = int(os.environ.get("DEBUG_LOG_OUTOFWINDOW", "6"))
+DEBUG_LOG_JUNKTITLE    = int(os.environ.get("DEBUG_LOG_JUNKTITLE", "6"))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("epg-pr")
 
-# ======== Utils ========
+# ==================== Helpers ====================
+
 def chunked(seq: Iterable[dict], size: int) -> Iterable[List[dict]]:
     it = iter(seq)
     while True:
@@ -55,19 +71,74 @@ def open_xml_stream(resp: requests.Response):
     gz = ("gzip" in ct) or resp.request.url.lower().endswith(".gz")
     return gzip.GzipFile(fileobj=resp.raw) if gz else resp.raw
 
-def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
-    if not raw: return None
-    s = raw.strip()
+# ---------- Flexible XMLTV datetime parsing ----------
+
+_DT_PATTERNS = (
+    # compact with tz or Z
+    ("%Y%m%d%H%M%S%z", None),
+    ("%Y%m%d%H%M%S", "compact"),
+    # dashed with tz or Z
+    ("%Y-%m-%d %H:%M:%S%z", None),
+    ("%Y-%m-%d %H:%M:%S", "dashed"),
+)
+
+def _normalize_tz_tail(s: str) -> str:
+    """
+    Convert '+HH:MM' -> '+HHMM', 'Z' -> '+0000', strip stray space before tz.
+    """
+    s = s.strip()
     if " " in s:
-        a, b = s.rsplit(" ", 1); s = a + b        # remove space before tz
-    if len(s) >= 6 and (not s.endswith("Z")) and s[-3] == ":" and s[-5] in "+-":
-        s = s[:-3] + s[-2:]                       # +HH:MM -> +HHMM
-    if s.endswith("Z"): s = s[:-1] + "+0000"
-    if len(s) == 14: s += "+0000"
+        a, b = s.rsplit(" ", 1)
+        # handle Z / +HH:MM / +HHMM
+        if b.upper() == "Z":
+            return a + " +0000"
+        if re.fullmatch(r"[+-]\d{2}:\d{2}", b):
+            return a + " " + b.replace(":", "")
+    elif s.endswith("Z"):
+        return s[:-1] + "+0000"
+    return s
+
+def parse_xmltv_datetime(raw: Optional[str], naive_tz: str = DEFAULT_NAIVE_TZ) -> Optional[datetime]:
+    """Parse many common XMLTV datetime flavors; attach `naive_tz` if no tz present."""
+    if not raw: return None
+    s = _normalize_tz_tail(raw)
+
+    # First, try all patterns as-given
+    for fmt, kind in _DT_PATTERNS:
+        try:
+            if kind is None:
+                dt = datetime.strptime(s, fmt)
+                return dt.astimezone(timezone.utc)
+            else:
+                # naive form; attach provided offset
+                dt = datetime.strptime(s, fmt)
+                # naive -> pretend it was in local offset, convert to UTC
+                # naive_tz like "-0400" or "+0530"
+                m = re.fullmatch(r"([+-])(\d{2})(\d{2})", naive_tz.strip())
+                if not m:
+                    # fallback to UTC if misconfigured
+                    return dt.replace(tzinfo=timezone.utc)
+                sign, hh, mm = m.groups()
+                offset_minutes = int(hh) * 60 + int(mm)
+                if sign == "-": offset_minutes = -offset_minutes
+                tz = timezone(timedelta(minutes=offset_minutes))
+                return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+        except Exception:
+            continue
+
+    # Try compactifying if there is a trailing tz with colon but no space (rare)
     try:
-        return datetime.strptime(s, "%Y%m%d%H%M%S%z").astimezone(timezone.utc)
+        m = re.match(r"^(\d{8}\d{6})[ ]?([+-]\d{2}):?(\d{2})$", s)
+        if m:
+            core, hh, mm = m.groups()
+            dt = datetime.strptime(core + hh + mm, "%Y%m%d%H%M%S%z")
+            return dt.astimezone(timezone.utc)
     except Exception:
-        return None
+        pass
+
+    return None
+
+# ---------- XML helpers ----------
 
 def localname(tag: str) -> str:
     if not tag: return tag
@@ -84,8 +155,9 @@ def icon_src(channel_el: ET.Element) -> Optional[str]:
                     return v.strip()
     return None
 
-# Name normalization
-STOP = {"tv","hd","uhd","sd","channel","ch","the","pr","us","puerto","rico","+1","+2","fhd","4k"}
+# ---------- Name normalization ----------
+
+STOP = {"tv","hd","uhd","sd","channel","ch","the","pr","puerto","rico","+1","+2","fhd","4k"}
 TOKEN_RE = re.compile(r"[^\w]+")
 
 def norm_name(s: str) -> str:
@@ -94,7 +166,7 @@ def norm_name(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
     s = re.sub(r"\(.*?\)", " ", s)
-    s = s.replace("&"," and ")
+    s = s.replace("&", " and ")
     s = " ".join(s.split())
     return s
 
@@ -103,32 +175,32 @@ def tokens(s: str) -> Set[str]:
 
 JUNK_TITLES = {"", "title", "no title", "untitled", "-", "programme", "program"}
 
-# ======== iptv-org live set (PR) ========
+# ==================== iptv-org live set (COUNTRY) ====================
+
 def fetch_json(url: str):
     log.info("Fetching JSON: %s", url)
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def build_live_pr():
-    """Return (live_name_tokens, name_variants, live_ids)
-       - live_name_tokens: set of tokenized, normalized names for matching
-       - name_variants: map normalized name -> set(channel_ids)
-       - live_ids: set of channel ids (iptv-org) that have at least one stream and country=PR
+def build_live_country(country_code: str) -> Tuple[Dict[str, Set[str]], Set[str]]:
     """
-    channels = fetch_json(IPTV_CHANNELS_URL)  # has 'id','name','alt_names','country',...
-    streams  = fetch_json(IPTV_STREAMS_URL)   # has 'channel','url','title',...
-    pr_ids = {ch["id"] for ch in channels if (ch.get("country") or "").upper() == "PR"}
-    live_ids = {s.get("channel") for s in streams if s.get("channel") in pr_ids}
+    Returns:
+      name_index: normalized name -> set(channel_ids)
+      live_ids: set of iptv-org channel ids that have at least one stream and match country
+    """
+    country_code = country_code.upper()
+    channels = fetch_json(IPTV_CHANNELS_URL)
+    streams  = fetch_json(IPTV_STREAMS_URL)
 
-    name_variants: Dict[str, Set[str]] = {}
-    live_name_tokens: Set[str] = set()
+    country_ids = {ch["id"] for ch in channels if (ch.get("country") or "").upper() == country_code}
+    live_ids = {s.get("channel") for s in streams if s.get("channel") in country_ids}
 
-    # Helper: add a name -> channel id mapping
+    name_index: Dict[str, Set[str]] = {}
     def add_name(nm: str, cid: str):
         key = norm_name(nm)
         if not key: return
-        name_variants.setdefault(key, set()).add(cid)
+        name_index.setdefault(key, set()).add(cid)
 
     for ch in channels:
         cid = ch.get("id")
@@ -137,24 +209,18 @@ def build_live_pr():
         for alt in ch.get("alt_names") or []:
             add_name(alt, cid)
 
-    # also learn from stream titles (helpful aliases)
     for st in streams:
         cid = st.get("channel")
         if cid in live_ids:
             add_name(st.get("title") or "", cid)
 
-    # token cache
-    for key in name_variants.keys():
-        for t in tokens(key):
-            live_name_tokens.add(t)
+    log.info("iptv-org %s: live_ids=%d, name_keys=%d", country_code, len(live_ids), len(name_index))
+    return name_index, live_ids
 
-    log.info("iptv-org PR: live_ids=%d, name_keys=%d, token_vocab=%d", len(live_ids), len(name_variants), len(live_name_tokens))
-    return live_name_tokens, name_variants, live_ids
+# ==================== Discover Open-EPG PR URLs ====================
 
-# ======== discover Open-EPG Puerto Rico URLs ========
 def discover_open_epg_pr() -> List[str]:
     urls: List[str] = []
-    # 1) try known candidates
     session = requests.Session()
     for u in OPEN_EPG_CANDIDATES:
         try:
@@ -163,7 +229,6 @@ def discover_open_epg_pr() -> List[str]:
                 urls.append(u)
         except Exception:
             pass
-    # 2) scan the guide page for /files/puertorico*.xml(.gz)
     try:
         r = session.get(OPEN_EPG_INDEX, timeout=REQUEST_TIMEOUT)
         if r.ok:
@@ -173,11 +238,12 @@ def discover_open_epg_pr() -> List[str]:
                     urls.append(u)
     except Exception:
         pass
-    urls = list(dict.fromkeys(urls))  # de-dup, preserve order
+    urls = list(dict.fromkeys(urls))
     log.info("Open-EPG PR URLs discovered: %s", ", ".join(urls) if urls else "(none)")
     return urls
 
-# ======== Supabase ========
+# ==================== Supabase ====================
+
 def init_supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         log.error("❌ SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
@@ -187,8 +253,7 @@ def init_supabase() -> Client:
         log.info("✅ Connected to Supabase.")
         return sb
     except Exception as e:
-        log.exception("Failed to create Supabase client: %s", e)
-        sys.exit(1)
+        log.exception("Failed to create Supabase client: %s", e); sys.exit(1)
 
 def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, base_batch: int):
     total = 0
@@ -196,7 +261,6 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
     while queue:
         batch = queue.pop(0)
         if conflict == "id":
-            # dedupe within-batch preferring non-junk/longer desc
             dedup: Dict[str, dict] = {}
             for r in batch:
                 k = r.get("id")
@@ -214,6 +278,7 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                         replace = True
                     if replace: dedup[k] = r
             batch = list(dedup.values())
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 sb.table(table).upsert(batch, on_conflict=conflict).execute()
@@ -224,8 +289,7 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                 if need_split and len(batch) > 1:
                     mid = len(batch)//2
                     queue.insert(0, batch[mid:]); queue.insert(0, batch[:mid])
-                    log.warning("Splitting %s batch (%d) due to error: %s", table, len(batch), msg)
-                    break
+                    log.warning("Splitting %s batch (%d) due to error: %s", table, len(batch), msg); break
                 if attempt == MAX_RETRIES:
                     log.error("Giving up on %s batch (%d): %s", table, len(batch), msg)
                 else:
@@ -251,35 +315,34 @@ def refresh_mv(sb: Client):
     except Exception as e:
         log.warning("MV refresh failed: %s", e)
 
-# ======== Core ingest (Puerto Rico only) ========
+# ==================== Core ingest (PR) ====================
+
 def fetch_and_process_pr(sb: Client):
     now_utc = datetime.now(timezone.utc)
     horizon_utc = now_utc + timedelta(hours=WINDOW_HOURS)
-    log.info("Window: %s -> %s (UTC)", now_utc.isoformat(), horizon_utc.isoformat())
+    log.info("Window: %s -> %s (UTC)  (naive times => %s)",
+             now_utc.isoformat(), horizon_utc.isoformat(), DEFAULT_NAIVE_TZ)
 
-    live_tokens, name_index, live_ids = build_live_pr()
+    name_index, live_ids = build_live_country(COUNTRY)
     if FILTER_LIVE and not live_ids:
-        log.warning("No live PR ids found in iptv-org; aborting.")
-        return
+        log.warning("No live ids found for %s in iptv-org; aborting.", COUNTRY); return
 
     epg_urls = discover_open_epg_pr()
     if not epg_urls:
-        log.warning("No Open-EPG Puerto Rico files found; aborting.")
-        return
+        log.warning("No Open-EPG files found for PR; aborting."); return
 
     channels: Dict[str, dict] = {}
     programs: Dict[str, dict] = {}
 
-    def is_live_match(names: List[str]) -> bool:
-        # direct normalized name -> any live channel id
-        for nm in names:
+    # Debug counters
+    dbg_unparseable = 0
+    dbg_out_of_window = 0
+    dbg_junk_title = 0
+
+    def is_live_match(names: List[str], ch_id_text: str) -> bool:
+        for nm in names + [ch_id_text]:
             key = norm_name(nm)
-            if key in name_index:
-                return True
-            # token match fallback (strong)
-            tk = tokens(key)
-            if tk and any(t in live_tokens for t in tk):
-                return True
+            if key in name_index: return True
         return False
 
     for url in epg_urls:
@@ -316,7 +379,7 @@ def fetch_and_process_pr(sb: Client):
 
                         keep = True
                         if FILTER_LIVE:
-                            keep = is_live_match(names) or is_live_match([ch_id])
+                            keep = is_live_match(names, ch_id)
                         keep_channel[ch_id] = keep
                         if keep:
                             disp = names[0] if names else ch_id
@@ -330,12 +393,26 @@ def fetch_and_process_pr(sb: Client):
                         if FILTER_LIVE and not keep_channel.get(ch_id, False):
                             el.clear(); continue
 
-                        s = parse_xmltv_datetime(el.get("start"))
-                        e = parse_xmltv_datetime(el.get("stop"))
-                        if not (s and e): el.clear(); continue
-                        if not (s <= horizon_utc and e >= now_utc): el.clear(); continue
+                        raw_start = el.get("start")
+                        raw_stop  = el.get("stop")
+                        s = parse_xmltv_datetime(raw_start)
+                        e = parse_xmltv_datetime(raw_stop)
 
-                        # choose best non-junk title; prefer first <title> then <sub-title>
+                        if not (s and e):
+                            if dbg_unparseable < DEBUG_LOG_UNPARSEABLE:
+                                log.info("DEBUG skip (unparseable time): ch=%s start=%s stop=%s raw=%s",
+                                         ch_id, raw_start, raw_stop, ET.tostring(el, encoding="unicode")[:300])
+                            dbg_unparseable += 1
+                            el.clear(); continue
+
+                        if not (s <= horizon_utc and e >= now_utc):
+                            if dbg_out_of_window < DEBUG_LOG_OUTOFWINDOW:
+                                log.info("DEBUG skip (outside window): ch=%s start=%s stop=%s now=%s horizon=%s",
+                                         ch_id, s.isoformat(), e.isoformat(),
+                                         now_utc.isoformat(), horizon_utc.isoformat())
+                            dbg_out_of_window += 1
+                            el.clear(); continue
+
                         title = ""
                         desc = ""
                         for child in list(el):
@@ -351,6 +428,9 @@ def fetch_and_process_pr(sb: Client):
                                 if d: desc = d
 
                         if not title or norm_name(title) in JUNK_TITLES:
+                            if dbg_junk_title < DEBUG_LOG_JUNKTITLE:
+                                log.info("DEBUG skip (junk/empty title): ch=%s start=%s title=%r", ch_id, s.isoformat(), title)
+                            dbg_junk_title += 1
                             el.clear(); continue
 
                         pid = f"{ch_id}_{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}"
@@ -362,6 +442,7 @@ def fetch_and_process_pr(sb: Client):
                             "title": title,
                             "description": desc or None
                         }
+
                         prev = programs.get(pid)
                         if prev is None:
                             programs[pid] = row
@@ -409,7 +490,6 @@ def fetch_and_process_pr(sb: Client):
         log.warning("No programmes kept (check matching/window).")
 
     # Verify, cleanup, refresh
-    cnt = -1
     try:
         res = sb.table("programs").select("id", count="exact")\
             .gte("end_time", now_utc.isoformat())\
@@ -429,7 +509,8 @@ def fetch_and_process_pr(sb: Client):
 
     refresh_mv(sb)
 
-# ======== Entrypoint ========
+# ==================== Entrypoint ====================
+
 def main() -> int:
     log.info("PR pilot: iptv-org LIVE + Open-EPG Puerto Rico, window=%dh", WINDOW_HOURS)
     sb = init_supabase()
