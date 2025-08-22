@@ -1,167 +1,334 @@
-# main.py
-import os
-import requests
-import gzip
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
-import sys
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Refactored XMLTV -> Supabase ingester
+- Streams & parses .xml or .xml.gz
+- Normalizes XMLTV timestamps
+- Writes channels + next-24h programmes to Supabase
+- Deletes programmes that ended >24h ago
 
-# --- Configuration ---
-# Your list of EPG URLs
-EPG_URLS = [
+ENV:
+  SUPABASE_URL           (required)
+  SUPABASE_SERVICE_KEY   (required)
+  EPG_URLS               (optional, comma-separated; defaults to epgshare01 ALL_SOURCES)
+"""
+
+from __future__ import annotations
+import os
+import sys
+import io
+import gzip
+import time
+import logging
+import itertools
+from datetime import datetime, timezone, timedelta
+from typing import Iterable, List, Dict, Optional, Tuple
+
+import requests
+import xml.etree.ElementTree as ET
+from supabase import create_client, Client
+
+# ----------------------- Config -----------------------
+
+DEFAULT_EPG_URLS = [
     "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 ]
 
-# --- Supabase Configuration ---
-# These will be loaded from environment variables (GitHub Secrets)
+BATCH_SIZE_CHANNELS = 5000
+BATCH_SIZE_PROGRAMS = 5000
+REQUEST_TIMEOUT = (10, 180)  # (connect, read) seconds
+
+# ----------------------- Logging ----------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("epg")
+
+# ----------------------- Env --------------------------
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-def initialize_supabase_client():
-    """Initializes and returns the Supabase client, exiting if config is missing."""
+_raw_urls = os.environ.get("EPG_URLS", "")
+if _raw_urls.strip():
+    EPG_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
+else:
+    EPG_URLS = DEFAULT_EPG_URLS[:]
+
+# ----------------------- Helpers ----------------------
+
+
+def chunked(seq: Iterable[dict], size: int) -> Iterable[List[dict]]:
+    it = iter(seq)
+    while True:
+        block = list(itertools.islice(it, size))
+        if not block:
+            return
+        yield block
+
+
+def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
+    """
+    Accepts common XMLTV forms:
+      - YYYYMMDDHHMMSS Z         (note the space before offset)
+      - YYYYMMDDHHMMSSZ          (Z)
+      - YYYYMMDDHHMMSS+HH:MM
+      - YYYYMMDDHHMMSS+HHMM
+      - YYYYMMDDHHMMSS           (assume UTC)
+    Returns aware UTC datetime, or None.
+    """
+    if not raw:
+        return None
+
+    s = raw.strip()
+
+    # Remove whitespace between datetime and tz if present, e.g. "20250820103000 +0000"
+    if " " in s and (s.endswith("Z") or s[-5] in ["+", "-"]):
+        parts = s.rsplit(" ", 1)
+        s = "".join(parts)
+
+    # Normalize +HH:MM -> +HHMM
+    if len(s) >= 5 and (s[-3] == ":" and (s[-6] in ["+", "-"])):
+        s = s[:-3] + s[-2:]
+
+    # Add UTC if missing tz entirely
+    if len(s) == 14:  # YYYYMMDDHHMMSS
+        s = s + "+0000"
+
+    # Handle trailing Z
+    if s.endswith("Z") and len(s) == 15:  # 14 + "Z"
+        s = s[:-1] + "+0000"
+
+    try:
+        # Expect exactly 'YYYYMMDDHHMMSS±HHMM'
+        dt = datetime.strptime(s, "%Y%m%d%H%M%S%z")
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def time_windows_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    """True if [a_start, a_end] intersects [b_start, b_end]."""
+    return a_start <= b_end and a_end >= b_start
+
+
+def open_xml_stream(resp: requests.Response, url: str):
+    """
+    Returns a file-like object suitable for ET.iterparse().
+    Handles .gz by wrapping in gzip.GzipFile.
+    """
+    # Ensure urllib3 will decompress if the server used Content-Encoding
+    resp.raw.decode_content = True
+
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    is_gz = url.lower().endswith(".gz") or "gzip" in ct or "application/gzip" in ct
+
+    raw_stream = resp.raw  # file-like
+
+    if is_gz:
+        # Wrap in GzipFile to get raw XML stream
+        return gzip.GzipFile(fileobj=raw_stream)
+    else:
+        return raw_stream
+
+
+def preferred_text(elem: ET.Element, tag: str) -> Optional[str]:
+    """
+    Return the first non-empty text for the given tag under elem.
+    (XMLTV can include multiple <title> / <desc> with lang attributes.)
+    """
+    for child in elem.findall(tag):
+        if child.text and child.text.strip():
+            return child.text.strip()
+    return None
+
+
+# ----------------------- Supabase ---------------------
+
+
+def init_supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("❌ ERROR: Supabase URL and Service Key must be set as environment variables in GitHub Secrets.", file=sys.stderr)
+        log.error("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
         sys.exit(1)
-    
     try:
         client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        print("✅ Successfully connected to Supabase.")
+        log.info("Connected to Supabase.")
         return client
     except Exception as e:
-        print(f"❌ ERROR: Failed to connect to Supabase: {e}", file=sys.stderr)
+        log.exception("Failed to create Supabase client: %s", e)
         sys.exit(1)
 
-def parse_xmltv_datetime(dt_str):
-    """Parses the unique XMLTV datetime format into a timezone-aware datetime object."""
+
+def upsert_channels(sb: Client, rows: List[dict]):
+    total = 0
+    for batch in chunked(rows, BATCH_SIZE_CHANNELS):
+        sb.table("channels").upsert(batch, on_conflict="id").execute()
+        total += len(batch)
+    log.info("Upserted %d channels.", total)
+
+
+def upsert_programs(sb: Client, rows: List[dict]):
+    total = 0
+    for batch in chunked(rows, BATCH_SIZE_PROGRAMS):
+        sb.table("programs").upsert(batch, on_conflict="id").execute()
+        total += len(batch)
+    log.info("Upserted %d programs.", total)
+
+
+def cleanup_old_programs(sb: Client, older_than_utc: datetime):
     try:
-        # Some XMLTV formats have a space before the timezone, this handles that.
-        if ' ' in dt_str:
-            parts = dt_str.rsplit(' ', 1)
-            dt_str = ''.join(parts)
-        return datetime.strptime(dt_str, '%Y%m%d%H%M%S%z')
-    except (ValueError, TypeError):
-        return None  # Return None if format is invalid
+        sb.table("programs").delete().lt("end_time", older_than_utc.isoformat()).execute()
+        log.info("Deleted programs with end_time < %s.", older_than_utc.isoformat())
+    except Exception as e:
+        log.warning("Cleanup failed: %s", e)
 
-def fetch_and_process_epg(supabase: Client):
-    """Fetches, parses, and upserts EPG data into Supabase."""
-    print("🚀 Starting EPG update process...")
 
-    all_channels_to_upsert = []
-    all_programs_to_upsert = []
-    valid_channel_ids = set()
+# ----------------------- Core ingest ------------------
 
-    # Loop through each EPG URL and process it
-    for url in EPG_URLS:
+
+def fetch_and_process_epg(sb: Client, urls: List[str]):
+    now_utc = datetime.now(timezone.utc)
+    horizon_utc = now_utc + timedelta(hours=24)
+
+    # Accumulators across all files
+    all_channels: Dict[str, dict] = {}  # id -> row
+    programs: List[dict] = []
+
+    for url in urls:
+        log.info("Fetching EPG: %s", url)
         try:
-            print(f"\n📡 Fetching EPG data from {url}...")
-            # Use stream=True for large file downloads
-            response = requests.get(url, stream=True, timeout=120)
-            response.raise_for_status()
+            with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as resp:
+                resp.raise_for_status()
+                stream = open_xml_stream(resp, url)
+                context = ET.iterparse(stream, events=("start", "end"))
+                # Advance to get the root element
+                _, root = next(context)
 
-            # Decompress and parse the XML incrementally
-            if url.endswith('.gz'):
-                with gzip.GzipFile(fileobj=response.raw) as f:
-                    context = ET.iterparse(f, events=('start', 'end'))
-                    # Skip the root element to start parsing on child elements
-                    event, root = next(context)
-            else:
-                context = ET.iterparse(response.raw, events=('start', 'end'))
-                event, root = next(context)
+                found_channels = 0
+                found_programs = 0
+                kept_programs = 0
 
-            print(f"✅ Successfully downloaded and starting to parse data from {url}.")
+                for event, elem in context:
+                    if event != "end":
+                        continue
 
-            channels_in_this_file = 0
-            programs_in_this_file = 0
+                    tag = elem.tag
 
-            for event, elem in context:
-                if event == 'end':
-                    if elem.tag == 'channel':
-                        channel_id = elem.get('id')
-                        display_name_node = elem.find('display-name')
-                        icon_node = elem.find('icon')
+                    if tag == "channel":
+                        ch_id = elem.get("id")
+                        if ch_id:
+                            display_name = preferred_text(elem, "display-name") or ch_id
+                            icon_url = None
+                            icon_node = elem.find("icon")
+                            if icon_node is not None:
+                                icon_url = icon_node.get("src")
+                            if ch_id not in all_channels:
+                                all_channels[ch_id] = {
+                                    "id": ch_id,
+                                    "display_name": display_name,
+                                    "icon_url": icon_url,
+                                }
+                                found_channels += 1
+                        elem.clear()
+                        continue
 
-                        if channel_id and display_name_node is not None and display_name_node.text:
-                            # Avoid adding duplicate channels
-                            if channel_id not in valid_channel_ids:
-                                all_channels_to_upsert.append({
-                                    'id': channel_id,
-                                    'display_name': display_name_node.text,
-                                    'icon_url': icon_node.get('src') if icon_node is not None else None
-                                })
-                                valid_channel_ids.add(channel_id)
-                                channels_in_this_file += 1
-                        elem.clear() # Clear the element and its children to free memory
+                    if tag == "programme":
+                        found_programs += 1
+                        ch_id = elem.get("channel")
+                        start_dt = parse_xmltv_datetime(elem.get("start"))
+                        end_dt = parse_xmltv_datetime(elem.get("stop"))
 
-                    elif elem.tag == 'programme':
-                        # Diagnostic print to check if programs are being found
-                        print(f"Found a program element. Current count: {programs_in_this_file + 1}")
-                        
-                        channel_id = elem.get('channel')
-                        start_dt = parse_xmltv_datetime(elem.get('start'))
-                        end_dt = parse_xmltv_datetime(elem.get('stop'))
-
-                        # Skip if essential data is missing or invalid
-                        if not start_dt or not end_dt:
-                            print("Warning: Skipping program due to invalid start/end time.")
+                        if not (ch_id and start_dt and end_dt):
                             elem.clear()
                             continue
 
-                        title_node = elem.find('title')
-                        desc_node = elem.find('desc')
-                        
-                        program_id = f"{channel_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
+                        # Keep only if overlaps [now, now+24h]
+                        if not time_windows_overlap(start_dt, end_dt, now_utc, horizon_utc):
+                            elem.clear()
+                            continue
 
-                        all_programs_to_upsert.append({
-                            'id': program_id,
-                            'channel_id': channel_id,
-                            'start_time': start_dt.isoformat(),
-                            'end_time': end_dt.isoformat(),
-                            'title': title_node.text if title_node is not None else 'No Title',
-                            'description': desc_node.text if desc_node is not None else None
+                        title = preferred_text(elem, "title") or "No Title"
+                        desc = preferred_text(elem, "desc")
+
+                        # Programme unique id: channel + start timestamp
+                        prog_id = f"{ch_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
+
+                        programs.append({
+                            "id": prog_id,
+                            "channel_id": ch_id,
+                            "start_time": start_dt.isoformat(),
+                            "end_time": end_dt.isoformat(),
+                            "title": title,
+                            "description": desc
                         })
-                        programs_in_this_file += 1
-                        elem.clear() # Clear the element and its children to free memory
-            
-            print(f"\nCompleted parsing. Found {channels_in_this_file} unique channels and {programs_in_this_file} programs.")
+                        kept_programs += 1
+
+                        elem.clear()
+                        # Occasionally clear the root to free memory
+                        if kept_programs % 5000 == 0:
+                            root.clear()
+                        continue
+
+                    # For any other end-tag, just clear to save memory
+                    elem.clear()
+
+                log.info(
+                    "Parsed file done: channels=%d (new), programs_found=%d, programs_kept_24h=%d",
+                    found_channels, found_programs, kept_programs
+                )
 
         except requests.exceptions.RequestException as e:
-            print(f"❌ ERROR: Failed to download data from {url}: {e}", file=sys.stderr)
+            log.error("HTTP error for %s: %s", url, e)
         except ET.ParseError as e:
-            print(f"❌ ERROR: Failed to parse XML data from {url}: {e}", file=sys.stderr)
+            log.error("XML parse error for %s: %s", url, e)
         except Exception as e:
-            print(f"❌ An unexpected error occurred with {url}: {e}", file=sys.stderr)
-    
-    # --- Bulk Upsert Channels and Programs after looping through all files ---
-    if all_channels_to_upsert:
-        print(f"\n--- Upserting {len(all_channels_to_upsert)} Channels ---")
-        try:
-            supabase.table('channels').upsert(all_channels_to_upsert).execute()
-            print("✅ Channels upserted successfully.")
-        except Exception as e:
-            print(f"❌ ERROR: Failed to upsert channels: {e}", file=sys.stderr)
+            log.exception("Unexpected error for %s: %s", url, e)
 
-    if all_programs_to_upsert:
-        print(f"\n--- Upserting {len(all_programs_to_upsert)} Programs ---")
-        try:
-            # We use `on_conflict='id'` to ensure we update existing rows if they exist
-            supabase.table('programs').upsert(all_programs_to_upsert, on_conflict='id').execute()
-            print("✅ Programs upserted successfully.")
-        except Exception as e:
-            print(f"❌ ERROR: Failed to upsert programs: {e}", file=sys.stderr)
-    
-    # --- Cleanup Old Programs ---
-    print("\n--- Cleaning up old programs ---")
-    try:
-        # Delete programs that ended more than 24 hours ago
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        supabase.table('programs').delete().lt('end_time', yesterday).execute()
-        print("✅ Successfully deleted old programs.")
-    except Exception as e:
-        print(f"⚠️ WARNING: Could not delete old programs. Error: {e}")
-    
-    print("\n✅ EPG update process completed!")
+    # Ensure all referenced channel_ids exist (in case some <programme> lacked a <channel> block)
+    referenced_ids = {p["channel_id"] for p in programs}
+    missing = referenced_ids.difference(all_channels.keys())
+    if missing:
+        log.warning("Programs reference %d channels missing in <channel> list. Creating placeholders.", len(missing))
+        for ch_id in missing:
+            all_channels[ch_id] = {
+                "id": ch_id,
+                "display_name": ch_id,
+                "icon_url": None,
+            }
+
+    # Upserts
+    if all_channels:
+        upsert_channels(sb, list(all_channels.values()))
+    else:
+        log.warning("No channels parsed to upsert.")
+
+    if programs:
+        # Sort (optional) for nicer batching by channel/time
+        programs.sort(key=lambda r: (r["channel_id"], r["start_time"]))
+        upsert_programs(sb, programs)
+    else:
+        log.warning("No programs kept for next 24h; check timestamp parsing and window.")
+
+    # Cleanup: delete programmes that ended more than 24h ago
+    cleanup_old_programs(sb, older_than_utc=now_utc - timedelta(hours=24))
+
+    log.info("Done. Channels total upserted: %d; Programs total upserted: %d",
+             len(all_channels), len(programs))
+
+
+# ----------------------- Entrypoint -------------------
+
+
+def main() -> int:
+    log.info("EPG ingest starting. URLs: %s", ", ".join(EPG_URLS))
+    sb = init_supabase()
+    t0 = time.time()
+    fetch_and_process_epg(sb, EPG_URLS)
+    log.info("Finished in %.1fs", time.time() - t0)
+    return 0
+
 
 if __name__ == "__main__":
-    supabase_client = initialize_supabase_client()
-    fetch_and_process_epg(supabase_client)
+    sys.exit(main())
