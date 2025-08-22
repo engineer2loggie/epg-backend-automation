@@ -19,7 +19,7 @@ on:
 jobs:
   ingest:
     # 👉 Make sure these labels MATCH what you configured on the Pi
-    runs-on: [self-hosted, linux, pi, home, hiptv.ddns.net, arm64]
+    runs-on: self-hosted
     # If your Pi is 32-bit, use: runs-on: [self-hosted, linux, pi, home, hiptv.ddns.net, arm]
     timeout-minutes: 60
 
