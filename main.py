@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import os, sys, gzip, time, logging, itertools, random
+import os, sys, gzip, time, logging, itertools, random, json
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, List, Dict, Optional
+from typing import Iterable, List, Dict, Optional, Set
 
 import requests
 import xml.etree.ElementTree as ET
@@ -17,13 +17,33 @@ DEFAULT_EPG_URLS = [
     "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 ]
 
-REQUEST_TIMEOUT = (10, 180)  # (connect, read)
+REQUEST_TIMEOUT = (10, 180)
 BATCH_CHANNELS = 2000
-BATCH_PROGRAMS = 1000        # smaller to avoid PostgREST payload issues
+BATCH_PROGRAMS = 1000
 MAX_RETRIES = 4
 
-# Refresh MV after ingest? (default yes)
-REFRESH_MV = os.environ.get("REFRESH_MV", "1") not in ("0", "false", "False", "")
+# ### CHANGED: 12h horizon by default
+WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "12"))
+
+# Refresh MV after ingest?
+REFRESH_MV = os.environ.get("REFRESH_MV", "1") not in ("0","false","False","")
+
+# ### NEW: only keep live streams & restrict countries
+FILTER_LIVE = os.environ.get("FILTER_LIVE", "1") not in ("0","false","False","")
+ALLOWED_COUNTRIES = os.environ.get(
+    "ALLOWED_COUNTRIES",
+    "PR,US,MX,ES,DE,CA,IT,GB,IE,CO,AU"
+).replace(" ", "").split(",")
+
+# iptv-org sources
+IPTV_CHANNELS_URL = os.environ.get(
+    "IPTV_CHANNELS_URL",
+    "https://iptv-org.github.io/api/channels.json"
+)
+IPTV_STREAMS_URL = os.environ.get(
+    "IPTV_STREAMS_URL",
+    "https://iptv-org.github.io/api/streams.json"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("epg")
@@ -48,28 +68,18 @@ def rand_jitter() -> float:
     return 0.25 + random.random() * 0.75
 
 def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
-    """Parse XMLTV datetime to UTC-aware datetime."""
     if not raw:
         return None
     s = raw.strip()
-
-    # remove accidental space before tz (e.g. '...  +0200')
     if " " in s:
         a, b = s.rsplit(" ", 1)
         s = a + b
-
-    # normalize +HH:MM -> +HHMM
-    if len(s) >= 6 and (s.endswith("Z") is False) and s[-3] == ":" and s[-5] in "+-":
+    if len(s) >= 6 and (not s.endswith("Z")) and s[-3] == ":" and s[-5] in "+-":
         s = s[:-3] + s[-2:]
-
-    # trailing 'Z' -> '+0000'
     if s.endswith("Z"):
         s = s[:-1] + "+0000"
-
-    # add UTC if no tz
-    if len(s) == 14:  # YYYYMMDDHHMMSS
+    if len(s) == 14:
         s += "+0000"
-
     try:
         dt = datetime.strptime(s, "%Y%m%d%H%M%S%z")
         return dt.astimezone(timezone.utc)
@@ -77,16 +87,12 @@ def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
         return None
 
 def open_xml_stream(resp: requests.Response, url: str):
-    """Return a file-like stream; transparently ungzip if needed."""
     resp.raw.decode_content = True
     ct = (resp.headers.get("Content-Type") or "").lower()
     gz = url.lower().endswith(".gz") or "gzip" in ct or "application/gzip" in ct
     return gzip.GzipFile(fileobj=resp.raw) if gz else resp.raw
 
-# ---- Namespace-agnostic XML utilities ----
-
 def localname(tag: str) -> str:
-    """Return the local tag name without namespace."""
     if not tag:
         return tag
     if tag[0] == '{':
@@ -94,11 +100,9 @@ def localname(tag: str) -> str:
     return tag
 
 def text_from(elem: ET.Element) -> str:
-    """Concatenate all text from an element (handles CDATA/nested tags)."""
     return ''.join(elem.itertext()).strip() if elem is not None else ''
 
 def first_text_by_names(elem: ET.Element, *names: str) -> str:
-    """Find first child by local tag name in `names`, return combined text."""
     wanted = {n.lower() for n in names}
     for child in list(elem):
         if localname(child.tag).lower() in wanted:
@@ -115,7 +119,6 @@ def find_child(elem: ET.Element, name: str) -> Optional[ET.Element]:
     return None
 
 def icon_src(elem: ET.Element) -> Optional[str]:
-    """Get <icon src='...'> handling namespaces on tag/attr."""
     ic = find_child(elem, 'icon')
     if ic is None:
         return None
@@ -139,14 +142,10 @@ def init_supabase() -> Client:
         sys.exit(1)
 
 def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, base_batch: int):
-    """Upsert rows with retries; if we hit duplicate-within-batch or server errors,
-    split the batch and retry smaller pieces."""
     total = 0
     queue: List[List[dict]] = list(chunked(rows, base_batch))
-
     while queue:
         batch = queue.pop(0)
-        # de-dupe IDs inside the batch to prevent 21000
         if conflict == "id":
             dedup: Dict[str, dict] = {}
             for r in batch:
@@ -177,13 +176,11 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                 break
             except APIError as e:
                 msg = str(e)
-                need_split = (
-                    "21000" in msg or
-                    "duplicate key value violates" in msg or
-                    "500" in msg or
-                    "413" in msg or
-                    "Payload" in msg
-                )
+                need_split = ("21000" in msg or
+                              "duplicate key value violates" in msg or
+                              "500" in msg or
+                              "413" in msg or
+                              "Payload" in msg)
                 if need_split and len(batch) > 1:
                     mid = len(batch) // 2
                     queue.insert(0, batch[mid:])
@@ -203,32 +200,18 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                 else:
                     sleep_s = attempt * rand_jitter()
                     log.warning("Retry %d/%d for %s (%d rows) in %.2fs (unexpected): %s",
-                                attempt, MAX_RETRIES, table, len(batch), sleep_s, e)
+                                attempt, MAX_RETRIES, table, len(batch), e)
                     time.sleep(sleep_s)
-
     log.info("Upserted %d rows into %s.", total, table)
 
-def count_programs_in_window(sb: Client, start_utc: datetime, end_utc: datetime) -> int:
-    try:
-        res = sb.table("programs")\
-            .select("id", count="exact")\
-            .gte("end_time", start_utc.isoformat())\
-            .lte("start_time", end_utc.isoformat())\
-            .execute()
-        return getattr(res, "count", None) or 0
-    except Exception as e:
-        log.warning("Count query failed: %s", e)
-        return -1
-
-def refresh_next_24h_mv(sb: Client) -> None:
-    """Calls the secure RPC to refresh the materialized view."""
+def refresh_next_12h_mv(sb: Client) -> None:
     if not REFRESH_MV:
         log.info("Skipping materialized view refresh (REFRESH_MV disabled).")
         return
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            log.info("Refreshing materialized view: programs_next_24h …")
-            sb.rpc("refresh_programs_next_24h").execute()
+            log.info("Refreshing materialized view: programs_next_12h …")
+            sb.rpc("refresh_programs_next_12h").execute()
             log.info("✅ Materialized view refreshed.")
             return
         except Exception as e:
@@ -239,12 +222,61 @@ def refresh_next_24h_mv(sb: Client) -> None:
             log.warning("Retry %d/%d refreshing MV in %.2fs: %s", attempt, MAX_RETRIES, sleep_s, e)
             time.sleep(sleep_s)
 
+# -------------------- iptv-org helpers ----------------
+
+def fetch_json(url: str) -> list:
+    log.info("Fetching: %s", url)
+    r = requests.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def build_live_channel_set() -> Set[str]:
+    """
+    Returns a set of channel IDs (matching XMLTV channel IDs)
+    that are both (a) in allowed countries and (b) currently live.
+    """
+    if not FILTER_LIVE:
+        log.info("FILTER_LIVE disabled; accepting all channels.")
+        return set()
+
+    channels = fetch_json(IPTV_CHANNELS_URL)  # list of dicts
+    streams  = fetch_json(IPTV_STREAMS_URL)   # list of dicts
+
+    # Map channel id -> country
+    id_to_country: Dict[str, Optional[str]] = {}
+    for ch in channels:
+        cid = ch.get("id")
+        ctry = (ch.get("country") or "").upper() or None
+        if cid:
+            id_to_country[cid] = ctry
+
+    allowed = set([c.upper() for c in ALLOWED_COUNTRIES])
+    live_ids: Set[str] = set()
+
+    count_live = 0
+    for st in streams:
+        if st.get("status") != "online":
+            continue
+        cid = st.get("channel")
+        if not cid:
+            continue
+        ctry = id_to_country.get(cid)
+        if ctry and ctry in allowed:
+            live_ids.add(cid)
+            count_live += 1
+
+    log.info("Live channels in allowed countries: %d", len(live_ids))
+    return live_ids
+
 # ----------------------- Core ingest ------------------
 
 def fetch_and_process_epg(sb: Client, urls: List[str]):
     now_utc = datetime.now(timezone.utc)
-    horizon_utc = now_utc + timedelta(hours=24)
+    horizon_utc = now_utc + timedelta(hours=WINDOW_HOURS)
     log.info("Window: %s -> %s (UTC)", now_utc.isoformat(), horizon_utc.isoformat())
+
+    # ### NEW: restrict to live channels in allowed countries
+    live_channels = build_live_channel_set()
 
     channels: Dict[str, dict] = {}  # id -> row
     programs: Dict[str, dict] = {}  # id -> row
@@ -261,7 +293,6 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                 c_new = 0
                 p_seen = 0
                 p_kept = 0
-                empty_titles = 0
 
                 for ev, el in context:
                     if ev != "end":
@@ -269,12 +300,14 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
 
                     tag = localname(el.tag)
 
-                    # --- channels ---
                     if tag == "channel":
                         ch_id = el.get("id")
                         if ch_id:
                             name = first_text_by_names(el, "display-name") or ch_id
                             icon = icon_src(el)
+                            # If filtering by live, only keep live channels
+                            if live_channels and ch_id not in live_channels:
+                                el.clear(); continue
                             if ch_id not in channels:
                                 channels[ch_id] = {
                                     "id": ch_id,
@@ -285,7 +318,6 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                         el.clear()
                         continue
 
-                    # --- programmes ---
                     if tag == "programme":
                         p_seen += 1
                         ch_id = el.get("channel")
@@ -294,14 +326,16 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                         if not (ch_id and s and e):
                             el.clear(); continue
 
-                        # keep only items that overlap [now, now+24h]
+                        # Must be within [now, now+WINDOW_HOURS]
                         if not (s <= horizon_utc and e >= now_utc):
+                            el.clear(); continue
+
+                        # Must be live channel (if filtering)
+                        if live_channels and ch_id not in live_channels:
                             el.clear(); continue
 
                         title = (first_text_by_names(el, "title", "sub-title") or "No Title").strip()
                         desc  = first_text_by_names(el, "desc").strip() or None
-                        if title == "No Title":
-                            empty_titles += 1
 
                         pid = f"{ch_id}_{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}"
                         row = {
@@ -318,17 +352,14 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                             programs[pid] = row
                             p_kept += 1
                         else:
-                            prev_t = (prev.get("title") or "")
-                            cand_t = (row.get("title") or "")
+                            # prefer rows with real title and longer description
+                            prev_t = (prev.get("title") or "").strip()
+                            cand_t = (row.get("title") or "").strip()
                             prev_d = (prev.get("description") or "") or ""
                             cand_d = (row.get("description") or "") or ""
-                            replace = False
-                            if prev_t.strip() == "No Title" and cand_t.strip() != "No Title":
-                                replace = True
-                            elif len(cand_d) > len(prev_d):
-                                replace = True
-                            if replace:
+                            if (prev_t == "No Title" and cand_t != "No Title") or (len(cand_d) > len(prev_d)):
                                 programs[pid] = row
+
                         el.clear()
                         if (p_kept % 8000) == 0:
                             root.clear()
@@ -337,8 +368,8 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
                     el.clear()
 
                 log.info(
-                    "Parsed file done: channels=%d (new), programs_found=%d, programs_kept_24h=%d, no_title=%d",
-                    c_new, p_seen, p_kept, empty_titles
+                    "Parsed file done: channels(new)=%d, programs_found=%d, programs_kept_%dh=%d",
+                    c_new, p_seen, WINDOW_HOURS, p_kept
                 )
 
         except requests.exceptions.RequestException as e:
@@ -348,7 +379,7 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
         except Exception as e:
             log.exception("Unexpected error for %s: %s", url, e)
 
-    # Ensure all program.channel_id exist in channels
+    # Ensure all program.channel_id exist in channels (should normally be true)
     referenced = {p["channel_id"] for p in programs.values()}
     missing = referenced.difference(channels.keys())
     if missing:
@@ -365,32 +396,22 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
     prog_rows = list(programs.values())
     log.info("Programs to upsert (deduped): %d", len(prog_rows))
 
-    for sample in prog_rows[:3]:
-        log.info("Sample program row: %s", {k: sample[k] for k in ("id", "channel_id", "start_time", "end_time", "title")})
-
     if prog_rows:
         prog_rows.sort(key=lambda r: (r["channel_id"], r["start_time"]))
         upsert_with_retry(sb, "programs", prog_rows, conflict="id", base_batch=BATCH_PROGRAMS)
     else:
-        log.warning("No programs kept in 24h window. (Check time parsing/window)")
+        log.warning("No programs kept in %d-hour window. (Check time parsing/window/live filter)", WINDOW_HOURS)
 
-    # verify
-    cnt = count_programs_in_window(sb, now_utc, horizon_utc)
-    if cnt >= 0:
-        log.info("✅ Supabase now has %d programs in the 24h window.", cnt)
-    else:
-        log.info("⚠️ Skipped verification count due to error.")
-
-    # cleanup: old programs
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    # Cleanup: remove anything older than now-12h (keeps table tiny)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
     try:
         sb.table("programs").delete().lt("end_time", cutoff.isoformat()).execute()
         log.info("Cleaned up programs with end_time < %s", cutoff.isoformat())
     except Exception as e:
         log.warning("Cleanup failed: %s", e)
 
-    # refresh MV (secure RPC)
-    refresh_next_24h_mv(sb)
+    # Refresh MV (12h)
+    refresh_next_12h_mv(sb)
 
     log.info("Done. Channels upserted: %d; Programs considered: %d", len(channels), len(prog_rows))
 
@@ -398,7 +419,19 @@ def fetch_and_process_epg(sb: Client, urls: List[str]):
 
 def main() -> int:
     log.info("EPG ingest starting. URLs: %s", ", ".join(EPG_URLS))
+    log.info("FILTER_LIVE=%s, ALLOWED_COUNTRIES=%s, WINDOW_HOURS=%d",
+             FILTER_LIVE, ",".join(ALLOWED_COUNTRIES), WINDOW_HOURS)
     sb = init_supabase()
+
+    # Optional: hard wipe each run to guarantee small DB
+    if os.environ.get("TRUNCATE_ON_START", "0") in ("1","true","True"):
+        try:
+            sb.rpc("exec_sql", {"sql": "TRUNCATE TABLE public.programs RESTART IDENTITY; TRUNCATE TABLE public.channels RESTART IDENTITY;"}).execute()
+            log.info("Truncated tables at start (TRUNCATE_ON_START=1).")
+        except Exception:
+            # If you don’t have an exec_sql RPC, just skip silently.
+            pass
+
     t0 = time.time()
     fetch_and_process_epg(sb, EPG_URLS)
     log.info("Finished in %.1fs", time.time() - t0)
