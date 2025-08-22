@@ -1,0 +1,65 @@
+name: Open-EPG PR ingest (XML-only)
+
+on:
+  workflow_dispatch: {}
+  # Uncomment to run hourly or nightly, etc.
+  # schedule:
+  #   - cron: "0 * * * *"  # every hour
+
+jobs:
+  run-ingest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "supabase>=2" postgrest requests
+
+      - name: Run PR ingest
+        env:
+          # --- your Supabase creds from repo/org secrets ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+          # --- force XML only (no .gz) ---
+          OPEN_EPG_FILES: "https://www.open-epg.com/files/puertorico1.xml,https://www.open-epg.com/files/puertorico2.xml"
+
+          # --- windowing/live OFF for the parsing test ---
+          WINDOW_HOURS: "0"
+          ENFORCE_LIVE: "0"
+
+          # --- language prefs & debug knobs ---
+          PREFER_LANGS: "es-pr,es,en"
+
+          # dump a few programme nodes so you can see title/desc in logs
+          DEBUG_DUMP_PROGRAM_CHILDREN: "6"
+
+          # one-shot lookup: the “Salud Total” slot
+          TEST_LOOKUP_CHANNEL: "3ABN LATINO WTPM DT3 PUERTO RICO.pr"
+          TEST_LOOKUP_START: "20250822223000 +0000"
+
+          # optional: skip super-thin feeds (disabled by default)
+          # RICHNESS_MIN_TITLE_RATIO: "0.02"
+
+          # optional: save fetched XML to workspace (useful for diffs)
+          # SAVE_FETCHED_XML: "1"
+        run: |
+          python main.py
+
+      # Optional: upload saved XML if you set SAVE_FETCHED_XML=1
+      - name: Upload saved XML artifacts
+        if: env.SAVE_FETCHED_XML == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetched-open-epg-xml
+          path: /tmp/open_epg_fetch_*.xml
+          if-no-files-found: ignore
