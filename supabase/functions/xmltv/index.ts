@@ -1,12 +1,3 @@
-# .github/workflows/deploy-xmltv.yml
-name: Deploy xmltv Edge Function
-on:
-  push:
-    paths:
-      - "supabase/functions/xmltv/**"
-      - ".github/workflows/deploy-xmltv.yml"
-  workflow_dispatch:
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -24,7 +15,7 @@ jobs:
             SUPABASE_URL="https://${{ secrets.SUPABASE_PROJECT_REF }}.supabase.co" \
             SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}"
 
-      - name: Deploy xmltv
+      - name: Deploy xmltv function
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: supabase functions deploy xmltv --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
