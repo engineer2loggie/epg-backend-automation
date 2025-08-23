@@ -1,0 +1,2 @@
+[functions.xmltv]
+verify_jwt = false
