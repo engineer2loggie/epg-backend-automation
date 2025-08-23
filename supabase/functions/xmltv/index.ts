@@ -1,6 +1,5 @@
 # .github/workflows/deploy-xmltv.yml
 name: Deploy xmltv Edge Function
-
 on:
   push:
     paths:
@@ -12,15 +11,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with: { version: latest }
 
-      - name: Setup Supabase CLI
-        uses: supabase/setup-cli@v1
-        with:
-          version: latest
-
-      # set runtime secrets for the function (no DB password needed)
       - name: Set function secrets
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
@@ -33,6 +27,4 @@ jobs:
       - name: Deploy xmltv
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-        run: |
-          supabase functions deploy xmltv \
-            --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
+        run: supabase functions deploy xmltv --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
