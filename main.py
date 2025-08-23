@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Open-EPG -> Supabase loader
+- 12h rolling window (computed in local tz with DST, then converted to UTC)
+- Deletes programs older than 12h
+- Title strictly from <title> (no <sub-title> fallback)
+"""
+
 from __future__ import annotations
-import os, sys, time, logging, itertools
-from datetime import datetime, timezone, timedelta
+import os, sys, gzip, time, logging, itertools
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
+import html
 
 import requests
 import xml.etree.ElementTree as ET
@@ -13,28 +22,37 @@ from postgrest.exceptions import APIError
 
 # ----------------------- Config -----------------------
 
-OPEN_EPG_URLS = [
+# Default Open-EPG Puerto Rico files; override in env OPEN_EPG_URLS (comma-separated)
+DEFAULT_EPG_URLS = [
     "https://www.open-epg.com/files/puertorico1.xml",
     "https://www.open-epg.com/files/puertorico2.xml",
 ]
 
 REQUEST_TIMEOUT = (10, 180)  # (connect, read)
-BATCH_CHANNELS = 1000
+BATCH_CHANNELS = 2000
 BATCH_PROGRAMS = 1000
 MAX_RETRIES = 4
 
-# Window 0 == OFF (ingest everything)
-WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "0"))
+# Window & timezone (DST aware)
+WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "12"))  # you asked for 12h
+WINDOW_TZ = os.environ.get("WINDOW_TZ", "America/New_York")  # computed in local tz, then UTC
+SKIP_EMPTY_TITLES = os.environ.get("SKIP_EMPTY_TITLES", "0") in ("1", "true", "True")
 
-# Debug: look up a specific slot (optional)
-TEST_LOOKUP_CHANNEL = os.environ.get("TEST_LOOKUP_CHANNEL", "")
-TEST_LOOKUP_START   = os.environ.get("TEST_LOOKUP_START", "")
+# Preferred language order for <title>/<desc>
+PREFER_LANGS = [p.strip().lower() for p in os.environ.get("PREFER_LANGS", "es-pr,es,en").split(",") if p.strip()]
+
+# Debug sampler limits
+DEBUG_SAMPLE_CHANNELS = int(os.environ.get("DEBUG_SAMPLE_CHANNELS", "10"))
+DEBUG_SAMPLE_PROGRAMS = int(os.environ.get("DEBUG_SAMPLE_PROGRAMS", "10"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("epg")
+log = logging.getLogger("open-epg")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+_raw_urls = os.environ.get("OPEN_EPG_URLS", "")
+EPG_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()] if _raw_urls else list(DEFAULT_EPG_URLS)
 
 # ----------------------- Helpers ----------------------
 
@@ -49,52 +67,70 @@ def chunked(seq: Iterable[dict], size: int) -> Iterable[List[dict]]:
 def localname(tag: str) -> str:
     if not tag:
         return tag
-    return tag.split('}', 1)[-1] if tag[0] == '{' else tag
+    if tag[0] == "{":
+        return tag.split("}", 1)[1]
+    return tag
 
 def parse_xmltv_datetime(raw: Optional[str]) -> Optional[datetime]:
+    """Parse XMLTV datetime of the form YYYYMMDDHHMMSS +ZZZZ, Z, or no tz.
+    Return timezone-aware UTC datetime."""
     if not raw:
         return None
     s = raw.strip()
-    # remove accidental space before tz (e.g. '...  +0200')
+
+    # Trim double-space before offset if present ("...  +0000")
     if " " in s:
+        # keep the last token as tz, if it looks like +HHMM or -HHMM
         a, b = s.rsplit(" ", 1)
-        s = a + b
-    # normalize +HH:MM -> +HHMM
-    if len(s) >= 6 and (not s.endswith("Z")) and s[-3] == ":" and s[-5] in "+-":
+        if len(b) in (5,) and (b[0] in "+-") and b[1:].isdigit():
+            s = a + b
+
+    # Normalize "+HH:MM" to "+HHMM"
+    if len(s) >= 6 and not s.endswith("Z") and s[-3] == ":" and s[-5] in "+-":
         s = s[:-3] + s[-2:]
-    # trailing 'Z' -> '+0000'
+
+    # "Z" -> "+0000"
     if s.endswith("Z"):
         s = s[:-1] + "+0000"
-    # add UTC if no tz
+
+    # Add UTC if tz is missing (assume UTC)
     if len(s) == 14:  # YYYYMMDDHHMMSS
         s += "+0000"
+
     try:
         dt = datetime.strptime(s, "%Y%m%d%H%M%S%z")
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
-def first_texts(elem: ET.Element, want: str) -> List[Tuple[str,str]]:
-    """Return list of (lang, text) for direct children with localname == want."""
-    out: List[Tuple[str,str]] = []
-    w = want.lower()
-    for child in list(elem):
-        if localname(child.tag).lower() == w:
-            lang = (child.attrib.get("lang") or "").strip()
-            txt = ''.join(child.itertext()).strip()
-            out.append((lang, txt))
-    return out
+def open_xml_stream(resp: requests.Response, url: str):
+    """Return a file-like stream; transparently ungzip if needed."""
+    resp.raw.decode_content = True
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    gz = url.lower().endswith(".gz") or "gzip" in ct or "application/gzip" in ct
+    return gzip.GzipFile(fileobj=resp.raw) if gz else resp.raw
 
-def pick_lang_text(candidates: List[Tuple[str,str]], prefer_langs: List[str]) -> str:
-    # prefer first non-empty by preferred languages, then any non-empty
-    for pl in prefer_langs:
-        for lang, txt in candidates:
-            if txt and (lang.lower() == pl.lower()):
-                return txt
-    for _, txt in candidates:
+def pick_lang(elems: List[ET.Element], prefer: List[str]) -> str:
+    """Pick element text by lang. STRICTLY from <title> (or <desc>) elements passed in."""
+    best = ""
+    # First pass: preferred langs
+    for lang in prefer:
+        for e in elems:
+            if localname(e.tag) not in ("title", "desc"):
+                continue
+            elang = (e.attrib.get("lang") or "").strip().lower()
+            if elang == lang:
+                txt = "".join(e.itertext()).strip()
+                if txt:
+                    return html.unescape(txt)
+    # Second pass: any non-empty
+    for e in elems:
+        if localname(e.tag) not in ("title", "desc"):
+            continue
+        txt = "".join(e.itertext()).strip()
         if txt:
-            return txt
-    return ""
+            return html.unescape(txt)
+    return best  # empty string
 
 # ----------------------- Supabase ---------------------
 
@@ -122,9 +158,13 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                 break
             except APIError as e:
                 msg = str(e)
-                need_split = ("21000" in msg or
-                              "duplicate key value violates" in msg or
-                              "500" in msg or "413" in msg or "Payload" in msg)
+                need_split = (
+                    "21000" in msg or
+                    "duplicate key value violates" in msg or
+                    "500" in msg or
+                    "413" in msg or
+                    "Payload" in msg
+                )
                 if need_split and len(batch) > 1:
                     mid = len(batch) // 2
                     queue.insert(0, batch[mid:])
@@ -134,239 +174,275 @@ def upsert_with_retry(sb: Client, table: str, rows: List[dict], conflict: str, b
                 if attempt == MAX_RETRIES:
                     log.error("Giving up on %s batch (%d): %s", table, len(batch), msg)
                 else:
-                    time.sleep(0.5 * attempt)
+                    sleep_s = attempt * 0.6
+                    log.warning("Retry %d/%d for %s (%d rows) in %.1fs: %s",
+                                attempt, MAX_RETRIES, table, len(batch), sleep_s, msg)
+                    time.sleep(sleep_s)
             except Exception as e:
                 if attempt == MAX_RETRIES:
                     log.exception("Unexpected error upserting %s (%d rows): %s", table, len(batch), e)
                 else:
-                    time.sleep(0.5 * attempt)
+                    sleep_s = attempt * 0.6
+                    log.warning("Retry %d/%d for %s (%d rows) in %.1fs (unexpected): %s",
+                                attempt, MAX_RETRIES, table, len(batch), sleep_s, e)
+                    time.sleep(sleep_s)
     log.info("Upserted %d rows into %s.", total, table)
-
-# ----------------------- XML ingest -------------------
-
-def fetch_xml(url: str) -> bytes:
-    log.info("Fetching EPG (XML only): %s", url)
-    with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as resp:
-        resp.raise_for_status()
-        # read all; file is plain XML (no gzip here)
-        return resp.content
-
-def ingest_open_epg_xml(xml_bytes: bytes,
-                        programs: Dict[str, dict],
-                        channels: Dict[str, dict],
-                        prefer_langs: List[str],
-                        now_utc: Optional[datetime],
-                        horizon_utc: Optional[datetime]) -> Tuple[int,int,float]:
-    """
-    Parse XML and append to `programs` & `channels`. Returns (ch_seen, p_seen, titled_ratio).
-    IMPORTANT FIX: don't clear child nodes before reading <programme>.
-    """
-    context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
-    _, root = next(context)
-
-    ch_seen = 0
-    p_seen = 0
-    nonempty_titles = 0
-
-    # map channel id -> display name (collect once)
-    # NOTE: we'll only clear nodes at 'channel' and 'programme' end events.
-    for ev, el in context:
-        tag = localname(el.tag)
-
-        if tag == "channel":
-            ch_id = el.attrib.get("id")
-            if ch_id:
-                # pick first display-name text, else id
-                name = pick_lang_text(first_texts(el, "display-name"), prefer_langs) or ch_id
-                icon = None
-                # optional <icon src="...">
-                for child in list(el):
-                    if localname(child.tag).lower() == "icon":
-                        for k, v in child.attrib.items():
-                            if localname(k).lower() == "src" and v:
-                                icon = v.strip()
-                                break
-                if ch_id not in channels:
-                    channels[ch_id] = {"id": ch_id, "display_name": name, "icon_url": icon}
-                    ch_seen += 1
-            el.clear()
-            continue
-
-        if tag == "programme":
-            p_seen += 1
-            ch_id = el.attrib.get("channel")
-            s_raw = el.attrib.get("start")
-            e_raw = el.attrib.get("stop") or el.attrib.get("end")
-            s = parse_xmltv_datetime(s_raw)
-            e = parse_xmltv_datetime(e_raw)
-            if not (ch_id and s and e):
-                el.clear()
-                continue
-
-            # optional windowing
-            if now_utc and horizon_utc:
-                if not (s <= horizon_utc and e >= now_utc):
-                    el.clear()
-                    continue
-
-            titles = first_texts(el, "title")
-            descs  = first_texts(el, "desc")
-            title  = pick_lang_text(titles, prefer_langs).strip()
-            desc   = pick_lang_text(descs, prefer_langs).strip() or None
-
-            if title:
-                nonempty_titles += 1
-
-            pid = f"{ch_id}_{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}"
-            row = {
-                "id": pid,
-                "channel_id": ch_id,
-                "start_time": s.isoformat(),
-                "end_time": e.isoformat(),
-                "title": title or None,          # keep NULL, not empty string
-                "description": desc
-            }
-            # keep the "best" version if duplicate id is encountered
-            prev = programs.get(pid)
-            if prev is None:
-                programs[pid] = row
-            else:
-                # prefer non-empty title and longer description
-                prev_t = prev.get("title") or ""
-                cand_t = row.get("title") or ""
-                prev_d = prev.get("description") or ""
-                cand_d = row.get("description") or ""
-                replace = False
-                if not prev_t and cand_t:
-                    replace = True
-                elif len(cand_d) > len(prev_d):
-                    replace = True
-                if replace:
-                    programs[pid] = row
-
-            el.clear()
-            # free memory occasionally
-            if (p_seen % 8000) == 0:
-                root.clear()
-            continue
-
-        # ⚠️ DO NOT el.clear() for other child nodes here.
-        # We must keep them intact until we process the parent <programme>.
-
-    titled_ratio = (nonempty_titles / p_seen) if p_seen else 0.0
-    return ch_seen, p_seen, titled_ratio
 
 # ----------------------- Core ingest ------------------
 
-def main() -> int:
-    prefer_langs = [s for s in (os.environ.get("PREFER_LANGS", "es-pr,es,en").split(",")) if s]
-    window = int(os.environ.get("WINDOW_HOURS", str(WINDOW_HOURS)))
-    log.info("Open-EPG ingest (PR, XML only). WINDOW_HOURS=%d, ENFORCE_LIVE=False, SKIP_EMPTY_TITLES=False, PREFER_LANGS=%s",
-             window, ",".join(prefer_langs))
+def compute_window_utc() -> Tuple[datetime, datetime, datetime]:
+    """
+    Return (now_local, now_utc, horizon_utc).
+    - now_local in WINDOW_TZ (DST aware)
+    - now_utc, horizon_utc in UTC
+    """
+    local_tz = ZoneInfo(WINDOW_TZ)
+    now_local = datetime.now(local_tz)  # DST-correct local time
+    horizon_local = now_local + timedelta(hours=WINDOW_HOURS)
+    now_utc = now_local.astimezone(timezone.utc)
+    horizon_utc = horizon_local.astimezone(timezone.utc)
+    return now_local, now_utc, horizon_utc
 
-    sb = init_supabase()
-
-    now_utc = datetime.now(timezone.utc) if window > 0 else None
-    horizon_utc = (now_utc + timedelta(hours=window)) if now_utc else None
-    log.info("Windowing: %s", "OFF" if not now_utc else f"{now_utc.isoformat()} -> {horizon_utc.isoformat()}")
-
+def parse_and_collect(url: str,
+                      keep_window: bool,
+                      now_utc: datetime,
+                      horizon_utc: datetime) -> Tuple[Dict[str, dict], List[dict], int, float]:
+    """Stream-parse a single XML/XML.GZ and collect channels/programs."""
     channels: Dict[str, dict] = {}
-    programs: Dict[str, dict] = {}
+    programs: List[dict] = []
+    empty_title_count = 0
+    total_prog = 0
 
-    total_ch_seen = 0
-    total_p_seen = 0
-    total_nonempty_ratio_nums = 0.0
-    total_nonempty_ratio_dens = 0
+    log.info("Fetching EPG: %s", url)
+    try:
+        with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status_code == 404:
+                log.warning("EPG URL 404: %s (skipping)", url)
+                return channels, programs, total_prog, 0.0
+            resp.raise_for_status()
+            stream = open_xml_stream(resp, url)
+            context = ET.iterparse(stream, events=("start", "end"))
+            _, root = next(context)
 
-    for url in OPEN_EPG_URLS:
-        try:
-            xml = fetch_xml(url)
-            ch_seen, p_seen, titled_ratio = ingest_open_epg_xml(
-                xml, programs, channels, prefer_langs, now_utc, horizon_utc
-            )
-            total_ch_seen += ch_seen
-            total_p_seen += p_seen
-            total_nonempty_ratio_nums += titled_ratio * p_seen
-            total_nonempty_ratio_dens += p_seen
+            # Simple sampler for debugging
+            sample_prog: List[dict] = []
+
+            for ev, el in context:
+                if ev != "end":
+                    continue
+                tag = localname(el.tag)
+
+                if tag == "channel":
+                    ch_id = el.get("id") or ""
+                    if ch_id and (ch_id not in channels):
+                        # Only keep the first non-empty display-name we see
+                        display_txt = ""
+                        for child in list(el):
+                            if localname(child.tag) == "display-name":
+                                display_txt = "".join(child.itertext()).strip()
+                                display_txt = html.unescape(display_txt)
+                                if display_txt:
+                                    break
+                        channels[ch_id] = {
+                            "id": ch_id,
+                            "display_name": display_txt or ch_id,
+                            "icon_url": None
+                        }
+                    el.clear()
+                    continue
+
+                if tag == "programme":
+                    total_prog += 1
+
+                    ch_id = el.get("channel") or ""
+                    s = parse_xmltv_datetime(el.get("start"))
+                    e = parse_xmltv_datetime(el.get("stop"))
+                    if not (ch_id and s and e):
+                        el.clear(); continue
+
+                    # Window filter (in UTC) if requested
+                    if keep_window:
+                        # keep if overlaps [now, horizon]
+                        if not (s <= horizon_utc and e >= now_utc):
+                            el.clear(); continue
+
+                    # Title STRICTLY from <title>; no sub-title fallback
+                    titles = [c for c in list(el) if localname(c.tag) == "title"]
+                    descs  = [c for c in list(el) if localname(c.tag) == "desc"]
+
+                    title = pick_lang(titles, PREFER_LANGS).strip()
+                    desc  = pick_lang(descs,  PREFER_LANGS).strip()
+
+                    if not title:
+                        empty_title_count += 1
+                        if SKIP_EMPTY_TITLES:
+                            el.clear(); continue
+
+                    # Program ID uses UTC timestamps to avoid tz ambiguity
+                    pid = f"{ch_id}_{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}"
+                    programs.append({
+                        "id": pid,
+                        "channel_id": ch_id,
+                        "start_time": s.isoformat(),  # UTC
+                        "end_time": e.isoformat(),    # UTC
+                        "title": title or None,
+                        "description": desc or None,
+                    })
+
+                    # Debug-sample a few programmes
+                    if len(sample_prog) < DEBUG_SAMPLE_PROGRAMS:
+                        sample_prog.append({
+                            "channel_id": ch_id, "start": s.isoformat(),
+                            "title": title, "desc_len": len(desc or "")
+                        })
+
+                    el.clear()
+                    if (len(programs) % 8000) == 0:
+                        root.clear()
+                    continue
+
+                el.clear()
+
+            # Log samples
+            if channels:
+                some_ch = list(channels.items())[:DEBUG_SAMPLE_CHANNELS]
+                log.info("SAMPLE channels (%d):", len(some_ch))
+                for cid, row in some_ch:
+                    log.info("  id=%s name='%s'", cid, row["display_name"])
+            if sample_prog:
+                log.info("SAMPLE programmes (%d):", len(sample_prog))
+                for p in sample_prog:
+                    log.info("  ch=%s start=%s title=%r desc_len=%d",
+                             p["channel_id"], p["start"], p["title"], p["desc_len"])
+
+            titled_ratio = 0.0
+            if total_prog:
+                titled_ratio = (total_prog - empty_title_count) / float(total_prog)
             log.info("Parsed %s: channels(seen)=%d, programs_found=%d, kept=%d, titled_ratio=%.3f",
-                     url, ch_seen, p_seen, p_seen, titled_ratio)
-        except requests.exceptions.RequestException as e:
-            log.error("HTTP error for %s: %s", url, e)
-        except ET.ParseError as e:
-            log.error("XML parse error for %s: %s", url, e)
+                     url, len(channels), total_prog, len(programs), titled_ratio)
+
+            return channels, programs, total_prog, titled_ratio
+
+    except requests.exceptions.RequestException as e:
+        log.error("HTTP error for %s: %s", url, e)
+    except ET.ParseError as e:
+        log.error("XML parse error for %s: %s", url, e)
+    except Exception as e:
+        log.exception("Unexpected error for %s: %s", url, e)
+
+    return channels, programs, total_prog, 0.0
+
+def refresh_next_12h_mv(sb: Client) -> None:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            log.info("Refreshing MV via RPC: refresh_programs_next_12h …")
+            sb.rpc("refresh_programs_next_12h").execute()
+            log.info("✅ MV refreshed.")
+            return
         except Exception as e:
-            log.exception("Unexpected error for %s: %s", url, e)
+            if attempt == MAX_RETRIES:
+                log.warning("RPC refresh_programs_next_12h failed after %d attempts: %s", attempt, e)
+                return
+            time.sleep(0.8 * attempt)
 
-    # Debug: sample a few items that look empty
-    empties = []
-    for r in programs.values():
-        if not (r.get("title") or r.get("description")):
-            empties.append(r)
-            if len(empties) == 6:
-                break
-    if empties:
-        log.info("SAMPLE EMPTY-looking programmes (6):")
-        for r in empties:
-            log.info("  ch=%s start=%s", r["channel_id"], r["start_time"])
-
-    # Optional test lookup
-    if TEST_LOOKUP_CHANNEL and TEST_LOOKUP_START:
-        # normalize start
-        sdt = parse_xmltv_datetime(TEST_LOOKUP_START)
-        title = desc = None
-        if sdt:
-            key_prefix = f"{TEST_LOOKUP_CHANNEL}_{sdt.strftime('%Y%m%d%H%M%S')}_"
-            for pid, row in programs.items():
-                if pid.startswith(key_prefix):
-                    title = row.get("title")
-                    desc = row.get("description") or ""
-                    break
-        log.info("TEST LOOKUP: %s @ %s -> title=%s, desc_len=%d",
-                 TEST_LOOKUP_CHANNEL, TEST_LOOKUP_START, repr(title), len(desc or ""))
-
-    # Upserts
-    if channels:
-        log.info("Upserting %d channels …", len(channels))
-        upsert_with_retry(sb, "channels", list(channels.values()), conflict="id", base_batch=BATCH_CHANNELS)
+def fetch_and_process(sb: Client, urls: List[str]):
+    keep_window = WINDOW_HOURS > 0
+    now_local, now_utc, horizon_utc = compute_window_utc()
+    if keep_window:
+        log.info("Windowing: ON (local=%s) -> UTC window: %s -> %s",
+                 now_local.tzinfo, now_utc.isoformat(), horizon_utc.isoformat())
     else:
-        log.warning("No channels to upsert.")
+        log.info("Windowing: OFF")
 
-    prog_rows = list(programs.values())
+    # Aggregate across all feeds
+    channels_all: Dict[str, dict] = {}
+    programs_all: Dict[str, dict] = {}  # id -> row
+
+    for url in urls:
+        chs, progs, _total, _ratio = parse_and_collect(url, keep_window, now_utc, horizon_utc)
+        for cid, crow in chs.items():
+            if cid not in channels_all:
+                channels_all[cid] = crow
+        for row in progs:
+            pid = row["id"]
+            # If duplicate pid appears, prefer the one with a non-empty title or longer description
+            keep = programs_all.get(pid)
+            if keep is None:
+                programs_all[pid] = row
+            else:
+                t_old = (keep.get("title") or "").strip()
+                t_new = (row.get("title") or "").strip()
+                d_old = keep.get("description") or ""
+                d_new = row.get("description") or ""
+                replace = False
+                if not t_old and t_new:
+                    replace = True
+                elif len(d_new) > len(d_old):
+                    replace = True
+                if replace:
+                    programs_all[pid] = row
+
+    # Upsert channels
+    if channels_all:
+        ch_rows = list(channels_all.values())
+        log.info("Upserting %d channels …", len(ch_rows))
+        upsert_with_retry(sb, "channels", ch_rows, conflict="id", base_batch=BATCH_CHANNELS)
+    else:
+        log.warning("No channels collected.")
+
+    # Upsert programs
+    prog_rows = list(programs_all.values())
+    prog_rows.sort(key=lambda r: (r["channel_id"], r["start_time"]))
     log.info("Programs to upsert (deduped): %d", len(prog_rows))
-
     if prog_rows:
-        prog_rows.sort(key=lambda r: (r["channel_id"], r["start_time"]))
         upsert_with_retry(sb, "programs", prog_rows, conflict="id", base_batch=BATCH_PROGRAMS)
     else:
-        log.warning("No programmes parsed (check parser/window).")
+        log.warning("No programs parsed for upsert.")
 
-    # Quick DB sanity: how many rows have non-null title/description?
+    # Sanity check (optional)
     try:
-        total = sb.table("programs").select("id").execute()
-        with_title = sb.table("programs").select("id").not_.is_("title", "null").execute()
-        with_desc = sb.table("programs").select("id").not_.is_("description", "null").execute()
+        if keep_window:
+            res = sb.table("programs").select("id", count="exact")\
+                .gte("end_time", now_utc.isoformat())\
+                .lte("start_time", horizon_utc.isoformat())\
+                .execute()
+        else:
+            res = sb.table("programs").select("id", count="exact").execute()
+        total = getattr(res, "count", None) or 0
+        # check how many have titles/descriptions
+        with_title = sb.table("programs").select("id")\
+            .not_.is_("title", "null").execute()
+        with_desc = sb.table("programs").select("id")\
+            .not_.is_("description", "null").execute()
         log.info("DB sanity: total=%d, with_title=%d, with_desc=%d",
-                 len(getattr(total, "data", []) or []),
-                 len(getattr(with_title, "data", []) or []),
-                 len(getattr(with_desc, "data", []) or []))
+                 total, len(getattr(with_title, "data", [])), len(getattr(with_desc, "data", [])))
     except Exception as e:
-        log.warning("DB sanity check failed: %s", e)
+        log.warning("Sanity check failed: %s", e)
 
-    # Refresh MV (12h name in your DB)
+    # Clean up older than 12h (computed in local tz with DST, then UTC)
     try:
-        log.info("Refreshing MV via RPC: refresh_programs_next_12h …")
-        sb.rpc("refresh_programs_next_12h").execute()
-        log.info("✅ MV refreshed.")
+        cutoff_local = now_local - timedelta(hours=WINDOW_HOURS)
+        cutoff_utc = cutoff_local.astimezone(timezone.utc)
+        sb.table("programs").delete().lt("end_time", cutoff_utc.isoformat()).execute()
+        log.info("Cleaned up programs with end_time < %s (UTC)", cutoff_utc.isoformat())
     except Exception as e:
-        log.warning("MV refresh failed: %s", e)
+        log.warning("Cleanup failed: %s", e)
 
-    log.info("Done. Channels upserted: %d; Programs considered: %d",
-             len(channels), len(prog_rows))
+    # Refresh MV
+    refresh_next_12h_mv(sb)
+
+# ----------------------- Entrypoint -------------------
+
+def main() -> int:
+    log.info("Open-EPG ingest (PR/XML). WINDOW_HOURS=%d, WINDOW_TZ=%s, SKIP_EMPTY_TITLES=%s",
+             WINDOW_HOURS, WINDOW_TZ, SKIP_EMPTY_TITLES)
+    if not EPG_URLS:
+        log.warning("No EPG URLs provided (OPEN_EPG_URLS env). Using defaults.")
+    sb = init_supabase()
+    t0 = time.time()
+    fetch_and_process(sb, EPG_URLS)
+    log.info("Finished in %.1fs", time.time() - t0)
     return 0
 
 if __name__ == "__main__":
-    try:
-        import io  # ensure available for iterparse stream
-    except Exception:
-        pass
     sys.exit(main())
