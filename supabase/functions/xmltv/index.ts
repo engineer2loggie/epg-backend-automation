@@ -1,12 +1,14 @@
 jobs:
-  deploy:
+  deploy-xmltv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: supabase/setup-cli@v1
-        with: { version: latest }
 
-      - name: Set function secrets
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Set Edge Function secrets
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
@@ -15,7 +17,7 @@ jobs:
             SUPABASE_URL="https://${{ secrets.SUPABASE_PROJECT_REF }}.supabase.co" \
             SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}"
 
-      - name: Deploy xmltv function
+      - name: Deploy xmltv
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: supabase functions deploy xmltv --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
