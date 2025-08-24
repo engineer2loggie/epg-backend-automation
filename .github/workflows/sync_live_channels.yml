@@ -31,7 +31,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run scraper (uses search-page Feed)
+      - name: Run scraper (uses Feed download / response capture)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
