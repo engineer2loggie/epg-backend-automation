@@ -2,6 +2,11 @@ name: Sync live IPTV-org channels to Supabase (HTML search)
 
 on:
   workflow_dispatch:
+    inputs:
+      countries:
+        description: "Comma-separated ISO2 country codes (e.g. PR or PR,US)"
+        required: false
+        default: "PR,DE,US,ES,MX,IT,IE,CA,AU,UK"
   schedule:
     - cron: "0 */12 * * *"  # every 12 hours
 
@@ -13,8 +18,7 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -27,17 +31,12 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Sanity
-        run: |
-          set -euo pipefail
-          echo "Repo: $GITHUB_REPOSITORY"
-          python -V
-          ls -la scripts || true
-
-      - name: Run scraper (HTML → M3U → canonical rows)
+      - name: Run scraper (strict HTML playlist only)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          COUNTRIES: ${{ inputs.countries }}
+          SCRAPER_STRICT: "1"   # IMPORTANT: disable fallback to generic index.m3u
         run: |
           set -euo pipefail
           python scripts/sync_live_channels.py
