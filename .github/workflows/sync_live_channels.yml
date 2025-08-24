@@ -21,20 +21,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Playwright (Chromium)
-        run: |
-          python -m pip install --upgrade pip
-          pip install playwright
-          python -m playwright install --with-deps chromium
-
-      - name: Sanity (no secrets)
+      - name: Sanity
         run: |
           set -euo pipefail
           echo "Repo: $GITHUB_REPOSITORY"
           python -V
           ls -la scripts || true
 
-      - name: Run scraper (HTML → M3U live)
+      - name: Run scraper (live M3U)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
