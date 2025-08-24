@@ -1,28 +1,30 @@
+# .github/workflows/sync_live_channels.yml
 name: Sync live IPTV-org channels to Supabase
-
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */6 * * *"   # every 6 hours
+    - cron: "17 */6 * * *"
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Print env sanity (no secrets)
+        run: |
+          echo "Repo: $GITHUB_REPOSITORY"
+          python -V
 
       - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python3 - <<'PY'
-          import sys, runpy
-          ns = runpy.run_path('.github/workflows/sync_live_channels.py')
-          PY
+          set -euo pipefail
+          .github/workflows/sync_live_channels.py
