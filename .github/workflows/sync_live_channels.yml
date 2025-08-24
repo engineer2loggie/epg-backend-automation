@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       countries:
-        description: "Comma-separated ISO2 country codes (e.g. PR or PR,US)"
+        description: "Comma-separated ISO2 codes (e.g. PR or PR,US)"
         required: false
         default: "PR,DE,US,ES,MX,IT,IE,CA,AU,UK"
   schedule:
@@ -31,12 +31,11 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run scraper (strict HTML playlist only)
+      - name: Run scraper (uses search-page Feed)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           COUNTRIES: ${{ inputs.countries }}
-          SCRAPER_STRICT: "1"   # IMPORTANT: disable fallback to generic index.m3u
         run: |
           set -euo pipefail
           python scripts/sync_live_channels.py
