@@ -5,12 +5,16 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import ssl
 
+# --- Config / env -------------------------------------------------------------
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-COUNTRIES    = ["PR","DE","US","ES","MX","IT","IE","CA","AU","UK"]
+COUNTRIES    = ["PR","DE","US","ES","MX","IT","IE","CA","AU","UK"]  # ISO-2, upper
 
 CHANNELS_URL = "https://iptv-org.github.io/api/channels.json"
 STREAMS_URL  = "https://iptv-org.github.io/api/streams.json"
+
+# --- Helpers ------------------------------------------------------------------
 
 def require_env():
     missing = []
@@ -18,12 +22,14 @@ def require_env():
     if not SERVICE_KEY:  missing.append("SUPABASE_SERVICE_ROLE_KEY")
     if missing:
         raise SystemExit(f"Missing environment variables: {', '.join(missing)}")
+    # Non-fatal warning if URL looks odd
     if ".supabase.co" not in SUPABASE_URL:
-        print(f"WARNING: SUPABASE_URL doesn’t look like an API URL (expected https://<id>.supabase.co), got: {SUPABASE_URL}")
+        print(f"WARNING: SUPABASE_URL may be wrong (expected https://<id>.supabase.co), got: {SUPABASE_URL}")
 
-    # Print domain only (safe)
+    # Print only the domain (safe)
     try:
-        print("ENV OK: ", SUPABASE_URL.split("//",1)[1].split("/",1)[0])
+        domain = SUPABASE_URL.split("//",1)[1].split("/",1)[0]
+        print("ENV OK for Supabase domain:", domain)
     except Exception:
         print("ENV OK")
 
@@ -36,9 +42,12 @@ def fetch_json(url: str):
         return json.load(resp)
 
 def pick_best_stream(streams):
+    """
+    Choose a 'best' stream by resolution/bitrate/framerate; fallback to first.
+    """
     def score(s):
-        w = s.get("width") or 0
-        h = s.get("height") or 0
+        w  = s.get("width") or 0
+        h  = s.get("height") or 0
         br = s.get("bitrate") or 0
         fr = s.get("frame_rate") or 0
         return (w*h, br, fr)
@@ -64,6 +73,8 @@ def upsert_rows(rows):
             body = resp.read().decode("utf-8", "ignore")
             raise RuntimeError(f"Supabase upsert failed {resp.status}: {body}")
 
+# --- Main ---------------------------------------------------------------------
+
 def main():
     require_env()
 
@@ -73,21 +84,24 @@ def main():
     print(f"channels.json: {len(channels)} items")
     print(f"streams.json : {len(streams)} items")
 
+    # id -> channel record
     ch_by_id = {c["id"]: c for c in channels if isinstance(c, dict) and "id" in c}
 
+    # Online streams only
     online = [s for s in streams if s.get("status") == "online" and isinstance(s.get("channel"), str)]
     print(f"online streams: {len(online)}")
 
-    # Group by channel id
+    # Group streams by channel id
     by_channel = {}
     for s in online:
         cid = s["channel"]
         by_channel.setdefault(cid, []).append(s)
 
+    # Build rows for target countries
     rows = []
-    by_country_kept = {cc:0 for cc in COUNTRIES}
     now_iso = datetime.now(timezone.utc).isoformat()
     target = set(COUNTRIES)
+    kept_counts = {cc: 0 for cc in COUNTRIES}
 
     for cid, slist in by_channel.items():
         ch = ch_by_id.get(cid)
@@ -107,9 +121,9 @@ def main():
             "source":         "iptv-org",
             "updated_at":     now_iso,
         })
-        by_country_kept[country] = by_country_kept.get(country,0) + 1
+        kept_counts[country] = kept_counts.get(country, 0) + 1
 
-    print("kept per country:", by_country_kept)
+    print("kept per country:", kept_counts)
     print("total rows to upsert:", len(rows))
 
     if not rows:
@@ -121,6 +135,7 @@ def main():
     print("Done.")
     return 0
 
+# Entry
 if __name__ == "__main__":
     try:
         sys.exit(main())
