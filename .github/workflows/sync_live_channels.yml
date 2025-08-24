@@ -27,4 +27,4 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euo pipefail
-          .github/workflows/sync_live_channels.py
+          scripts/sync_live_channels.py
