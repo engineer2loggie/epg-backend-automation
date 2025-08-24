@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import os, sys, re, json, ssl
+import os, sys, re, json, ssl, tempfile, pathlib
 from datetime import datetime, timezone
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from collections import Counter
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -12,7 +12,7 @@ COUNTRIES    = [c.strip().upper() for c in os.environ.get("COUNTRIES", "PR,DE,US
 
 SEARCH_BASE   = "https://iptv-org.github.io/?q=live%20country:{cc}"
 CHANNELS_JSON = "https://iptv-org.github.io/api/channels.json"
-STREAMS_JSON  = "https://iptv-org.github.io/api/streams.json"  # used only to map URL->channel id (when tvg-id is missing)
+STREAMS_JSON  = "https://iptv-org.github.io/api/streams.json"  # URL→channel id mapping when tvg-id is missing
 
 def require_env():
     miss = []
@@ -25,7 +25,7 @@ def require_env():
 
 def fetch_text(url: str, timeout=90) -> str:
     ctx = ssl.create_default_context()
-    req = Request(url, headers={"User-Agent": "iptv-live-html/1.2"})
+    req = Request(url, headers={"User-Agent": "iptv-live-html/1.3"})
     with urlopen(req, context=ctx, timeout=timeout) as resp:
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status} for {url}")
@@ -40,8 +40,15 @@ def absolutize(href: str) -> str:
     if href.startswith("/"): return "https://iptv-org.github.io" + href
     return "https://iptv-org.github.io/" + href
 
-def playlist_url_from_search(country: str) -> str:
-    """Render the search page and extract the .m3u 'Feed' URL for the current query."""
+def playlist_text_from_search(country: str) -> str:
+    """
+    Open the search page, then:
+      1) Try to capture any link with '.m3u' (preferring ones that include the query).
+      2) Click the Feed control and capture:
+         - a download (page.expect_download), OR
+         - any network response whose URL ends with '.m3u'.
+      3) Fallback: try constructed index.m3u with encoded query (as a last resort).
+    """
     from playwright.sync_api import sync_playwright
     url = SEARCH_BASE.format(cc=country)
     query_tokens = [
@@ -53,40 +60,109 @@ def playlist_url_from_search(country: str) -> str:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent="Mozilla/5.0 (LiveScraper/1.2)")
+        page = browser.new_page(user_agent="Mozilla/5.0 (LiveScraper/1.3)")
+
+        # --- helper to fetch arbitrary URL via page (to reuse UA / cookies if any)
+        def pull_url(u: str) -> Optional[str]:
+            try:
+                resp = page.request.get(u, timeout=60_000)
+                if resp.ok:
+                    return resp.text()
+            except Exception:
+                pass
+            return None
+
         try:
             page.goto(url, wait_until="networkidle", timeout=60_000)
-            # give the client-side app a moment to paint dynamic controls
             page.wait_for_timeout(1500)
 
-            # collect every clickable link
+            # (A) Look for any visible <a> with .m3u
             hrefs: List[str] = page.eval_on_selector_all(
                 "a[href]", "els => els.map(e => e.getAttribute('href'))"
             ) or []
-
-            # prefer any .m3u link that includes our query tokens
             m3u_hrefs = [absolutize(h) for h in hrefs if h and ".m3u" in h.lower()]
+
+            # Prefer link that includes our query tokens
             for h in m3u_hrefs:
                 if any(tok.lower() in h.lower() for tok in query_tokens):
-                    return h
+                    txt = pull_url(h)
+                    if txt and txt.strip().startswith("#EXTM3U"):
+                        print(f"[{country}] Found m3u via anchor: {h}")
+                        return txt
 
-            # secondary: sometimes the feed control is an icon; try role/name = Feed
-            link = page.locator('a[aria-label="Feed"], a[aria-label="feed"]').first
-            if link.count() > 0:
-                h = link.get_attribute("href") or ""
-                if ".m3u" in h.lower():
-                    return absolutize(h)
+            # (B) Click a “Feed” control and capture download / response
+            m3u_from_response = {"url": None, "body": None}
 
-            # last resort: pick any .m3u shown on the page (still tied to current query UI)
-            if m3u_hrefs:
-                return m3u_hrefs[0]
+            def on_response(resp):
+                url = resp.url
+                if ".m3u" in url.lower():
+                    try:
+                        body = resp.text()
+                        if body and body.strip().startswith("#EXTM3U"):
+                            m3u_from_response["url"]  = url
+                            m3u_from_response["body"] = body
+                    except Exception:
+                        pass
 
-            raise RuntimeError("No .m3u link found on the search page")
+            page.on("response", on_response)
+
+            # Possible selectors for the Feed control
+            candidates = [
+                'a[aria-label="Feed"]',
+                'a[aria-label="feed"]',
+                'a:has-text("Feed")',
+                'button:has-text("Feed")',
+                '[title~="Feed"]',
+                '[data-tooltip~="Feed"]',
+            ]
+            clicked = False
+            for sel in candidates:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    # Try download capture
+                    try:
+                        with page.expect_download(timeout=5_000) as dlinfo:
+                            loc.first.click()
+                        dl = dlinfo.value
+                        path = dl.path() or (lambda: (dl.save_as(tmp := str(pathlib.Path(tempfile.gettempdir()) / dl.suggested_filename)), tmp))()
+                        # read file content
+                        m3u_text = pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
+                        if m3u_text.strip().startswith("#EXTM3U"):
+                            print(f"[{country}] Captured m3u via download: {dl.suggested_filename}")
+                            return m3u_text
+                    except Exception:
+                        # No download? still might have a network response
+                        try:
+                            loc.first.click()
+                        except Exception:
+                            pass
+                    clicked = True
+                    page.wait_for_timeout(800)
+                    if m3u_from_response["body"]:
+                        print(f"[{country}] Captured m3u via network response: {m3u_from_response['url']}")
+                        return m3u_from_response["body"]
+
+            # (C) Last resort: try a constructed feed URL for the current query
+            # (These forms are what the site typically uses when sharing Feed URLs)
+            guesses = [
+                f"https://iptv-org.github.io/iptv/index.m3u?q=live%20country%3A{country}",
+                f"https://iptv-org.github.io/iptv/index.m3u?q=live+country%3A{country}",
+                f"https://iptv-org.github.io/iptv/index.m3u?q=live%20country:{country}",
+                f"https://iptv-org.github.io/iptv/index.m3u?q=live+country:{country}",
+            ]
+            for g in guesses:
+                txt = pull_url(g)
+                if txt and txt.strip().startswith("#EXTM3U"):
+                    print(f"[{country}] Fallback constructed feed worked: {g}")
+                    return txt
+
+            raise RuntimeError("No .m3u link found or generated from the search page")
         finally:
             browser.close()
 
+# --- Supabase helpers ------------------------------------------------
+
 def supabase_delete_country(cc: str):
-    """Delete existing rows for a display country. We store 'UK' (not 'GB') for the UK."""
     import urllib.request
     url = f"{SUPABASE_URL}/rest/v1/live_channels?country=eq.{cc}"
     req = urllib.request.Request(
@@ -119,7 +195,7 @@ def upsert_rows(rows: List[Dict[str, Any]]):
             body = resp.read().decode("utf-8", "ignore")
             raise RuntimeError(f"Supabase upsert failed {resp.status}: {body}")
 
-# M3U parsing ---------------------------------------------------------
+# --- M3U parsing -----------------------------------------------------
 
 ATTR_RE = re.compile(r'([A-Za-z0-9_-]+)="([^"]*)"')
 
@@ -152,24 +228,26 @@ def parse_m3u(text: str) -> List[Dict[str, str]]:
             i += 1
     return out
 
-# Country code helpers ------------------------------------------------
+# --- Country code helpers -------------------------------------------
+
 def catalog_match_code(cc: str) -> str:
     """Map display country to catalog country (GB vs UK)."""
     return "GB" if cc == "UK" else cc
 
 def stored_country(cc: str) -> str:
-    """Normalize for storage (we keep 'UK' for user-facing)."""
+    """Normalize for storage (we keep 'UK' as display)."""
     return "UK" if cc in ("UK","GB") else cc
 
-# Main ----------------------------------------------------------------
+# --- Main ------------------------------------------------------------
+
 def main():
     require_env()
 
-    # Canonical channel catalog (id, name, logo, country)
+    # Canonical channel catalog
     catalog = fetch_json(CHANNELS_JSON)
     by_id = { (c.get("id") or "").lower(): c for c in catalog if c.get("id") }
 
-    # URL→channel ID mapping for rows missing tvg-id
+    # URL→channel ID mapping (for rows lacking tvg-id)
     streams = fetch_json(STREAMS_JSON)
     url_to_id = {}
     for s in streams:
@@ -185,15 +263,11 @@ def main():
         print(f"[{cc}] Deleting existing rows in Supabase …")
         supabase_delete_country(cc)
 
-        print(f"[{cc}] Locating search-page feed …")
-        plist_url = playlist_url_from_search(cc)
-        print(f"[{cc}] Feed playlist: {plist_url}")
-
-        m3u_text = fetch_text(plist_url)
+        print(f"[{cc}] Getting Feed playlist (m3u) …")
+        m3u_text = playlist_text_from_search(cc)
         entries = parse_m3u(m3u_text)
         print(f"[{cc}] Parsed entries: {len(entries)}")
 
-        # Deduplicate by channel_id (catalog) per country
         rows_by_id: Dict[str, Dict[str, Any]] = {}
         now_iso = datetime.now(timezone.utc).isoformat()
         want_cc = catalog_match_code(cc)
@@ -214,8 +288,7 @@ def main():
 
             meta = by_id[channel_id]
             meta_cc = (meta.get("country") or "").upper()
-
-            # require catalog country to match (GB <-> UK handled)
+            # require country match (GB <-> UK treated as same)
             if not ({meta_cc, want_cc} & {"GB","UK"}) and meta_cc != want_cc:
                 continue
 
