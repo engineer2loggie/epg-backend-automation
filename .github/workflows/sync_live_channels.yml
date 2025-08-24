@@ -28,7 +28,7 @@ jobs:
           python -V
           ls -la scripts || true
 
-      - name: Run scraper (live M3U)
+      - name: Run scraper (live M3U with country resolution)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
