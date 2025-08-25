@@ -1,0 +1,61 @@
+name: Build & Push EPG to Supabase
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *" # every 6 hours
+
+env:
+  # Comma-separated ISO-2 codes you want (e.g. PR,US,MX,ES,AR)
+  COUNTRIES: "PR,US"
+  DAYS: "2"               # how many days to fetch
+  MAX_CONNECTIONS: "6"    # be polite to sources
+  TABLE: "epg_programs"   # Supabase table name
+
+jobs:
+  epg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out your repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install script deps
+        run: npm ci
+
+      - name: Clone iptv-org/epg
+        run: |
+          git clone --depth 1 https://github.com/iptv-org/epg.git epg
+          cd epg
+          npm ci
+
+      - name: Build channels.xml for selected countries
+        run: node scripts/make-channels-xml.mjs "$COUNTRIES"
+
+      - name: Grab EPG (this creates guide.xml)
+        working-directory: epg
+        run: |
+          mkdir -p ../build
+          npm run grab --- \
+            --channels=../build/channels.xml \
+            --output ../build/guide.xml \
+            --days="${{ env.DAYS }}" \
+            --maxConnections="${{ env.MAX_CONNECTIONS }}"
+
+      - name: Upload guide.xml as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: guide.xml
+          path: build/guide.xml
+
+      - name: Push to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_TABLE: ${{ env.TABLE }}
+        run: node scripts/push-to-supabase.mjs build/guide.xml build/channels.xml
