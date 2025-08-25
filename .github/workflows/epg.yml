@@ -1,84 +1,117 @@
-name: EPG Build (npm run grab)
+- name: Add make-channels script
+  run: |
+    mkdir -p scripts
+    cat > scripts/make-channels-by-site.mjs <<'EOF'
+// scripts/make-channels-by-site.mjs
+// Usage: node scripts/make-channels-by-site.mjs US
+// Produces: work/US/channels-US-<site>.xml (one per site) filtered to that country's channels.
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * *" # daily, 6:00 UTC
+import fs from "fs";
+import path from "path";
+import https from "https";
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-    env:
-      NODE_OPTIONS: --max-old-space-size=2048
-      # Sites that are known to 403 on GitHub runners. You can relax this later.
-      BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+const CC_INPUT = (process.argv[2] || "").toUpperCase();
+if (!CC_INPUT) {
+  console.error("Country code required (e.g. US, GB, PR, MX, CA, IT, ES, AU, IE, DE, DO)");
+  process.exit(1);
+}
+const CC = CC_INPUT === "UK" ? "GB" : CC_INPUT;
 
-    steps:
-      - uses: actions/checkout@v4
+const BLOCKED = new Set(
+  (process.env.BLOCKED_SITES || "directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 
-      - name: Checkout iptv-org/epg (src)
-        run: git clone --depth=1 https://github.com/iptv-org/epg.git epg-src
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, { headers: { "User-Agent": "epg-job/1.0" } }, res => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`GET ${url} -> ${res.statusCode}`));
+          res.resume();
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", chunk => (data += chunk));
+        res.on("end", () => resolve(data));
+      })
+      .on("error", reject);
+  });
+}
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
-      - name: Install deps for epg (official repo)
-        working-directory: epg-src
-        run: npm ci
+const OUT_DIR = path.join("work", CC);
+fs.mkdirSync(OUT_DIR, { recursive: true });
 
-      - name: Prepare scripts dir
-        run: mkdir -p scripts work out
+(async () => {
+  console.log(`[make-channels] country=${CC}`);
 
-      - name: Add make-channels script
-        run: |
-          cat > scripts/make-channels-by-site.mjs <<'EOF'
-          # (PASTE THE WHOLE JS FROM SECTION 1 HERE)
-          EOF
+  const channelsUrl = "https://iptv-org.github.io/api/channels.json";
+  const guidesUrl   = "https://iptv-org.github.io/api/guides.json";
 
-      - name: Build per-country, per-site (US, PR, MX, CA, IT, ES, UK/GB, AU, IE, DE, DO)
-        env:
-          COUNTRIES: US,PR,MX,CA,IT,ES,UK,AU,IE,DE,DO
-        run: |
-          IFS=',' read -ra CCS <<< "$COUNTRIES"
-          for CC in "${CCS[@]}"; do
-            echo "== Prepare channels for $CC =="
-            node scripts/make-channels-by-site.mjs "$CC"
+  const [channelsRaw, guidesRaw] = await Promise.all([httpGet(channelsUrl), httpGet(guidesUrl)]);
 
-            mkdir -p "out/$CC"
-            shopt -s nullglob
-            for f in work/${CC}/channels-${CC}-*.xml; do
-              site=$(basename "$f" .xml | sed -E "s/^channels-${CC}-//")
-              echo "::group::Grab $CC / $site"
-              echo "channels: $f"
-              ( cd epg-src && \
-                npm run grab -- \
-                  --site="$site" \
-                  --channels="../$f" \
-                  --output="../out/${CC}/${site}.xml" \
-                  --days 1 \
-                  --maxConnections 2 \
-                  --concurrency 2 \
-                  --timeout 180000 \
-                  --delay 500 \
-                  --gzip \
-                  --debug || true )
-              echo "::endgroup::"
-            done
+  const channels = JSON.parse(channelsRaw);
+  const guides = JSON.parse(guidesRaw);
 
-            # keep artifact step happy even if nothing built
-            if [ -z "$(ls -A out/${CC} 2>/dev/null)" ]; then
-              echo "no site outputs for ${CC}" > "out/${CC}/README.txt"
-            fi
+  // Keep only channels in this country
+  const byId = new Map(
+    channels
+      .filter(ch => (ch.country || "").toUpperCase() === CC)
+      .map(ch => [ch.id, ch])
+  );
 
-            echo "== List $CC outputs ==" && ls -lah "out/${CC}" || true
-          done
+  // Group guides by site for channels in this country (skip blocked sites)
+  const perSite = new Map();
+  for (const g of guides) {
+    if (!g || !g.channel || !g.site || !g.site_id) continue;
+    if (!byId.has(g.channel)) continue;
+    if (BLOCKED.has(g.site)) continue;
 
-      - name: Upload artifacts (all countries)
-        uses: actions/upload-artifact@v4
-        with:
-          name: epg-sites-all
-          path: out/**
-          if-no-files-found: warn
+    const arr = perSite.get(g.site) || [];
+    arr.push({
+      site: g.site,
+      site_id: g.site_id,
+      xmltv_id: g.channel,
+      lang: g.lang || ""
+    });
+    perSite.set(g.site, arr);
+  }
+
+  // Emit one channels-<CC>-<site>.xml per site
+  for (const [site, arr] of perSite.entries()) {
+    const file = path.join(OUT_DIR, `channels-${CC}-${site}.xml`);
+    const rows = arr
+      .sort((a, b) => a.xmltv_id.localeCompare(b.xmltv_id))
+      .map(
+        x =>
+          `  <channel site="${x.site}" site_id="${escapeXml(x.site_id)}" xmltv_id="${escapeXml(
+            x.xmltv_id
+          )}"${x.lang ? ` lang="${x.lang}"` : ""}/>`
+      )
+      .join("\n");
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<channels>\n${rows}\n</channels>\n`;
+    fs.writeFileSync(file, xml, "utf8");
+    console.log(`[make-channels] wrote ${file} (${arr.length} entries)`);
+  }
+
+  if (perSite.size === 0) {
+    const f = path.join(OUT_DIR, "README.txt");
+    fs.writeFileSync(f, `No sites produced for ${CC}\n`, "utf8");
+    console.log(`[make-channels] ${f}`);
+  }
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+EOF
