@@ -6,11 +6,10 @@ on:
     - cron: "0 */6 * * *" # every 6 hours
 
 env:
-  # Comma-separated ISO-2 codes you want (e.g. PR,US,MX,ES,AR)
-  COUNTRIES: "PR,US"
-  DAYS: "2"               # how many days to fetch
-  MAX_CONNECTIONS: "6"    # be polite to sources
-  TABLE: "epg_programs"   # Supabase table name
+  COUNTRIES: "US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO"  # NOTE: UK => GB in ISO-2
+  DAYS: "2"
+  MAX_CONNECTIONS: "6"
+  TABLE: "epg_programs"
 
 jobs:
   epg:
