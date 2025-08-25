@@ -1,60 +1,132 @@
-name: Build & Push EPG to Supabase
+name: Build EPG (selected countries)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours
-
-env:
-  COUNTRIES: "US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO"  # NOTE: UK => GB in ISO-2
-  DAYS: "2"
-  MAX_CONNECTIONS: "6"
-  TABLE: "epg_programs"
+    - cron: "17 2 * * *" # daily at 02:17 UTC (pick any)
 
 jobs:
-  epg:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [US, PR, MX, CA, IT, ES, GB, AU, IE, DE, DO]  # UK=GB
+    env:
+      # keep memory in check
+      NODE_OPTIONS: --max-old-space-size=2048
+      # block sites that 403 without cookies / geo / JS
+      BLOCKED: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
     steps:
-      - name: Check out your repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
-      - name: Install script deps
-        run: npm install
-
-      - name: Clone iptv-org/epg
+      - name: Fetch iptv-org datasets
         run: |
-          git clone --depth 1 https://github.com/iptv-org/epg.git epg
-          cd epg
-          npm ci
+          curl -sL https://iptv-org.github.io/api/channels.json -o channels.json
+          curl -sL https://iptv-org.github.io/api/guides.json   -o guides.json
 
-      - name: Build channels.xml for selected countries
-        run: node scripts/make-channels-xml.mjs "$COUNTRIES"
-
-      - name: Grab EPG (this creates guide.xml)
-        working-directory: epg
+      - name: Build channels.xml for ${{ matrix.cc }}
+        env:
+          CC: ${{ matrix.cc }}
         run: |
-          mkdir -p ../build
-          npm run grab --- \
-            --channels=../build/channels.xml \
-            --output ../build/guide.xml \
-            --days="${{ env.DAYS }}" \
-            --maxConnections="${{ env.MAX_CONNECTIONS }}"
+          node <<'NODE'
+          const fs = require('fs');
+          const cc = process.env.CC;
+          const blocked = new Set((process.env.BLOCKED||'').split(',').map(s=>s.trim()).filter(Boolean));
 
-      - name: Upload guide.xml as artifact (optional)
+          const channels = JSON.parse(fs.readFileSync('channels.json','utf8'));
+          const guides   = JSON.parse(fs.readFileSync('guides.json','utf8'));
+
+          // country filter (US/PR/MX/CA/IT/ES/GB/AU/IE/DE/DO)
+          const wanted = new Set([cc]);
+
+          // channel map for quick membership test
+          const chanById = new Map(
+            channels
+              .filter(c => c && c.id && c.country && wanted.has(String(c.country).toUpperCase()))
+              .map(c => [c.id, c])
+          );
+
+          const rows = [];
+          for (const g of guides) {
+            if (!g || !g.channel || !g.site || !g.site_id) continue; // guard undefined => avoids "replace" crash
+            if (!chanById.has(g.channel)) continue;                   // only our countries
+            if (blocked.has(g.site)) continue;                        // skip known 403 sites
+            rows.push({
+              xmltv_id: g.channel,
+              site: g.site,
+              site_id: String(g.site_id),
+              lang: g.lang || 'en'
+            });
+          }
+
+          if (!rows.length) {
+            console.log('No eligible rows for', cc);
+            fs.writeFileSync(`channels-${cc}.xml`, '<channels/>\n');
+            process.exit(0);
+          }
+
+          const esc = s => String(s)
+            .replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+            .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+          let xml = '<channels>\n';
+          for (const r of rows) {
+            xml += `  <channel site="${esc(r.site)}" site_id="${esc(r.site_id)}" xmltv_id="${esc(r.xmltv_id)}" lang="${esc(r.lang)}"/>\n`;
+          }
+          xml += '</channels>\n';
+
+          fs.writeFileSync(`channels-${cc}.xml`, xml);
+          console.log(`Wrote channels-${cc}.xml with ${rows.length} entries`);
+          NODE
+
+      - name: Run epg-grabber for ${{ matrix.cc }}
+        run: |
+          mkdir -p out
+          # Lower parallelism to keep memory & 403s down; 1 day initially
+          npx -y epg-grabber \
+            --channels ./channels-${{ matrix.cc }}.xml \
+            --output ./out/${{ matrix.cc }}.xml \
+            --days 1 \
+            --gzip \
+            --maxConnections 2 \
+            --concurrency 2 \
+            --timeout 180000 \
+            --delay 500 \
+            --debug || true
+
+      - name: List outputs
+        run: ls -lh out || true
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: guide.xml
-          path: build/guide.xml
+          name: epg-${{ matrix.cc }}
+          path: out/${{ matrix.cc }}.xml*
 
-      - name: Push to Supabase
+      # OPTIONAL: push to Supabase Storage (set secrets first)
+      - name: Upload to Supabase
+        if: env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE != ''
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SUPABASE_TABLE: ${{ env.TABLE }}
-        run: node scripts/push-to-supabase.mjs build/guide.xml build/channels.xml
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+        run: |
+          FILE="out/${{ matrix.cc }}.xml.gz"
+          if [ -f "$FILE" ]; then
+            DEST="epg/${{ matrix.cc }}/epg_${{ github.run_id }}.xml.gz"
+            curl -sS -X POST \
+              "${SUPABASE_URL}/storage/v1/object/${DEST}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+              -H "x-upsert: true" \
+              -H "Content-Type: application/gzip" \
+              --data-binary "@${FILE}"
+            echo "Uploaded $FILE to $DEST"
+          else
+            echo "No gz file for ${{ matrix.cc }}; skipping Supabase upload"
+          fi
