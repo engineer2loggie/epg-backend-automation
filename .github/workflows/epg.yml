@@ -1,47 +1,4 @@
-name: EPG build
-
-on:
-  workflow_dispatch:
-    inputs:
-      countries:
-        description: "Comma-separated ISO codes"
-        required: false
-        default: "US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO"
-
-env:
-  COUNTRIES: ${{ github.event.inputs.countries || 'US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO' }}
-  BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
-  NODE_OPTIONS: --max-old-space-size=2048
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-
-      - name: Checkout iptv-org/epg (configs & scripts)
-        uses: actions/checkout@v4
-        with:
-          repository: iptv-org/epg
-          path: epg-src
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install epg-src deps
-        working-directory: epg-src
-        run: npm ci
-
-      - name: Fetch iptv-org API JSON
-        run: |
-          mkdir -p work/api out
-          curl -fsSL https://iptv-org.github.io/api/channels.json -o work/api/channels.json
-          curl -fsSL https://iptv-org.github.io/api/guides.json   -o work/api/guides.json
-
-      - name: Write helper scripts
+- name: Write helper scripts
         run: |
           mkdir -p scripts
 
@@ -67,10 +24,10 @@ jobs:
 
           function esc(s) {
             return String(s)
-              .replaceAll('&', '&amp;')
-              .replaceAll('"', '&quot;')
-              .replaceAll('<', '&lt;')
-              .replaceAll('>', '&gt;');
+              .replace(/&/g, '&amp;')
+              .replace(/"/g, '&quot;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
           }
 
           (async () => {
@@ -86,7 +43,7 @@ jobs:
             );
 
             if (byId.size === 0) {
-              console.log(\`[\${CC}] No channels for this country in channels.json\`);
+              console.log('[' + CC + '] No channels for this country in channels.json');
               process.exit(0);
             }
 
@@ -103,21 +60,21 @@ jobs:
             }
 
             if (grouped.size === 0) {
-              console.log(\`[\${CC}] No usable sites (possibly all blocked)\`);
+              console.log('[' + CC + '] No usable sites (possibly all blocked)');
               process.exit(0);
             }
 
             for (const [site, map] of grouped) {
-              const file = path.join(OUT_DIR, \`channels-\${CC}-\${site}.xml\`);
+              const file = path.join(OUT_DIR, 'channels-' + CC + '-' + site + '.xml');
               const lines = ['<channels>'];
               for (const [site_id, xmltv_id] of map) {
                 lines.push(
-                  \`  <channel site="\${esc(site)}" site_id="\${esc(site_id)}" xmltv_id="\${esc(xmltv_id)}" />\`
+                  '  <channel site="' + esc(site) + '" site_id="' + esc(site_id) + '" xmltv_id="' + esc(xmltv_id) + '" />'
                 );
               }
-              lines.push('</channels>\\n');
-              await fs.writeFile(file, lines.join('\\n'), 'utf8');
-              console.log(\`[\${CC}] wrote \${file} (\${map.size} entries)\`);
+              lines.push('</channels>\n');
+              await fs.writeFile(file, lines.join('\n'), 'utf8');
+              console.log('[' + CC + '] wrote ' + file + ' (' + map.size + ' entries)');
             }
           })().catch(err => {
             console.error(err);
@@ -125,6 +82,7 @@ jobs:
           });
           EOF
 
+          # The rest of your script (cat > scripts/run-grabs.sh ...) remains the same
           cat > scripts/run-grabs.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -184,13 +142,3 @@ jobs:
           EOF
 
           chmod +x scripts/run-grabs.sh
-
-      - name: Run grabs
-        run: scripts/run-grabs.sh
-
-      - name: Upload XML artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: epg-xml
-          path: out/**
-          if-no-files-found: warn
