@@ -10,14 +10,12 @@ on:
 
 env:
   COUNTRIES: ${{ github.event.inputs.countries || 'US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO' }}
-  # These sites very often block GitHub runners; skip them to keep the build green
   BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
   NODE_OPTIONS: --max-old-space-size=2048
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -37,16 +35,157 @@ jobs:
         working-directory: epg-src
         run: npm ci
 
-      - name: Fetch iptv-org api json
+      - name: Fetch iptv-org API JSON
         run: |
           mkdir -p work/api out
           curl -fsSL https://iptv-org.github.io/api/channels.json -o work/api/channels.json
           curl -fsSL https://iptv-org.github.io/api/guides.json   -o work/api/guides.json
 
-      - name: Make scripts executable
-        run: chmod +x scripts/run-grabs.sh
+      - name: Write helper scripts
+        run: |
+          mkdir -p scripts
 
-      - name: Prepare per-site channel lists & grab EPG
+          cat > scripts/make-channels-by-site.mjs <<'EOF'
+          import fs from 'node:fs/promises';
+          import path from 'node:path';
+
+          const CC = (process.env.CC || 'US').toUpperCase();
+          const API_DIR = 'work/api';
+          const OUT_DIR = path.join('work', CC);
+
+          const blocked = new Set(
+            (process.env.BLOCKED_SITES || '')
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean)
+          );
+
+          async function loadJson(p) {
+            const buf = await fs.readFile(p, 'utf8');
+            return JSON.parse(buf);
+          }
+
+          function esc(s) {
+            return String(s)
+              .replaceAll('&', '&amp;')
+              .replaceAll('"', '&quot;')
+              .replaceAll('<', '&lt;')
+              .replaceAll('>', '&gt;');
+          }
+
+          (async () => {
+            await fs.mkdir(OUT_DIR, { recursive: true });
+
+            const channels = await loadJson(path.join(API_DIR, 'channels.json'));
+            const guides   = await loadJson(path.join(API_DIR, 'guides.json'));
+
+            const byId = new Map(
+              channels
+                .filter(c => (c.country || '').toUpperCase() === CC)
+                .map(c => [c.id, c])
+            );
+
+            if (byId.size === 0) {
+              console.log(\`[\${CC}] No channels for this country in channels.json\`);
+              process.exit(0);
+            }
+
+            const grouped = new Map(); // site -> Map(site_id -> xmltv_id)
+            for (const g of guides) {
+              if (!g || !g.channel || !g.site || !g.site_id) continue;
+              if (!byId.has(g.channel)) continue;
+
+              const site = String(g.site).trim();
+              if (blocked.has(site)) continue;
+
+              if (!grouped.has(site)) grouped.set(site, new Map());
+              grouped.get(site).set(String(g.site_id), String(g.channel));
+            }
+
+            if (grouped.size === 0) {
+              console.log(\`[\${CC}] No usable sites (possibly all blocked)\`);
+              process.exit(0);
+            }
+
+            for (const [site, map] of grouped) {
+              const file = path.join(OUT_DIR, \`channels-\${CC}-\${site}.xml\`);
+              const lines = ['<channels>'];
+              for (const [site_id, xmltv_id] of map) {
+                lines.push(
+                  \`  <channel site="\${esc(site)}" site_id="\${esc(site_id)}" xmltv_id="\${esc(xmltv_id)}" />\`
+                );
+              }
+              lines.push('</channels>\\n');
+              await fs.writeFile(file, lines.join('\\n'), 'utf8');
+              console.log(\`[\${CC}] wrote \${file} (\${map.size} entries)\`);
+            }
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+
+          cat > scripts/run-grabs.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          IFS=',' read -ra CCS <<< "${COUNTRIES}"
+          mkdir -p out
+
+          for CC in "${CCS[@]}"; do
+            CC="$(echo "$CC" | tr '[:lower:]' '[:upper:]')"
+            export CC
+            echo "== Prepare channels for ${CC} =="
+
+            node scripts/make-channels-by-site.mjs
+
+            mkdir -p "out/${CC}"
+            shopt -s nullglob
+            for f in work/${CC}/channels-${CC}-*.xml; do
+              site="$(basename "$f" .xml | sed -E "s/^channels-${CC}-//")"
+              cfg="epg-src/sites/${site}/${site}.config.js"
+
+              if [[ ! -f "$cfg" ]]; then
+                echo "::warning ::No config for site '${site}', skipping (${cfg})"
+                continue
+              fi
+
+              echo "::group::Grab ${CC} / ${site}"
+              echo "channels: $f"
+              echo "config   : $cfg"
+
+              set +e
+              npm --prefix epg-src run grab --silent -- \
+                --config "$cfg" \
+                --channels "$f" \
+                --output "out/${CC}/${site}.xml" \
+                --days 1 \
+                --maxConnections 2 \
+                --concurrency 2 \
+                --timeout 180000 \
+                --delay 500 \
+                --debug 2>&1 | tee "out/${CC}/${site}.log"
+              rc=${PIPESTATUS[0]}
+              set -e
+
+              if [[ -f "out/${CC}/${site}.xml" ]]; then
+                gzip -f "out/${CC}/${site}.xml"
+                echo "Wrote out/${CC}/${site}.xml.gz"
+              else
+                echo "::notice ::No XML produced for ${site} (${CC}). See log out/${CC}/${site}.log"
+              fi
+              echo "::endgroup::"
+            done
+
+            if [[ -z "$(ls -A out/${CC} 2>/dev/null || true)" ]]; then
+              echo "no site outputs for ${CC}" > "out/${CC}/README.txt"
+            fi
+          done
+          EOF
+
+          chmod +x scripts/run-grabs.sh
+
+      - name: Run grabs
         run: scripts/run-grabs.sh
 
       - name: Upload XML artifacts
