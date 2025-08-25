@@ -2,16 +2,17 @@ name: EPG
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
-
-env:
-  COUNTRIES: US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO
-  NODE_OPTIONS: --max-old-space-size=2048
-  BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+    branches:
+      - main
 
 jobs:
-  build:
+  grab:
     runs-on: ubuntu-latest
+    env:
+      COUNTRIES: US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO
+      NODE_OPTIONS: --max-old-space-size=2048
+      BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,25 +22,19 @@ jobs:
         with:
           node-version: 20
 
-      - name: Fetch iptv-org/epg
+      - name: Prepare repos and snapshots
         run: |
-          git clone --depth 1 https://github.com/iptv-org/epg epg-src
-
-      - name: Install dependencies (epg-src)
-        working-directory: epg-src
-        run: npm ci
-
-      - name: Fetch iptv-org/api snapshots
-        run: |
-          mkdir -p work/api
+          set -e
+          mkdir -p work/api scripts out
           curl -fsSL https://iptv-org.github.io/api/channels.json -o work/api/channels.json
-          curl -fsSL https://iptv-org.github.io/api/guides.json -o work/api/guides.json
+          curl -fsSL https://iptv-org.github.io/api/guides.json   -o work/api/guides.json
+          git clone --depth 1 https://github.com/iptv-org/epg epg-src
+          npm ci --prefix epg-src
 
       - name: Write helper scripts
         run: |
           mkdir -p scripts
           cat > scripts/make-channels-by-site.mjs <<'EOF'
-          // scripts/make-channels-by-site.mjs
           import fs from 'node:fs/promises';
           import path from 'node:path';
 
@@ -118,7 +113,7 @@ jobs:
             console.error(err);
             process.exit(1);
           });
-EOF
+          EOF
 
           cat > scripts/run-grabs.sh <<'EOF'
           #!/usr/bin/env bash
@@ -176,7 +171,7 @@ EOF
               echo "no site outputs for ${CC}" > "out/${CC}/README.txt"
             fi
           done
-EOF
+          EOF
 
           chmod +x scripts/run-grabs.sh
 
