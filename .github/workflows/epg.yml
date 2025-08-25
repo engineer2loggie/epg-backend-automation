@@ -25,7 +25,7 @@ jobs:
           node-version: "20"
 
       - name: Install script deps
-        run: npm ci
+        run: npm install
 
       - name: Clone iptv-org/epg
         run: |
