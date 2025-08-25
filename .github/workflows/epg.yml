@@ -1,18 +1,57 @@
-name: EPG (manual)
+name: EPG build
 
 on:
   workflow_dispatch:
     inputs:
       countries:
-        description: "Comma-separated ISO codes (US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO)"
+        description: "Comma-separated ISO codes"
         required: false
         default: "US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO"
 
+env:
+  COUNTRIES: ${{ github.event.inputs.countries || 'US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO' }}
+  # These sites very often block GitHub runners; skip them to keep the build green
+  BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+  NODE_OPTIONS: --max-old-space-size=2048
+
 jobs:
-  sanity:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Show inputs
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout iptv-org/epg (configs & scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: iptv-org/epg
+          path: epg-src
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install epg-src deps
+        working-directory: epg-src
+        run: npm ci
+
+      - name: Fetch iptv-org api json
         run: |
-          echo "Triggered on: $GITHUB_REF"
-          echo "countries='${{ github.event.inputs.countries }}'"
+          mkdir -p work/api out
+          curl -fsSL https://iptv-org.github.io/api/channels.json -o work/api/channels.json
+          curl -fsSL https://iptv-org.github.io/api/guides.json   -o work/api/guides.json
+
+      - name: Make scripts executable
+        run: chmod +x scripts/run-grabs.sh
+
+      - name: Prepare per-site channel lists & grab EPG
+        run: scripts/run-grabs.sh
+
+      - name: Upload XML artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: epg-xml
+          path: out/**
+          if-no-files-found: warn
