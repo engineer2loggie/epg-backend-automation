@@ -1,9 +1,48 @@
-- name: Write helper scripts
-  shell: bash
-  run: |
-    mkdir -p scripts
+name: EPG
 
-    cat > scripts/make-channels-by-site.mjs <<'EOF'
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+env:
+  COUNTRIES: US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO
+  NODE_OPTIONS: --max-old-space-size=2048
+  BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch iptv-org/epg
+        run: |
+          git clone --depth 1 https://github.com/iptv-org/epg epg-src
+
+      - name: Install dependencies (epg-src)
+        working-directory: epg-src
+        run: npm ci
+
+      - name: Fetch iptv-org/api snapshots
+        run: |
+          mkdir -p work/api
+          curl -fsSL https://iptv-org.github.io/api/channels.json -o work/api/channels.json
+          curl -fsSL https://iptv-org.github.io/api/guides.json -o work/api/guides.json
+
+      - name: Write helper scripts
+        shell: bash
+        run: |
+          mkdir -p scripts
+
+          cat > scripts/make-channels-by-site.mjs <<'EOF'
 // scripts/make-channels-by-site.mjs
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -38,7 +77,7 @@ function esc(s) {
   const channels = await loadJson(path.join(API_DIR, 'channels.json'));
   const guides   = await loadJson(path.join(API_DIR, 'guides.json'));
 
-  // channels for this country -> Map(xmltv_id -> channel)
+  // channels in this country
   const byId = new Map(
     channels
       .filter(c => ((c.country || '').toUpperCase() === CC))
@@ -88,7 +127,7 @@ function esc(s) {
 });
 EOF
 
-    cat > scripts/run-grabs.sh <<'EOF'
+          cat > scripts/run-grabs.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -146,4 +185,17 @@ for CC in "${CCS[@]}"; do
 done
 EOF
 
-    chmod +x scripts/run-grabs.sh
+          chmod +x scripts/run-grabs.sh
+
+      - name: Run grabs
+        env:
+          COUNTRIES: ${{ env.COUNTRIES }}
+          BLOCKED_SITES: ${{ env.BLOCKED_SITES }}
+        run: scripts/run-grabs.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: epg-xml
+          path: out/**
+          if-no-files-found: warn
