@@ -1,155 +1,84 @@
-name: Build EPG (selected countries)
+name: EPG Build (npm run grab)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "22 2 * * *"
+    - cron: "0 6 * * *" # daily, 6:00 UTC
 
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        cc: [US, PR, MX, CA, IT, ES, GB, AU, IE, DE, DO] # UK == GB
     env:
       NODE_OPTIONS: --max-old-space-size=2048
+      # Sites that are known to 403 on GitHub runners. You can relax this later.
+      BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Checkout iptv-org/epg (src)
+        run: git clone --depth=1 https://github.com/iptv-org/epg.git epg-src
+
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Clone iptv-org/epg (site configs)
-        run: |
-          git clone --depth=1 https://github.com/iptv-org/epg.git epg-src
+      - name: Install deps for epg (official repo)
+        working-directory: epg-src
+        run: npm ci
 
-      - name: Fetch iptv-org datasets
-        run: |
-          curl -sL https://iptv-org.github.io/api/channels.json -o channels.json
-          curl -sL https://iptv-org.github.io/api/guides.json   -o guides.json
-          echo "channels.json size: $(wc -c < channels.json) bytes"
-          echo "guides.json   size: $(wc -c < guides.json) bytes"
+      - name: Prepare scripts dir
+        run: mkdir -p scripts work out
 
-      - name: Build per-site channels for ${{ matrix.cc }}
+      - name: Add make-channels script
+        run: |
+          cat > scripts/make-channels-by-site.mjs <<'EOF'
+          # (PASTE THE WHOLE JS FROM SECTION 1 HERE)
+          EOF
+
+      - name: Build per-country, per-site (US, PR, MX, CA, IT, ES, UK/GB, AU, IE, DE, DO)
         env:
-          CC: ${{ matrix.cc }}
+          COUNTRIES: US,PR,MX,CA,IT,ES,UK,AU,IE,DE,DO
         run: |
-          set -e
-          mkdir -p work/${CC} out/${CC}
-          node <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
+          IFS=',' read -ra CCS <<< "$COUNTRIES"
+          for CC in "${CCS[@]}"; do
+            echo "== Prepare channels for $CC =="
+            node scripts/make-channels-by-site.mjs "$CC"
 
-          const CC = process.env.CC;
-          function log(...a){ console.log(`[${CC}]`, ...a); }
+            mkdir -p "out/$CC"
+            shopt -s nullglob
+            for f in work/${CC}/channels-${CC}-*.xml; do
+              site=$(basename "$f" .xml | sed -E "s/^channels-${CC}-//")
+              echo "::group::Grab $CC / $site"
+              echo "channels: $f"
+              ( cd epg-src && \
+                npm run grab -- \
+                  --site="$site" \
+                  --channels="../$f" \
+                  --output="../out/${CC}/${site}.xml" \
+                  --days 1 \
+                  --maxConnections 2 \
+                  --concurrency 2 \
+                  --timeout 180000 \
+                  --delay 500 \
+                  --gzip \
+                  --debug || true )
+              echo "::endgroup::"
+            done
 
-          try {
-            const channels = JSON.parse(fs.readFileSync('channels.json','utf8'));
-            const guides   = JSON.parse(fs.readFileSync('guides.json','utf8'));
+            # keep artifact step happy even if nothing built
+            if [ -z "$(ls -A out/${CC} 2>/dev/null)" ]; then
+              echo "no site outputs for ${CC}" > "out/${CC}/README.txt"
+            fi
 
-            const cc = String(CC||'').toUpperCase();
-            const chanById = new Map(
-              channels
-                .filter(c => c && c.id && String(c.country||'').toUpperCase() === cc)
-                .map(c => [c.id, c])
-            );
-
-            log(`channels in ${cc}:`, chanById.size);
-
-            // gather guides for our channels only
-            const bySite = new Map();
-            for (const g of guides) {
-              if (!g || !g.channel || !g.site || !g.site_id) continue;
-              if (!chanById.has(g.channel)) continue;
-              if (!bySite.has(g.site)) bySite.set(g.site, []);
-              bySite.get(g.site).push(g);
-            }
-
-            log(`candidate sites before config check:`, bySite.size);
-
-            // keep only sites that have a config
-            const keep = new Map();
-            for (const [site, list] of bySite) {
-              const cfgPath = path.join('epg-src','sites',site,`${site}.config.js`);
-              if (fs.existsSync(cfgPath)) keep.set(site, list);
-              else log(`skip: no config for ${site} (had ${list.length} channels)`);
-            }
-
-            log(`sites with config:`, keep.size);
-
-            if (!keep.size) {
-              // create a marker so artifact upload doesn't warn
-              fs.mkdirSync(path.join('out', cc), { recursive: true });
-              fs.writeFileSync(path.join('out', cc, '.keep'), '');
-              process.exit(0);
-            }
-
-            // write per-site channels XML
-            fs.mkdirSync(path.join('work', cc), { recursive: true });
-
-            const esc = s => String(s)
-              .replace(/&/g,'&amp;').replace(/"/g,'&quot;')
-              .replace(/</g,'&lt;').replace(/>/g,'&gt;');
-
-            for (const [site, list] of keep) {
-              const outPath = path.join('work', cc, `channels-${cc}-${site}.xml`);
-              let xml = '<channels>\n';
-              for (const g of list) {
-                xml += `  <channel site="${esc(g.site)}" site_id="${esc(g.site_id)}" xmltv_id="${esc(g.channel)}" lang="${esc(g.lang||'en')}"/>\n`;
-              }
-              xml += '</channels>\n';
-              fs.writeFileSync(outPath, xml);
-              log(`wrote ${outPath} (${list.length} rows)`);
-            }
-          } catch (e) {
-            console.log(`[${CC}] generator error`, e && e.stack || e);
-            fs.mkdirSync(path.join('out', CC), { recursive: true });
-            fs.writeFileSync(path.join('out', CC, '.keep'), '');
-            process.exit(0);
-          }
-          NODE
-
-      - name: Grab per-site for ${{ matrix.cc }}
-        env:
-          CC: ${{ matrix.cc }}
-        run: |
-          set +e
-          shopt -s nullglob
-          mkdir -p out/${CC}
-          for f in work/${CC}/channels-${CC}-*.xml; do
-            site=$(basename "$f" .xml | sed -E "s/^channels-${CC}-//")
-            cfg="epg-src/sites/${site}/${site}.config.js"
-            echo "::group::Grab ${CC} / ${site}"
-            echo "channels: $f"
-            echo "config   : $cfg"
-            # Use npx to ensure epg-grabber is present
-            npx -y epg-grabber \
-              --config "$cfg" \
-              --channels "$f" \
-              --output "out/${CC}/${site}.xml" \
-              --days 1 \
-              --maxConnections 2 \
-              --concurrency 2 \
-              --timeout 180000 \
-              --delay 500 \
-              --debug || true
-            [ -f "out/${CC}/${site}.xml" ] && gzip -f "out/${CC}/${site}.xml"
-            echo "::endgroup::"
+            echo "== List $CC outputs ==" && ls -lah "out/${CC}" || true
           done
 
-          # Always leave at least one file so the artifact step doesn't warn
-          if [ -z "$(ls -A out/${CC})" ]; then
-            echo "no site outputs for ${CC}" > "out/${CC}/README.txt"
-          fi
-
-          ls -l out/${CC} || true
-
-      - name: Upload artifact (sites for ${{ matrix.cc }})
+      - name: Upload artifacts (all countries)
         uses: actions/upload-artifact@v4
         with:
-          name: epg-sites-${{ matrix.cc }}
-          path: out/${{ matrix.cc }}/**
+          name: epg-sites-all
+          path: out/**
           if-no-files-found: warn
