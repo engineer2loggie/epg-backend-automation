@@ -3,7 +3,7 @@ name: Build EPG (selected countries)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "22 2 * * *"  # daily
+    - cron: "22 2 * * *"
 
 jobs:
   build:
@@ -11,10 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cc: [US, PR, MX, CA, IT, ES, GB, AU, IE, DE, DO] # UK=GB
+        cc: [US, PR, MX, CA, IT, ES, GB, AU, IE, DE, DO] # UK == GB
     env:
       NODE_OPTIONS: --max-old-space-size=2048
-      BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
     steps:
       - uses: actions/checkout@v4
 
@@ -23,81 +22,93 @@ jobs:
         with:
           node-version: 20
 
-      - name: Clone iptv-org/epg (site configs & grabber scripts)
+      - name: Clone iptv-org/epg (site configs)
         run: |
           git clone --depth=1 https://github.com/iptv-org/epg.git epg-src
-          cd epg-src
-          npm ci
 
       - name: Fetch iptv-org datasets
         run: |
           curl -sL https://iptv-org.github.io/api/channels.json -o channels.json
           curl -sL https://iptv-org.github.io/api/guides.json   -o guides.json
+          echo "channels.json size: $(wc -c < channels.json) bytes"
+          echo "guides.json   size: $(wc -c < guides.json) bytes"
 
       - name: Build per-site channels for ${{ matrix.cc }}
         env:
           CC: ${{ matrix.cc }}
-          BLOCKED: ${{ env.BLOCKED_SITES }}
         run: |
+          set -e
+          mkdir -p work/${CC} out/${CC}
           node <<'NODE'
           const fs = require('fs');
           const path = require('path');
 
           const CC = process.env.CC;
-          const BLOCKED = new Set((process.env.BLOCKED||'').split(',').map(s=>s.trim()).filter(Boolean));
+          function log(...a){ console.log(`[${CC}]`, ...a); }
 
-          const channels = JSON.parse(fs.readFileSync('channels.json','utf8'));
-          const guides   = JSON.parse(fs.readFileSync('guides.json','utf8'));
+          try {
+            const channels = JSON.parse(fs.readFileSync('channels.json','utf8'));
+            const guides   = JSON.parse(fs.readFileSync('guides.json','utf8'));
 
-          // filter channels by country
-          const chanById = new Map(
-            channels
-              .filter(c => c && c.id && String(c.country||'').toUpperCase() === CC)
-              .map(c => [c.id, c])
-          );
+            const cc = String(CC||'').toUpperCase();
+            const chanById = new Map(
+              channels
+                .filter(c => c && c.id && String(c.country||'').toUpperCase() === cc)
+                .map(c => [c.id, c])
+            );
 
-          // group guides by site, but only those that match our channels and aren’t blocked
-          const bySite = new Map();
-          for (const g of guides) {
-            if (!g || !g.channel || !g.site || !g.site_id) continue;
-            if (!chanById.has(g.channel)) continue;
-            if (BLOCKED.has(g.site)) continue;
-            if (!bySite.has(g.site)) bySite.set(g.site, []);
-            bySite.get(g.site).push(g);
-          }
+            log(`channels in ${cc}:`, chanById.size);
 
-          // only keep sites for which a config exists in epg-src/sites/<site>/<site>.config.js
-          const existingSites = [];
-          for (const [site, list] of bySite) {
-            const cfgPath = path.join('epg-src','sites',site,`${site}.config.js`);
-            if (fs.existsSync(cfgPath)) {
-              existingSites.push(site);
-            } else {
-              console.log(`Skipping site without config: ${site} (has ${list.length} rows)`);
-              bySite.delete(site);
+            // gather guides for our channels only
+            const bySite = new Map();
+            for (const g of guides) {
+              if (!g || !g.channel || !g.site || !g.site_id) continue;
+              if (!chanById.has(g.channel)) continue;
+              if (!bySite.has(g.site)) bySite.set(g.site, []);
+              bySite.get(g.site).push(g);
             }
-          }
 
-          if (!existingSites.length) {
-            console.log(`No usable sites for ${CC}`);
+            log(`candidate sites before config check:`, bySite.size);
+
+            // keep only sites that have a config
+            const keep = new Map();
+            for (const [site, list] of bySite) {
+              const cfgPath = path.join('epg-src','sites',site,`${site}.config.js`);
+              if (fs.existsSync(cfgPath)) keep.set(site, list);
+              else log(`skip: no config for ${site} (had ${list.length} channels)`);
+            }
+
+            log(`sites with config:`, keep.size);
+
+            if (!keep.size) {
+              // create a marker so artifact upload doesn't warn
+              fs.mkdirSync(path.join('out', cc), { recursive: true });
+              fs.writeFileSync(path.join('out', cc, '.keep'), '');
+              process.exit(0);
+            }
+
+            // write per-site channels XML
+            fs.mkdirSync(path.join('work', cc), { recursive: true });
+
+            const esc = s => String(s)
+              .replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+              .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+            for (const [site, list] of keep) {
+              const outPath = path.join('work', cc, `channels-${cc}-${site}.xml`);
+              let xml = '<channels>\n';
+              for (const g of list) {
+                xml += `  <channel site="${esc(g.site)}" site_id="${esc(g.site_id)}" xmltv_id="${esc(g.channel)}" lang="${esc(g.lang||'en')}"/>\n`;
+              }
+              xml += '</channels>\n';
+              fs.writeFileSync(outPath, xml);
+              log(`wrote ${outPath} (${list.length} rows)`);
+            }
+          } catch (e) {
+            console.log(`[${CC}] generator error`, e && e.stack || e);
+            fs.mkdirSync(path.join('out', CC), { recursive: true });
+            fs.writeFileSync(path.join('out', CC, '.keep'), '');
             process.exit(0);
-          }
-
-          // write per-site channels XML
-          fs.mkdirSync(path.join('work', CC), { recursive: true });
-          const esc = s => String(s)
-            .replace(/&/g,'&amp;').replace(/"/g,'&quot;')
-            .replace(/</g,'&lt;').replace(/>/g,'&gt;');
-
-          for (const [site, list] of bySite) {
-            const outPath = path.join('work', CC, `channels-${CC}-${site}.xml`);
-            let xml = '<channels>\n';
-            for (const g of list) {
-              xml += `  <channel site="${esc(g.site)}" site_id="${esc(g.site_id)}" xmltv_id="${esc(g.channel)}" lang="${esc(g.lang||'en')}"/>\n`;
-            }
-            xml += '</channels>\n';
-            fs.writeFileSync(outPath, xml);
-            console.log(`Wrote ${outPath} (${list.length} rows)`);
           }
           NODE
 
@@ -105,17 +116,17 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
         run: |
-          set -e
+          set +e
+          shopt -s nullglob
           mkdir -p out/${CC}
-          # run each site separately with its specific config
           for f in work/${CC}/channels-${CC}-*.xml; do
-            [ -f "$f" ] || continue
             site=$(basename "$f" .xml | sed -E "s/^channels-${CC}-//")
             cfg="epg-src/sites/${site}/${site}.config.js"
             echo "::group::Grab ${CC} / ${site}"
-            echo "using channels: $f"
-            echo "using config  : $cfg"
-            node epg-src/node_modules/.bin/epg-grabber \
+            echo "channels: $f"
+            echo "config   : $cfg"
+            # Use npx to ensure epg-grabber is present
+            npx -y epg-grabber \
               --config "$cfg" \
               --channels "$f" \
               --output "out/${CC}/${site}.xml" \
@@ -125,42 +136,20 @@ jobs:
               --timeout 180000 \
               --delay 500 \
               --debug || true
-            gzip -f "out/${CC}/${site}.xml" || true
+            [ -f "out/${CC}/${site}.xml" ] && gzip -f "out/${CC}/${site}.xml"
             echo "::endgroup::"
           done
+
+          # Always leave at least one file so the artifact step doesn't warn
+          if [ -z "$(ls -A out/${CC})" ]; then
+            echo "no site outputs for ${CC}" > "out/${CC}/README.txt"
+          fi
+
           ls -l out/${CC} || true
 
-      - name: Upload artifact (all site files for ${{ matrix.cc }})
+      - name: Upload artifact (sites for ${{ matrix.cc }})
         uses: actions/upload-artifact@v4
         with:
           name: epg-sites-${{ matrix.cc }}
           path: out/${{ matrix.cc }}/**
           if-no-files-found: warn
-
-      # OPTIONAL: Pack and upload a single tar.gz to Supabase
-      - name: Tar per-country folder
-        run: |
-          if [ -d "out/${{ matrix.cc }}" ]; then
-            tar czf "out/${{ matrix.cc }}.tar.gz" -C out "${{ matrix.cc }}"
-          fi
-
-      - name: Upload to Supabase (optional)
-        if: env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE != ''
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-        run: |
-          FILE="out/${{ matrix.cc }}.tar.gz"
-          if [ -f "$FILE" ]; then
-            DEST="epg/${{ matrix.cc }}/${{ matrix.cc }}_${{ github.run_id }}.tar.gz"
-            curl -sS -X POST \
-              "${SUPABASE_URL}/storage/v1/object/${DEST}" \
-              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
-              -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
-              -H "x-upsert: true" \
-              -H "Content-Type: application/gzip" \
-              --data-binary "@${FILE}"
-            echo "Uploaded $FILE to $DEST"
-          else
-            echo "No per-country archive for ${{ matrix.cc }}"
-          fi
