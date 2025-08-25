@@ -1,100 +1,119 @@
-// Build channels.xml by joining iptv-org/api channels+guides and filtering by country.
-// Usage: node scripts/make-channels-xml.mjs "PR,US,MX"
+// scripts/make-channels-by-site.mjs
+// Usage: node scripts/make-channels-by-site.mjs US
+// Produces: work/US/channels-US-<site>.xml files, each only for that site's channels in the country
 
-import fs from "node:fs/promises";
-import path from "node:path";
+import fs from "fs";
+import path from "path";
+import https from "https";
 
-const API_BASE = "https://iptv-org.github.io/api";
-
-const outDir = "build";
-const outPath = path.join(outDir, "channels.xml");
-
-const rawCountries = (process.argv[2] || process.env.COUNTRIES || "").trim();
-if (!rawCountries) {
-  console.error("Missing country list. Pass e.g. 'PR,US' as an argument or set COUNTRIES env.");
+const CC_INPUT = (process.argv[2] || "").toUpperCase();
+if (!CC_INPUT) {
+  console.error("Country code required (e.g. US, GB, PR, MX, CA, IT, ES, AU, IE, DE, DO)");
   process.exit(1);
 }
-const wanted = new Set(
-  rawCountries
+
+const CC_MAP = { UK: "GB" }; // normalize
+const CC = CC_MAP[CC_INPUT] || CC_INPUT;
+
+// allow skipping known-blocked sites (403s)
+const BLOCKED = new Set(
+  (process.env.BLOCKED_SITES || "directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com")
     .split(",")
-    .map(s => s.trim().toUpperCase())
+    .map(s => s.trim())
     .filter(Boolean)
 );
 
-function uniqBy(arr, keyFn) {
-  const seen = new Set();
-  const res = [];
-  for (const it of arr) {
-    const k = keyFn(it);
-    if (!seen.has(k)) {
-      seen.add(k);
-      res.push(it);
-    }
-  }
-  return res;
+// fetch helper
+function get(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, { headers: { "User-Agent": "epg-job/1.0" } }, res => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`GET ${url} -> ${res.statusCode}`));
+          res.resume();
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", chunk => (data += chunk));
+        res.on("end", () => resolve(data));
+      })
+      .on("error", reject);
+  });
 }
 
-function escapeXml(s = "") {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+const OUT_DIR = path.join("work", CC);
+fs.mkdirSync(OUT_DIR, { recursive: true });
 
 (async () => {
-  console.log(`Fetching channels.json and guides.json…`);
-  const [channelsRes, guidesRes] = await Promise.all([
-    fetch(`${API_BASE}/channels.json`),
-    fetch(`${API_BASE}/guides.json`)
-  ]);
-  const [channels, guides] = await Promise.all([channelsRes.json(), guidesRes.json()]);
+  console.log(`[make-channels] country=${CC}`);
 
-  // Allowed channel ids by country
-  const allowedChannelIds = new Set(
+  const channelsUrl = "https://iptv-org.github.io/api/channels.json";
+  const guidesUrl   = "https://iptv-org.github.io/api/guides.json";
+
+  const [channelsRaw, guidesRaw] = await Promise.all([get(channelsUrl), get(guidesUrl)]);
+
+  /** @type {{id:string,country?:string,name?:string,language?:string[]}|[]} */
+  const channels = JSON.parse(channelsRaw);
+  /** @type {{channel:string|null,site:string,site_id:string,site_name?:string,lang?:string}|[]} */
+  const guides = JSON.parse(guidesRaw);
+
+  // channels for this country
+  const byId = new Map(
     channels
-      .filter(c => c.country && wanted.has(String(c.country).toUpperCase()))
-      .map(c => c.id)
+      .filter(ch => (ch.country || "").toUpperCase() === CC)
+      .map(ch => [ch.id, ch])
   );
 
-  // Build <channel> entries from guides for allowed channels
-  const entries = guides
-    .filter(g => g.channel && allowedChannelIds.has(g.channel))
-    .map(g => ({
+  // join guides -> only those whose channel id exists in this country set
+  const perSite = new Map(); // site -> array of {site, site_id, xmltv_id, lang}
+  for (const g of guides) {
+    if (!g || !g.channel || !g.site || !g.site_id) continue;
+    if (!byId.has(g.channel)) continue;
+    if (BLOCKED.has(g.site)) continue;
+
+    const arr = perSite.get(g.site) || [];
+    arr.push({
+      site: g.site,
+      site_id: g.site_id,
       xmltv_id: g.channel,
-      site: g.site || "",
-      site_id: g.site_id || "",
-      lang: g.lang || "",
-      site_name: g.site_name || "" // as text node
-    }))
-    // some channels have multiple guides on same site+site_id; dedupe
-    .filter(e => e.site && e.site_id);
-
-  const unique = uniqBy(
-    entries,
-    e => `${e.xmltv_id}|${e.site}|${e.site_id}|${e.lang}`
-  );
-
-  console.log(`Countries: ${[...wanted].join(", ")} → ${unique.length} guide entries`);
-
-  await fs.mkdir(outDir, { recursive: true });
-
-  const xml = [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<channels>`
-  ];
-
-  for (const e of unique) {
-    xml.push(
-      `  <channel site="${escapeXml(e.site)}" lang="${escapeXml(e.lang)}" xmltv_id="${escapeXml(e.xmltv_id)}" site_id="${escapeXml(e.site_id)}">${escapeXml(e.site_name)}</channel>`
-    );
+      lang: g.lang || ""
+    });
+    perSite.set(g.site, arr);
   }
 
-  xml.push(`</channels>`, ``);
+  // write one XML per site
+  for (const [site, arr] of perSite.entries()) {
+    const file = path.join(OUT_DIR, `channels-${CC}-${site}.xml`);
+    const rows = arr
+      .sort((a, b) => a.xmltv_id.localeCompare(b.xmltv_id))
+      .map(
+        x =>
+          `  <channel site="${x.site}" site_id="${escapeXml(x.site_id)}" xmltv_id="${escapeXml(
+            x.xmltv_id
+          )}"${x.lang ? ` lang="${x.lang}"` : ""}/>`
+      )
+      .join("\n");
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<channels>\n${rows}\n</channels>\n`;
+    fs.writeFileSync(file, xml, "utf8");
+    console.log(`[make-channels] wrote ${file} (${arr.length} entries)`);
+  }
 
-  await fs.writeFile(outPath, xml.join("\n"), "utf8");
-  console.log(`Wrote ${outPath}`);
+  // leave a marker if nothing produced (so the workflow can still proceed)
+  if (perSite.size === 0) {
+    const f = path.join(OUT_DIR, "README.txt");
+    fs.writeFileSync(f, `No sites produced for ${CC}\n`, "utf8");
+    console.log(`[make-channels] ${f}`);
+  }
 })().catch(err => {
   console.error(err);
   process.exit(1);
 });
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
