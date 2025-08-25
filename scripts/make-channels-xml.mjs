@@ -19,7 +19,7 @@ async function loadJson(p) {
 }
 
 function esc(s) {
-  // escape XML special chars without using replaceAll or backticks
+  // escape XML special chars
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
