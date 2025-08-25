@@ -19,7 +19,7 @@ async function loadJson(p) {
 }
 
 function esc(s) {
-  // avoid replaceAll & template literals for maximum portability
+  // escape XML special chars without using replaceAll or backticks
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
@@ -73,7 +73,7 @@ function esc(s) {
       );
     }
     lines.push('</channels>');
-    lines.push(''); // trailing newline
+    lines.push('');
     await fs.writeFile(file, lines.join('\n'), 'utf8');
     console.log('[' + CC + '] wrote ' + file + ' (' + map.size + ' entries)');
   }
