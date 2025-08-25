@@ -32,15 +32,15 @@ for CC in "${CCS[@]}"; do
     # Keep it gentle to avoid rate-limits and OOM
     set +e
     npm --prefix epg-src run grab --silent -- \
-      --config "$cfg" \
-      --channels "$f" \
-      --output "out/${CC}/${site}.xml" \
-      --days 1 \
-      --maxConnections 2 \
-      --concurrency 2 \
-      --timeout 180000 \
-      --delay 500 \
-      --debug 2>&1 | tee "out/${CC}/${site}.log"
+  --site "$site" \
+  --channels "$f" \
+  --output "out/${CC}/${site}.xml" \
+  --days 1 \
+  --maxConnections 2 \
+  --concurrency 2 \
+  --timeout 180000 \
+  --delay 500 \
+  --debug 2>&1 | tee "out/${CC}/${site}.log"
     rc=${PIPESTATUS[0]}
     set -e
 
