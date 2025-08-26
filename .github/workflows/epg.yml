@@ -1,13 +1,14 @@
 name: EPG
+
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   grab:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     env:
       COUNTRIES: US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO
       NODE_OPTIONS: --max-old-space-size=2048
@@ -146,14 +147,14 @@ jobs:
 
               set +e
               npm --prefix epg-src run grab --- \
-                          --site "$site" \
-                          --channels "$f" \
-                          --output "out/${CC}/${site}.xml" \
-                          --days 1 \
-                          --maxConnections 2 \
-                          --timeout 180000 \
-                          --delay 500 \
-                          2>&1 | tee "out/${CC}/${site}.log"
+                --site "$site" \
+                --channels "$f" \
+                --output "out/${CC}/${site}.xml" \
+                --days 1 \
+                --maxConnections 2 \
+                --timeout 180000 \
+                --delay 500 \
+                2>&1 | tee "out/${CC}/${site}.log"
               rc=${PIPESTATUS[0]}
               set -e
 
@@ -179,6 +180,62 @@ jobs:
           COUNTRIES: ${{ env.COUNTRIES }}
           BLOCKED_SITES: ${{ env.BLOCKED_SITES }}
         run: scripts/run-grabs.sh
+
+      - name: Publish to Supabase
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          # Optional: set this secret if you want DB rows created (e.g., "epg_files")
+          SUPABASE_DB_TABLE: ${{ secrets.SUPABASE_DB_TABLE }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          if [[ -z "${SUPABASE_URL:-}" || -z "${SUPABASE_SERVICE_ROLE:-}" ]]; then
+            echo "Supabase secrets not set; skipping publish."
+            exit 0
+          fi
+
+          # Try to create a public bucket named 'epg' (ignore if it already exists)
+          curl -sS -X POST "${SUPABASE_URL}/storage/v1/bucket" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Content-Type: application/json" \
+            -d '{"id":"epg","name":"epg","public":true}' >/dev/null || true
+
+          total=0
+          for f in out/*/*.xml.gz; do
+            rel="${f#out/}"                            # e.g. US/beinsports.com.xml.gz
+            cc="${rel%%/*}"
+            site_with_ext="${rel#*/}"
+            site="${site_with_ext%.xml.gz}"
+
+            # Upload to Storage (upsert)
+            curl -sS -X PUT "${SUPABASE_URL}/storage/v1/object/epg/${cc}/${site}.xml.gz" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+              -H "x-upsert: true" \
+              -H "Content-Type: application/gzip" \
+              --data-binary @"${f}" >/dev/null
+
+            echo "Uploaded ${rel}"
+            total=$((total+1))
+
+            # Optional index row in a table via PostgREST (if table name is provided)
+            if [[ -n "${SUPABASE_DB_TABLE:-}" ]]; then
+              size_kb=$(du -k "$f" | cut -f1)
+              programs=$(zcat "$f" | grep -c "<programme" || echo 0)
+              public_url="${SUPABASE_URL}/storage/v1/object/public/epg/${cc}/${site}.xml.gz"
+              curl -sS -X POST "${SUPABASE_URL}/rest/v1/${SUPABASE_DB_TABLE}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+                -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+                -H "Content-Type: application/json" \
+                -d "{\"country\":\"${cc}\",\"site\":\"${site}\",\"url\":\"${public_url}\",\"size_kb\":${size_kb},\"programs\":${programs}}" >/dev/null || true
+            fi
+          done
+
+          echo "Total uploaded: ${total}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
