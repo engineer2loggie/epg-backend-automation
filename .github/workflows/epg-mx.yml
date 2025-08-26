@@ -17,14 +17,12 @@ jobs:
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
       MX_EPG_URL: https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz
       HEADLESS: 'true'
-      MAX_CHANNELS: '0'          # set to e.g. 25 for test runs
+      MAX_CHANNELS: '0'
       PER_PAGE_DELAY_MS: '150'
       NAV_TIMEOUT_MS: '30000'
       PROBE_TIMEOUT_MS: '5000'
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
-
-      # Supabase table: public.mx_channels
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -37,21 +35,25 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
       - name: Install Playwright and deps
         run: |
           npm i --no-save playwright saxes @supabase/supabase-js
           npx playwright install --with-deps chromium
 
-      - name: Write script
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p scripts out/mx
-          # overwrite to avoid stale copies
-          rm -f scripts/mx-scrape-and-match.mjs
-          cat > scripts/mx-scrape-and-match.mjs <<'EOF'
+      - name: Run MX scrape & match
+        run: node scripts/mx-scrape-and-match.mjs
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-output
+          path: |
+            out/mx/records.json
+            out/mx/matches.json
+            out/mx/unmatched.json
+          if-no-files-found: ignore
 // Scrape iptv-org for MX channels, pull .m3u8s, probe them,
 // stream-parse huge EPG (ALL_SOURCES1) safely (no giant string concat),
 // match channels (exact/anchor/subset/fuzzy), write artifacts,
