@@ -311,7 +311,7 @@ jobs:
 
               const { nameMap } = await parseEpgMx();
               const matched = match(scraped, nameMap);
-              console.log(`Matched ${matched.length} channels with working streams & EPG.``);
+              console.log(`Matched ${matched.length} channels with working streams & EPG.`);
 
               const outPath = path.join('out', 'mx', 'matches.json');
               await fs.writeFile(outPath, JSON.stringify(matched, null, 2), 'utf8');
