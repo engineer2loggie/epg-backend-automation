@@ -24,7 +24,7 @@ jobs:
       PROBE_TIMEOUT_MS: '5000'
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
-      EPG_REQUIRE_PROGS: '0'      # set to '1' only if you want to keep channels that have programme listings
+      EPG_REQUIRE_PROGS: '0'      # set '1' to keep only channels w/ programme entries
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -50,9 +50,13 @@ jobs:
           set -euo pipefail
           mkdir -p scripts out/mx
           cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-          {{PASTE_THE_JS_FROM_ABOVE_VERBATIM}}
+          #!/usr/bin/env node
+          $(cat <<'JS'
+          {{THE_SCRIPT_ABOVE_WHOLE_BLOCK}}
+          JS
+          )
           EOF
-          node -e "require('fs').chmodSync('scripts/mx-scrape-and-match.mjs', 0o755)"
+          chmod +x scripts/mx-scrape-and-match.mjs
 
       - name: Run MX scrape & match
         run: node scripts/mx-scrape-and-match.mjs
