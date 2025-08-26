@@ -1,5 +1,4 @@
 name: EPG
-
 on:
   workflow_dispatch:
   push:
@@ -10,9 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      COUNTRIES: US,PR,MX,CA,IT,ES,GB,AU,IE,DE,DO
+      # US removed
+      COUNTRIES: PR,MX,CA,IT,ES,GB,AU,IE,DE,DO
       NODE_OPTIONS: --max-old-space-size=2048
-      BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com,gatotv.com
+      # gatotv.com UNBLOCKED so PR can work
+      BLOCKED_SITES: directv.com,mi.tv,tvtv.us,tvpassport.com
 
     steps:
       - name: Checkout
@@ -186,8 +187,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          # Optional: set this secret if you want DB rows created (e.g., "epg_files")
-          SUPABASE_DB_TABLE: ${{ secrets.SUPABASE_DB_TABLE }}
+          SUPABASE_DB_TABLE: ${{ secrets.SUPABASE_DB_TABLE }} # optional
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -197,7 +197,6 @@ jobs:
             exit 0
           fi
 
-          # Try to create a public bucket named 'epg' (ignore if it already exists)
           curl -sS -X POST "${SUPABASE_URL}/storage/v1/bucket" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
@@ -206,12 +205,11 @@ jobs:
 
           total=0
           for f in out/*/*.xml.gz; do
-            rel="${f#out/}"                            # e.g. US/beinsports.com.xml.gz
+            rel="${f#out/}"
             cc="${rel%%/*}"
             site_with_ext="${rel#*/}"
             site="${site_with_ext%.xml.gz}"
 
-            # Upload to Storage (upsert)
             curl -sS -X PUT "${SUPABASE_URL}/storage/v1/object/epg/${cc}/${site}.xml.gz" \
               -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
               -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
@@ -222,7 +220,6 @@ jobs:
             echo "Uploaded ${rel}"
             total=$((total+1))
 
-            # Optional index row in a table via PostgREST (if table name is provided)
             if [[ -n "${SUPABASE_DB_TABLE:-}" ]]; then
               size_kb=$(du -k "$f" | cut -f1)
               programs=$(zcat "$f" | grep -c "<programme" || echo 0)
