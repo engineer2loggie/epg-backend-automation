@@ -151,7 +151,6 @@ jobs:
                     --output "out/${CC}/${site}.xml" \
                     --days 1 \
                     --maxConnections 2 \
-                    --concurrency 2 \
                     --timeout 180000 \
                     --delay 500 \
                     --debug 2>&1 | tee "out/${CC}/${site}.log"
