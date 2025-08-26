@@ -43,7 +43,9 @@ jobs:
 # optional Supabase upsert.
 
 import { chromium } from 'playwright';
+
 import { XMLParser } from 'fast-xml-parser';
+
 import zlib from 'node:zlib';
 import fs from 'node:fs/promises';
 import path from 'node:path';
