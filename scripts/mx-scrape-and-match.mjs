@@ -203,6 +203,7 @@ async function parseEpgStream() {
 
   const MAX_NAME_CHARS = 1024;  // cap per <display-name>
   const MAX_NAMES_PER_CH = 24;  // cap number of display-names we keep per channel
+  const MAX_VARIANTS = 64;      // cap variant names stored per channel
 
   let cur = null;                // { id, namesRaw:[] }
   let inDisp = false;
@@ -217,11 +218,7 @@ async function parseEpgStream() {
     if (nm === 'channel') {
       cur = { id: tag.attributes?.id ? String(tag.attributes.id) : '', namesRaw: [] };
     } else if (nm === 'display-name' && cur) {
-      // start a new, bounded buffer for this display-name
-      inDisp = true;
-      dispChunks = [];
-      dispLen = 0;
-      dispTruncated = false;
+      inDisp = true; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'programme') {
       const cid = tag.attributes?.channel;
       if (cid) programmesSeen.add(String(cid));
@@ -229,9 +226,7 @@ async function parseEpgStream() {
   });
 
   parser.on('text', (t) => {
-    if (!inDisp || !cur) return;
-    if (!t) return;
-    if (dispTruncated) return; // already at cap
+    if (!inDisp || !cur || !t || dispTruncated) return;
     let chunk = String(t);
     if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
     const remain = MAX_NAME_CHARS - dispLen;
@@ -248,7 +243,6 @@ async function parseEpgStream() {
         const clean = txt.trim();
         if (clean) cur.namesRaw.push(clean);
       }
-      // reset display-name state
       inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'channel' && cur) {
       const id = cur.id || '';
@@ -256,11 +250,8 @@ async function parseEpgStream() {
         const names = new Set();
         for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
         for (const v of expandNameVariants(id)) if (v) names.add(v);
-
-        // optional: cap variants to keep memory bounded
         const limitedNames = [];
-        for (const v of names) { limitedNames.push(v); if (limitedNames.length >= 64) break; }
-
+        for (const v of names) { limitedNames.push(v); if (limitedNames.length >= MAX_VARIANTS) break; }
         const entry = { id, names: limitedNames, tokenSet: new Set(), hasProgs: false };
         for (const nm2 of entry.names) for (const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
         idTo.set(id, entry);
@@ -269,7 +260,6 @@ async function parseEpgStream() {
           if (k && !nameMap.has(k)) nameMap.set(k, entry);
         }
       }
-      // reset channel state
       cur = null; inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     }
   });
@@ -278,7 +268,6 @@ async function parseEpgStream() {
     src.on('error', reject);
     gunzip.on('error', reject);
     gunzip.on('data', (chunk) => {
-      // stream decode + feed parser
       const text = decoder.decode(chunk, { stream: true });
       if (text) parser.write(text);
     });
@@ -308,9 +297,11 @@ function jaccard(aTokens, bTokens) {
 }
 
 function findMatch(channelName, nameKey, nameMap, entries) {
+  // exact normalized key match
   const exact = nameMap.get(nameKey);
   if (exact) return { entry: exact, score: 1, method: 'exact' };
 
+  // token containment / anchor / subset / fuzzy
   const sTokArr = tokensOf(channelName);
   const sTok = new Set(sTokArr);
 
@@ -322,7 +313,7 @@ function findMatch(channelName, nameKey, nameMap, entries) {
     }
   }
 
-  // subset: all scraped tokens inside an entry's tokens
+  // subset: all scraped tokens are in entry's tokens; prefer smallest token set
   let subsetBest = null, subsetBestSize = Infinity;
   for (const e of entries) {
     const E = e.tokenSet || new Set();
@@ -332,7 +323,7 @@ function findMatch(channelName, nameKey, nameMap, entries) {
   }
   if (subsetBest) return { entry: subsetBest, score: 0.9, method: 'subset' };
 
-  // fuzzy Jaccard
+  // fuzzy jaccard fallback
   let best = null, bestScore = 0;
   for (const e of entries) for (const nm of e.names) {
     const score = jaccard(sTokArr, tokensOf(nm));
