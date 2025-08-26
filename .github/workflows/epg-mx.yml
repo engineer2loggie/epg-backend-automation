@@ -12,7 +12,7 @@ jobs:
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
       MX_EPG_URL: https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
       HEADLESS: "true"
-      MAX_CHANNELS: "0"       # set to e.g. 25 for test runs
+      MAX_CHANNELS: "0"      # set to e.g. 25 for test runs
       PER_PAGE_DELAY_MS: "150"
       NAV_TIMEOUT_MS: "30000"
       PROBE_TIMEOUT_MS: "5000"
@@ -128,18 +128,4 @@ async function collectChannelPages(browser) {
   items = items.filter(i => i.name && i.url);
   items = uniqBy(items, x => x.url);
 
-  if (MAX_CHANNELS > 0 && items.length > MAX_CHANNELS) items = items.slice(0, MAX_CHANNELS);
-  await page.close();
-  return items.map(i => ({ ...i, nameKey: keyOf(i.name) }));
-}
-
-// ---------- SCRAPE PER-CHANNEL PAGE FOR .m3u8 ----------
-async function scrapeChannel(browser, link) {
-  const page = await browser.newPage();
-  page.setDefaultTimeout(NAV_TIMEOUT_MS);
-  try {
-    await page.goto(link.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(500);
-
-    // Try to click "Streams" tab/section if present
-    const tab = await
+  if (MAX
