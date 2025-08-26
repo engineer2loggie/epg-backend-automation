@@ -40,17 +40,16 @@ jobs:
     set -e
     mkdir -p scripts out/mx
     cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-import { chromium } from 'playwright';
-import { XMLParser } from 'fast-xml-parser';
-import zlib from 'node:zlib';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
-import { createClient } from '@supabase/supabase-js';
+    import { chromium } from 'playwright';
+    import { XMLParser } from 'fast-xml-parser';
+    import zlib from 'node:zlib';
+    import fs from 'node:fs/promises';
+    import path from 'node:path';
+    import { setTimeout as delay } from 'node:timers/promises';
+    import { createClient } from '@supabase/supabase-js';
 
 const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
-// ...the rest of your JS exactly as-is...
-// make sure there are no ${ { }} expressions or tabs in this block
+
 EOF
 
 const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
