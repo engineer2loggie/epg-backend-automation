@@ -37,15 +37,12 @@ jobs:
       - name: Write script
         run: |
           mkdir -p scripts out/mx
-          cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-# Scrape iptv-org.github.io for live MX channels (no JSON APIs), pull .m3u8s,
-# download EPGShare MX XML, match by display-name, probe stream, write artifact,
-# optional Supabase upsert.
+          cat > scripts/mx-scrape-and-match.mjs
+          <<'EOF
+          
 
 import { chromium } from 'playwright';
-
 import { XMLParser } from 'fast-xml-parser';
-
 import zlib from 'node:zlib';
 import fs from 'node:fs/promises';
 import path from 'node:path';
