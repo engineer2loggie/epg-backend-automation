@@ -1,37 +1,78 @@
 // Scrape iptv-org.github.io for live MX channels (no JSON APIs), pull .m3u8s,
-// download EPGShare MX XML, match by display-name, write artifact, optional Supabase upsert.
+// stream-parse EPG (ALL_SOURCES1), match by normalized names, write artifacts,
+// and insert into Supabase public.mx_channels (uuid id, stream_url, channel_guess,
+// epg_channel_id, epg_display_name, working, checked_at).
 
 import { chromium } from 'playwright';
-import { XMLParser } from 'fast-xml-parser';
-import zlib from 'node:zlib';
+import { createGunzip } from 'node:zlib';
+import { Readable } from 'node:stream';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createClient } from '@supabase/supabase-js';
+import { SaxesParser } from 'saxes';
 
+// ---------- ENV ----------
 const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
-const EPG_GZ_URL = process.env.MX_EPG_URL || 'https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz';
+// Default to ALL SOURCES (huge); we stream-parse to avoid memory limits
+const EPG_GZ_URL = process.env.MX_EPG_URL || 'https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz';
 
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
 const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0'); // 0 = no cap
 const PER_PAGE_DELAY_MS = Number(process.env.PER_PAGE_DELAY_MS || '150');
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || '30000');
+const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '5000');
+
+const FUZZY_MIN = Number(process.env.FUZZY_MIN || '0.45');
+const LOG_UNMATCHED = process.env.LOG_UNMATCHED === '1';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'epg_streams';
+const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
+const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mx_channels';
 
-function norm(s) {
-  if (!s) return '';
-  return s
-    .normalize('NFD').replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .replace(/&/g, ' and ')
-    .replace(/\b(tv|canal|hd)\b/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
-    .replace(/\s+/g, ' ');
+// ---------- NORMALIZATION / TOKENS ----------
+function stripAccents(s) { return String(s).normalize('NFD').replace(/\p{Diacritic}+/gu, ''); }
+function normalizeNumerals(s) {
+  const map = { 'uno':'1','dos':'2','tres':'3','cuatro':'4','cinco':'5','seis':'6','siete':'7','ocho':'8','nueve':'9','diez':'10','once':'11','doce':'12','trece':'13' };
+  return String(s).replace(/\b(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece)\b/gi, m => map[m.toLowerCase()]);
 }
+function dropTimeshift(s) {
+  return String(s)
+    .replace(/(?:[-+]\s*\d+\s*(?:h|hora|horas)\b)/ig,'')
+    .replace(/\b\d+\s*horas?\b/ig,'')
+    .replace(/\(\s*\d+\s*horas?\s*\)/ig,'')
+    .replace(/\btime\s*shift\b/ig,'')
+    .replace(/\s{2,}/g,' ')
+    .trim();
+}
+function stripLeadingCanal(s) { return String(s).replace(/^\s*canal[\s._-]+/i, ''); }
+function stripCountryTag(s) { return String(s).replace(/(\.(mx|us)|\s+\(?mx\)?|\s+m[eé]xico|\s+usa|\s+eeuu)\s*$/i,'').trim(); }
+
+const STOP = new Set(['canal','tv','television','hd','sd','mx','mexico','méxico','hora','horas','us','usa','eeuu']);
+function tokensOf(s) {
+  if (!s) return [];
+  let plain = stripAccents(normalizeNumerals(String(s).toLowerCase()));
+  plain = dropTimeshift(plain);
+  plain = stripCountryTag(plain);
+  plain = plain.replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+  return plain.split(/\s+/).filter(t => t && !STOP.has(t));
+}
+function keyOf(s) { return Array.from(new Set(tokensOf(s))).sort().join(' '); }
+
+function expandNameVariants(s) {
+  if (!s) return [];
+  const out = new Set();
+  const orig = String(s).trim();
+  const noCanal = stripLeadingCanal(orig);
+  const flat = x => x.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const noTS = dropTimeshift(noCanal);
+  const noCountry = stripCountryTag(noTS);
+  [orig, noCanal, noTS, noCountry, flat(orig), flat(noCanal), flat(noTS), flat(noCountry)]
+    .forEach(v => { if (v) out.add(v); });
+  return [...out];
+}
+
 function uniqBy(arr, keyFn) {
   const m = new Map();
   for (const x of arr) {
@@ -41,84 +82,61 @@ function uniqBy(arr, keyFn) {
   return [...m.values()];
 }
 
-async function fetchBuf(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Fetch failed ${r.status} ${url}`);
-  return Buffer.from(await r.arrayBuffer());
-}
-
-// 1) collect channel page links from iptv-org search page
+// ---------- SCRAPING ----------
 async function collectChannelPages(browser) {
   const page = await browser.newPage();
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
   await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(1500); // allow client filter to render
+  // Wait for client-side filter to render
+  await page.waitForSelector('a[href*="/channels/"]', { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1000);
 
-  // Grab anchors to /channels/…; grab a nearby img as logo if present
-  let items = await page.$$eval('a[href*="/channels/"]', (as) => {
+  let items = await page.$$eval('a[href*="/channels/"]', as => {
     const out = [];
     for (const a of as) {
       const href = a.getAttribute('href') || '';
       if (!href.includes('/channels/')) continue;
       const url = new URL(href, location.href).href;
       const name = (a.textContent || '').trim();
-      let logo = null;
-      const row = a.closest('tr,li,article,div') || a.parentElement;
-      if (row) {
-        const img = row.querySelector('img');
-        if (img) logo = img.src || img.getAttribute('src');
-      }
-      out.push({ url, name, logo });
+      out.push({ url, name });
     }
-    // de-dupe by URL
     const m = new Map();
     for (const it of out) if (!m.has(it.url)) m.set(it.url, it);
     return [...m.values()];
   });
 
-  items = uniqBy(items, (x) => x.url);
+  items = items.filter(i => i.name && i.url);
+  items = uniqBy(items, x => x.url);
   if (MAX_CHANNELS > 0 && items.length > MAX_CHANNELS) items = items.slice(0, MAX_CHANNELS);
-
   await page.close();
-  return items;
+  return items.map(i => ({ ...i, nameKey: keyOf(i.name) }));
 }
 
-// 2) visit each channel page, extract .m3u8s (from Streams tab/section)
 async function scrapeChannel(browser, link) {
   const page = await browser.newPage();
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
   try {
     await page.goto(link.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(500);
 
-    // Try to switch to Streams tab if exists
     const tab = await page.$('text=Streams');
-    if (tab) {
-      await tab.click().catch(() => {});
-      await page.waitForTimeout(400);
-    }
+    if (tab) { await tab.click().catch(() => {}); await page.waitForTimeout(400); }
 
-    // Prefer clickable anchors
-    let anchors = await page.$$eval('a[href*=".m3u8"]', (els) =>
-      els.map((e) => ({ url: e.href, text: (e.textContent || '').trim() }))
+    let anchors = await page.$$eval('a[href*=".m3u8"]', els =>
+      els.map(e => ({ url: e.href, text: (e.textContent || '').trim() }))
     );
 
-    // Fallback: regex scan of HTML
     if (!anchors.length) {
       const html = await page.content();
       const rx = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi;
       const set = new Set();
-      let m;
-      while ((m = rx.exec(html))) set.add(m[0]);
-      anchors = [...set].map((u) => ({ url: u, text: '' }));
+      let m; while ((m = rx.exec(html))) set.add(m[0]);
+      anchors = [...set].map(u => ({ url: u, text: '' }));
     }
 
-    anchors = uniqBy(
-      anchors.filter((a) => /^https?:\/\//i.test(a.url)),
-      (a) => a.url
-    );
+    anchors = uniqBy(anchors.filter(a => /^https?:\/\//i.test(a.url)), a => a.url);
 
-    return anchors.map((a) => ({
+    return anchors.map(a => ({
       url: a.url,
       quality: (a.text.match(/\b(1080p|720p|480p|360p|HD|SD)\b/i) || [])[0] || null
     }));
@@ -137,9 +155,7 @@ async function scrapeAll(browser, links) {
     if (streams.length) {
       out.push({
         channelName: lnk.name,
-        channelNameNorm: norm(lnk.name),
-        channelPage: lnk.url,
-        logo: lnk.logo || null,
+        channelNameKey: lnk.nameKey,
         streams
       });
     }
@@ -148,116 +164,192 @@ async function scrapeAll(browser, links) {
   return out;
 }
 
-// 3) parse EPGShare MX gzip XML
-async function parseEpgMx() {
-  console.log(`Downloading EPGShare MX… ${EPG_GZ_URL}`);
-  const gz = await fetchBuf(EPG_GZ_URL);
-  const xmlBuf = zlib.gunzipSync(gz);
-  const xml = xmlBuf.toString('utf8');
-
-  const parser = new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: '',
-    trimValues: true
-  });
-  const doc = parser.parse(xml);
-
-  const channels = doc?.tv?.channel ? (Array.isArray(doc.tv.channel) ? doc.tv.channel : [doc.tv.channel]) : [];
-  const programmes = doc?.tv?.programme ? (Array.isArray(doc.tv.programme) ? doc.tv.programme : [doc.tv.programme]) : [];
-
-  const idTo = new Map();
-  const nameMap = new Map(); // normalized display-name -> [obj]
-
-  for (const ch of channels) {
-    const id = ch.id;
-    const icon = ch?.icon?.src || null;
-    const names = [];
-    const dn = ch['display-name'];
-    if (Array.isArray(dn)) {
-      for (const v of dn) if (typeof v === 'string') names.push(v);
-    } else if (typeof dn === 'string') {
-      names.push(dn);
-    }
-    const obj = { id, names, icon, hasProgs: false };
-    idTo.set(id, obj);
-    for (const n of names) {
-      const k = norm(n);
-      if (!k) continue;
-      if (!nameMap.has(k)) nameMap.set(k, []);
-      nameMap.get(k).push(obj);
-    }
+async function probeM3U8(url) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: { 'user-agent': 'Mozilla/5.0', 'accept': 'application/vnd.apple.mpegurl,text/plain,*/*' },
+      signal: ac.signal
+    });
+    if (!r.ok) return false;
+    const txt = await r.text();
+    return txt.includes('#EXTM3U');
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
   }
+}
 
-  for (const p of programmes) {
-    const cid = p.channel;
+// ---------- STREAM PARSE EPG (Mexico-related only) ----------
+function isMexicoEntry(id, names) {
+  // Keep channels whose id ends with .mx OR whose names mention Mexico/MX.
+  return /\.mx$/i.test(id) || names.some(n => /\b(m[eé]xico|mx)\b/i.test(String(n)));
+}
+
+async function parseEpgStream() {
+  console.log(`Downloading EPG (stream)… ${EPG_GZ_URL}`);
+  const res = await fetch(EPG_GZ_URL);
+  if (!res.ok || !res.body) throw new Error(`Fetch failed ${res.status} ${EPG_GZ_URL}`);
+
+  const gunzip = createGunzip();
+  const src = Readable.fromWeb(res.body);
+  const decoder = new TextDecoder('utf-8');
+  const parser = new SaxesParser({ xmlns: false });
+
+  const idTo = new Map();    // id -> { id, names:[...], tokenSet:Set<string>, hasProgs:boolean }
+  const nameMap = new Map(); // keyOf(name) -> entry
+  const programmesSeen = new Set();
+
+  let cur = null;            // { id, namesRaw:[] }
+  let inDisp = false;
+  let dispBuf = '';
+
+  parser.on('error', (e) => { throw e; });
+
+  parser.on('opentag', (tag) => {
+    const name = String(tag.name).toLowerCase();
+    if (name === 'channel') {
+      cur = { id: tag.attributes?.id ? String(tag.attributes.id) : null, namesRaw: [] };
+    } else if (name === 'display-name' && cur) {
+      inDisp = true; dispBuf = '';
+    } else if (name === 'programme') {
+      const cid = tag.attributes?.channel;
+      if (cid) programmesSeen.add(String(cid));
+    }
+  });
+
+  parser.on('text', (t) => {
+    if (inDisp && cur) dispBuf += t;
+  });
+
+  parser.on('closetag', (nameRaw) => {
+    const name = String(nameRaw).toLowerCase();
+    if (name === 'display-name' && cur) {
+      const t = dispBuf.trim();
+      if (t) cur.namesRaw.push(t);
+      inDisp = false; dispBuf = '';
+    } else if (name === 'channel' && cur) {
+      const id = cur.id || '';
+      if (isMexicoEntry(id, cur.namesRaw)) {
+        const names = new Set();
+        for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
+        for (const v of expandNameVariants(id)) if (v) names.add(v);
+        const entry = { id, names: [...names], tokenSet: new Set(), hasProgs: false };
+        for (const nm of entry.names) for (const t of tokensOf(nm)) entry.tokenSet.add(t);
+        idTo.set(id, entry);
+        for (const n of entry.names) {
+          const k = keyOf(n);
+          if (k && !nameMap.has(k)) nameMap.set(k, entry);
+        }
+      }
+      cur = null;
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    src.on('error', reject);
+    gunzip.on('error', reject);
+    gunzip.on('data', (chunk) => parser.write(decoder.decode(chunk, { stream: true })));
+    gunzip.on('end', () => {
+      parser.write(decoder.decode(new Uint8Array(), { stream: false }));
+      parser.close();
+      resolve();
+    });
+    src.pipe(gunzip);
+  });
+
+  for (const cid of programmesSeen) {
     const o = idTo.get(cid);
     if (o) o.hasProgs = true;
   }
+  for (const [k, v] of nameMap.entries()) if (!v.hasProgs) nameMap.delete(k);
 
-  const withProgs = [...idTo.values()].filter((x) => x.hasProgs);
-  console.log(`EPG channels: ${channels.length}, with programmes for ${withProgs.length}`);
-  return { nameMap };
+  console.log(`EPG entries kept (Mexico-related): ${new Set([...nameMap.values()]).size}`);
+  return { nameMap, entries: [...new Set([...nameMap.values()])] };
 }
 
-// 4) match by normalized display-name (exact normalized)
-function match(scraped, nameMap) {
-  const res = [];
-  for (const s of scraped) {
-    const list = nameMap.get(s.channelNameNorm) || [];
-    if (list.length) {
-      const pick = list[0];
-      res.push({
-        channelName: s.channelName,
-        channelPage: s.channelPage,
-        logo: s.logo,
-        streams: s.streams,
-        epgChannelId: pick.id,
-        epgDisplayNames: pick.names,
-        epgIcon: pick.icon
-      });
+// ---------- MATCH ----------
+function jaccard(aTokens, bTokens) {
+  const A = new Set(aTokens), B = new Set(bTokens);
+  let inter = 0; for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter || 1);
+}
+
+function findMatch(channelName, nameKey, nameMap, entries) {
+  // 1) exact key match
+  const exact = nameMap.get(nameKey);
+  if (exact) return { entry: exact, score: 1, method: 'exact' };
+
+  // 2) token containment / single-token anchor
+  const sTokArr = tokensOf(channelName);
+  const sTok = new Set(sTokArr);
+
+  // Single strong token (e.g., "teleritmo") -> anchor
+  if (sTok.size === 1) {
+    const [only] = [...sTok];
+    for (const e of entries) if (e.tokenSet && e.tokenSet.has(only)) {
+      return { entry: e, score: 0.99, method: 'anchor' };
     }
   }
-  return res;
+
+  // Subset: if all scraped tokens ⊆ entry tokens, pick smallest token set
+  let subsetBest = null, subsetBestSize = Infinity;
+  for (const e of entries) {
+    const E = e.tokenSet || new Set();
+    let allIn = true;
+    for (const t of sTok) { if (!E.has(t)) { allIn = false; break; } }
+    if (allIn && E.size < subsetBestSize) { subsetBest = e; subsetBestSize = E.size; }
+  }
+  if (subsetBest) return { entry: subsetBest, score: 0.9, method: 'subset' };
+
+  // 3) fuzzy Jaccard fallback
+  let best = null, bestScore = 0;
+  for (const e of entries) {
+    for (const nm of e.names) {
+      const score = jaccard(sTokArr, tokensOf(nm));
+      if (score > bestScore) { bestScore = score; best = e; }
+    }
+  }
+  if (best && bestScore >= FUZZY_MIN) return { entry: best, score: bestScore, method: 'fuzzy' };
+  return { entry: null, score: 0, method: 'none' };
 }
 
-// 5) optional supabase upsert
-async function upsertSupabase(rows) {
+// ---------- DB ----------
+async function saveRows(rows) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.log('Supabase env missing or no rows; skipped DB upload.');
+    console.log('Supabase env missing; skipped DB upload.');
     return;
   }
   if (!rows.length) {
     console.log('No rows to upload to Supabase.');
     return;
   }
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
-  const payload = [];
-  for (const r of rows) {
-    for (const s of r.streams) {
-      payload.push({
-        country: 'MX',
-        channel_name: r.channelName,
-        channel_logo: r.logo,
-        channel_page: r.channelPage,
-        stream_url: s.url,
-        stream_quality: s.quality,
-        epg_channel_id: r.epgChannelId,
-        epg_display_names: r.epgDisplayNames,
-        epg_icon: r.epgIcon
-      });
-    }
-  }
-  const { error } = await supabase.from(SUPABASE_TABLE).upsert(payload, {
-    onConflict: 'country,channel_name,stream_url',
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false },
+    db: { schema: SUPABASE_SCHEMA }
+  });
+
+  // Try upsert on stream_url; fall back to insert if no unique index exists.
+  let { error } = await supabase.from(SUPABASE_TABLE).upsert(rows, {
+    onConflict: 'stream_url',
     ignoreDuplicates: false
   });
-  if (error) throw error;
-  console.log(`Supabase upsert done: ${payload.length} rows`);
+  if (error) {
+    console.warn(`Upsert failed (${error.code ?? 'no-code'}): ${error.message}. Falling back to insert…`);
+    ({ error } = await supabase.from(SUPABASE_TABLE).insert(rows));
+  }
+  if (error) {
+    console.warn(`Insert failed: ${error.message} (${error.code ?? 'no-code'})`);
+  } else {
+    console.log(`DB write OK: ${rows.length} rows`);
+  }
 }
 
-async function ensureDir(p) {
-  await fs.mkdir(p, { recursive: true });
-}
+// ---------- MAIN ----------
+async function ensureDir(p) { await fs.mkdir(p, { recursive: true }); }
 
 async function main() {
   await ensureDir('out/mx');
@@ -266,25 +358,58 @@ async function main() {
     console.log(`Scraping: ${SEARCH_URL}`);
     const links = await collectChannelPages(browser);
     console.log(`Found ${links.length} channel pages.`);
-
     const scraped = await scrapeAll(browser, links);
-    console.log(`Channels with at least one .m3u8: ${scraped.length}`);
+    console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-    const { nameMap } = await parseEpgMx();
-    const matched = match(scraped, nameMap);
-    console.log(`Matched ${matched.length} channels with working streams & EPG.`);
+    // Probe streams (keep only working)
+    for (const row of scraped) {
+      const tested = [];
+      for (const s of row.streams) {
+        const ok = await probeM3U8(s.url);
+        if (ok) tested.push(s);
+      }
+      row.streams = tested;
+    }
+    const filtered = scraped.filter(r => r.streams.length > 0);
+    console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
 
-    const outPath = path.join('out', 'mx', 'matches.json');
-    await fs.writeFile(outPath, JSON.stringify(matched, null, 2), 'utf8');
-    console.log(`Wrote ${outPath}`);
+    const { nameMap, entries } = await parseEpgStream();
 
-    await upsertSupabase(matched);
+    const records = [];
+    const matchedOnly = [];
+    for (const r of filtered) {
+      const { entry, method } = findMatch(r.channelName, r.channelNameKey, nameMap, entries);
+      for (const s of r.streams) {
+        const rec = {
+          stream_url: s.url,
+          channel_guess: r.channelName,
+          epg_channel_id: entry ? entry.id : null,
+          epg_display_name: entry ? (entry.names[0] || null) : null,
+          working: true,
+          checked_at: new Date().toISOString()
+        };
+        records.push(rec);
+        if (entry) matchedOnly.push({ ...rec, _match_method: method });
+      }
+    }
+
+    console.log(`Matched with EPG: ${matchedOnly.length} stream rows (across ${filtered.length} channels).`);
+
+    // Artifacts
+    await fs.writeFile(path.join('out', 'mx', 'records.json'), JSON.stringify(records, null, 2), 'utf8');
+    await fs.writeFile(path.join('out', 'mx', 'matches.json'), JSON.stringify(matchedOnly, null, 2), 'utf8');
+
+    if (LOG_UNMATCHED) {
+      const matchedUrls = new Set(matchedOnly.map(x => x.stream_url));
+      const unmatched = records.filter(x => !matchedUrls.has(x.stream_url));
+      await fs.writeFile(path.join('out', 'mx', 'unmatched.json'), JSON.stringify(unmatched, null, 2), 'utf8');
+      console.log(`Wrote out/mx/unmatched.json with ${unmatched.length} unmatched rows`);
+    }
+
+    await saveRows(records);
   } finally {
     await browser.close();
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main().catch((e) => { console.error(e); process.exit(1); });
