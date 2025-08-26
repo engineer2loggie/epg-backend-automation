@@ -3,7 +3,7 @@ name: MX streams + EPG (EPGShare only)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "25 3 * * *" # daily, 03:25 UTC
+    - cron: "25 3 * * *" # daily 03:25 UTC
 
 jobs:
   mx_pipeline:
@@ -12,14 +12,16 @@ jobs:
       # Sources
       MX_EPG_URL: https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
       M3U_PAGES: https://iptvcat.net/mexico__1,https://iptvcat.net/mexico__2
+      M3U_FALLBACK: https://iptv-org.github.io/iptv/countries/mx.m3u
 
       # Scrape/runtime knobs
-      MAX_URLS: "200"          # max M3U/M3U8 URLs per page to test (after de-dupe)
-      CONCURRENCY: "8"         # parallel stream checks
-      FETCH_TIMEOUT_MS: "8500" # per-request timeout
+      MAX_URLS: "400"           # cap total tested URLs after de-dupe
+      CONCURRENCY: "10"         # parallel testers
+      FETCH_TIMEOUT_MS: "9000"  # per request
       RANGE_HEADER: "bytes=0-4096"
+      MIN_IPTVCAT_URLS: "20"    # if iptvcat yields less than this, use fallback
 
-      # Supabase (set secrets in repo → Settings → Secrets and variables → Actions)
+      # Supabase
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
       SUPABASE_TABLE: mx_working_channels
@@ -42,291 +44,270 @@ jobs:
           import { setTimeout as delay } from 'node:timers/promises';
           import zlib from 'node:zlib';
           import { promisify } from 'node:util';
-
           const gunzip = promisify(zlib.gunzip);
 
-          const UA = 'Mozilla/5.0 (compatible; EyePTV/EPGMatch/1.0; +https://github.com/)';
+          const UA = 'Mozilla/5.0 (compatible; EyePTV/EPGMatch/1.1)';
           const MX_EPG_URL = process.env.MX_EPG_URL;
-          const M3U_PAGES = (process.env.M3U_PAGES || '').split(',').map(s => s.trim()).filter(Boolean);
-          const MAX_URLS = Number(process.env.MAX_URLS || 200);
-          const CONCURRENCY = Number(process.env.CONCURRENCY || 8);
-          const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8500);
+          const M3U_PAGES = (process.env.M3U_PAGES || '').split(',').map(s=>s.trim()).filter(Boolean);
+          const M3U_FALLBACK = process.env.M3U_FALLBACK || '';
+          const MAX_URLS = +process.env.MAX_URLS || 400;
+          const CONCURRENCY = +process.env.CONCURRENCY || 10;
+          const FETCH_TIMEOUT_MS = +process.env.FETCH_TIMEOUT_MS || 9000;
           const RANGE_HEADER = process.env.RANGE_HEADER || 'bytes=0-4096';
+          const MIN_IPTVCAT_URLS = +process.env.MIN_IPTVCAT_URLS || 20;
 
           const SUPABASE_URL = process.env.SUPABASE_URL || '';
           const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE || '';
           const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mx_working_channels';
 
-          function abortIn(ms) {
-            const c = new AbortController();
-            const t = setTimeout(() => c.abort(), ms);
-            return { signal: c.signal, cancel: () => clearTimeout(t) };
+          function abortIn(ms) { const c=new AbortController(); const t=setTimeout(()=>c.abort(),ms); return {signal:c.signal,cancel:()=>clearTimeout(t)} }
+          function stripTags(s){return s.replace(/<[^>]+>/g,'')}
+          function normalizeName(s){
+            return stripTags(String(s)).normalize('NFD').replace(/\p{Diacritic}/gu,'')
+              .toLowerCase().replace(/&/g,' and ').replace(/\bhd\b/g,'')
+              .replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ')
+          }
+          function jaccard(a,b){
+            const A=new Set(normalizeName(a).split(' ').filter(Boolean));
+            const B=new Set(normalizeName(b).split(' ').filter(Boolean));
+            if(!A.size && !B.size) return 1;
+            const inter=[...A].filter(x=>B.has(x)).length;
+            const uni=new Set([...A,...B]).size;
+            return uni? inter/uni : 0;
           }
 
-          function stripTags(s) { return s.replace(/<[^>]+>/g, ''); }
-
-          function normalizeName(s) {
-            return stripTags(String(s))
-              .normalize('NFD').replace(/\p{Diacritic}/gu,'')
-              .toLowerCase()
-              .replace(/&/g,' and ')
-              .replace(/\bhd\b/g,'')
-              .replace(/[^a-z0-9]+/g,' ')
-              .trim()
-              .replace(/\s+/g,' ');
+          async function fetchText(url, opts={}){
+            const {signal}=abortIn(FETCH_TIMEOUT_MS);
+            const res=await fetch(url,{redirect:'follow',headers:{'user-agent':UA,...opts.headers},signal});
+            return {res, txt: await res.text()};
+          }
+          async function fetchBuffer(url, opts={}){
+            const {signal}=abortIn(FETCH_TIMEOUT_MS);
+            const res=await fetch(url,{redirect:'follow',headers:{'user-agent':UA,...opts.headers},signal});
+            const buf=Buffer.from(new Uint8Array(await res.arrayBuffer()));
+            return {res, buf};
           }
 
-          function jaccard(a, b) {
-            const A = new Set(normalizeName(a).split(' ').filter(Boolean));
-            const B = new Set(normalizeName(b).split(' ').filter(Boolean));
-            if (!A.size && !B.size) return 1;
-            const inter = [...A].filter(x => B.has(x)).length;
-            const uni = new Set([...A, ...B]).size;
-            return uni ? inter / uni : 0;
-          }
-
-          async function fetchText(url, opts = {}) {
-            const { signal } = abortIn(FETCH_TIMEOUT_MS);
-            const res = await fetch(url, {
-              redirect: 'follow',
-              headers: { 'user-agent': UA, ...opts.headers },
-              signal
-            });
-            const txt = await res.text();
-            return { res, txt };
-          }
-
-          async function fetchBuffer(url, opts = {}) {
-            const { signal } = abortIn(FETCH_TIMEOUT_MS);
-            const res = await fetch(url, {
-              redirect: 'follow',
-              headers: { 'user-agent': UA, ...opts.headers },
-              signal
-            });
-            const arr = new Uint8Array(await res.arrayBuffer());
-            return { res, buf: Buffer.from(arr) };
-          }
-
-          // --- 1) Download & parse EPGShare MX (channels + programme counts) ---
-          async function loadEpg() {
+          async function loadEpg(){
             console.log('Downloading EPGShare MX…', MX_EPG_URL);
-            const { buf } = await fetchBuffer(MX_EPG_URL);
-            const xml = (await gunzip(buf)).toString('utf8');
+            const {buf}=await fetchBuffer(MX_EPG_URL);
+            const xml=(await gunzip(buf)).toString('utf8');
 
-            // Build channel map: id -> {names: Set<string>}
-            const chanRe = /<channel\b[^>]*?\bid="([^"]+)"[^>]*>([\s\S]*?)<\/channel>/g;
-            const nameRe = /<display-name\b[^>]*>([\s\S]*?)<\/display-name>/g;
-            const channels = new Map(); // id -> {names:Set, norm:Set}
-
-            let m;
-            while ((m = chanRe.exec(xml)) !== null) {
-              const id = m[1];
-              const body = m[2];
-              const names = new Set();
-              let nm;
-              while ((nm = nameRe.exec(body)) !== null) {
-                const raw = stripTags(nm[1]).trim();
-                if (raw) names.add(raw);
-              }
-              if (!channels.has(id)) channels.set(id, { names: new Set(), norm: new Set() });
-              for (const n of names) {
-                channels.get(id).names.add(n);
-                channels.get(id).norm.add(normalizeName(n));
-              }
+            const channels=new Map(); // id -> {names:Set, norm:Set}
+            const chanRe=/<channel\b[^>]*?\bid="([^"]+)"[^>]*>([\s\S]*?)<\/channel>/g;
+            const nameRe=/<display-name\b[^>]*>([\s\S]*?)<\/display-name>/g;
+            let m; while((m=chanRe.exec(xml))){ const id=m[1], body=m[2];
+              let nm; const names=new Set();
+              while((nm=nameRe.exec(body))) { const raw=stripTags(nm[1]).trim(); if(raw) names.add(raw); }
+              if(!channels.has(id)) channels.set(id,{names:new Set(),norm:new Set()});
+              for(const n of names){ channels.get(id).names.add(n); channels.get(id).norm.add(normalizeName(n)); }
             }
+            const progRe=/<programme\b[^>]*\bchannel="([^"]+)"/g;
+            const programmeCount=new Map();
+            let p; while((p=progRe.exec(xml))) { const cid=p[1]; programmeCount.set(cid,1+(programmeCount.get(cid)||0)); }
 
-            // Programme counts by channel id (only to verify that the id actually has data)
-            const progRe = /<programme\b[^>]*\bchannel="([^"]+)"/g;
-            const programmeCount = new Map();
-            let p;
-            while ((p = progRe.exec(xml)) !== null) {
-              const cid = p[1];
-              programmeCount.set(cid, 1 + (programmeCount.get(cid) || 0));
-            }
-
-            console.log(`EPG channels: ${channels.size}, with programmes for ${[...programmeCount.keys()].length}`);
-            return { xml, channels, programmeCount };
+            console.log(`EPG channels: ${channels.size}, with programmes for ${programmeCount.size}`);
+            return {xml, channels, programmeCount};
           }
 
-          // --- 2) Scrape iptvcat pages for .m3u / .m3u8 links ---
-          async function scrapeM3UUrls() {
-            const all = new Set();
-            for (const page of M3U_PAGES) {
-              try {
-                console.log('Fetching page:', page);
-                const { txt } = await fetchText(page);
-                const re = /https?:\/\/[^\s"'<>()]+?\.(?:m3u8|m3u)(?:\?[^\s"'<>]*)?/gi;
-                let mm;
-                let c = 0;
-                while ((mm = re.exec(txt)) !== null) {
-                  all.add(mm[0]);
-                  c++;
-                }
-                console.log(`Found ~${c} candidate links on page`);
-              } catch (e) {
-                console.warn('Failed to fetch page', page, e.message);
-              }
+          function extractLinksFromHtml(html, base){
+            const out=new Set();
+            // direct .m3u/.m3u8 anywhere in the html
+            const direct=/https?:\/\/[^\s"'<>]+?\.(?:m3u8?|mpd)(?:\?[^\s"'<>]*)?/gi;
+            let mm; while((mm=direct.exec(html))) out.add(mm[0]);
+
+            // attributes that may contain the link
+            const attr=/\b(?:data-clipboard-text|data-url|data-href|content|value|href|src)="([^"]+\.(?:m3u8?|mpd)[^"]*)"/gi;
+            while((mm=attr.exec(html))) out.add(mm[1]);
+
+            // follow internal watch/play/channel pages to find the real link
+            const internal=/(?:href|data-href)=["'](\/(?:watch|play|channel)\/[^"']+)["']/gi;
+            const subs=[];
+            while((mm=internal.exec(html))) {
+              try { const u=new URL(mm[1], base).toString(); subs.push(u); } catch {}
             }
-            const list = [...all].slice(0, MAX_URLS);
-            console.log(`Total unique URLs (capped): ${list.length}`);
-            return list;
+            return { direct:[...out], follow:subs };
           }
 
-          // Try to extract tvg-id/tvg-name from an m3u playlist snippet
-          function parseM3UMetadata(text) {
-            // look at first EXTINF block
-            const line = (text.match(/#EXTINF[^\n]*\n[^\n]*/i) || [])[0] || '';
-            const tvgId = (line.match(/tvg-id="([^"]+)"/i) || [])[1] || '';
-            const tvgName = (line.match(/tvg-name="([^"]+)"/i) || [])[1]
-              || (line.split(',').slice(-1)[0] || '').trim();
+          async function collectLinksFromPage(url){
+            const seen=new Set();
+            const links=new Set();
+            try{
+              const {txt}=await fetchText(url);
+              const {direct, follow}=extractLinksFromHtml(txt, url);
+              for(const d of direct) links.add(d);
+              for(const sub of follow.slice(0,60)){ // cap subpage fetches
+                try{
+                  const {txt:subHtml}=await fetchText(sub);
+                  const {direct:subDirect}=extractLinksFromHtml(subHtml, sub);
+                  for(const d of subDirect) links.add(d);
+                }catch{}
+              }
+            }catch(e){ console.warn('Failed page', url, e.message); }
+            // normalize & filter to m3u/m3u8/mpd (we accept mpd but later discard if not playlist)
+            const clean=[...links].filter(u=>/\.(m3u8?|mpd)(?:\?|$)/i.test(u));
+            return clean;
+          }
+
+          async function getIptvCatUrls(){
+            const all=new Set();
+            for(const page of M3U_PAGES){
+              console.log('Scrape:', page);
+              for(const u of await collectLinksFromPage(page)) all.add(u);
+            }
+            console.log('iptvcat candidate URLs:', all.size);
+            return [...all];
+          }
+
+          async function getFallbackUrls(){
+            if(!M3U_FALLBACK) return [];
+            try{
+              console.log('Fetching fallback playlist:', M3U_FALLBACK);
+              const {txt}=await fetchText(M3U_FALLBACK);
+              const urls=[...txt.matchAll(/^(?!#)(https?:\/\/\S+)/gmi)].map(m=>m[1].trim());
+              console.log('fallback URLs:', urls.length);
+              return urls;
+            }catch(e){
+              console.warn('fallback fetch failed:', e.message);
+              return [];
+            }
+          }
+
+          function parseM3UMetadata(text){
+            // search first few EXTINF blocks
+            const head=text.slice(0,20000);
+            const inf = head.match(/#EXTINF[^\n]*\n[^\n]*/i)?.[0] || '';
+            const tvgId = (inf.match(/tvg-id="([^"]+)"/i)||[])[1] || (head.match(/tvg-id="([^"]+)"/i)||[])[1] || '';
+            const tvgName = (inf.match(/tvg-name="([^"]+)"/i)||[])[1]
+                            || (head.match(/,(.*)$/m)||[])[1] || '';
             return { tvgId: tvgId.trim(), tvgName: tvgName.trim() };
           }
 
-          function guessNameFromUrl(u) {
-            try {
-              const { pathname } = new URL(u);
-              let s = decodeURIComponent(pathname);
-              s = s.replace(/^.*\//, '').replace(/\.(m3u8?|mpd).*$/i, '');
+          function guessNameFromUrl(u){
+            try{
+              const {pathname}=new URL(u);
+              let s=decodeURIComponent(pathname).replace(/^.*\//,'').replace(/\.(m3u8?|mpd).*$/i,'');
               return s.replace(/[_\-]+/g,' ').trim();
-            } catch { return ''; }
+            }catch{return ''}
           }
 
-          async function testStream(url) {
-            try {
-              const { res, txt } = await fetchText(url, {
-                headers: {
-                  'Range': RANGE_HEADER,
-                  'Accept': '*/*',
-                  'Accept-Encoding': 'identity',
-                  'Connection': 'keep-alive'
-                }
-              });
-              const ok = res.ok && res.status < 400;
-              if (!ok) return { ok: false };
-              const ctype = (res.headers.get('content-type') || '').toLowerCase();
-              const looksM3U = /\.m3u8?(\?|$)/i.test(url) || ctype.includes('mpegurl') || ctype.includes('vnd.apple.mpegurl') || ctype.includes('audio/x-mpegurl') || ctype.includes('text/plain');
-              if (!looksM3U) return { ok: false };
-
-              // Try to pull metadata if it's a playlist
-              const meta = parseM3UMetadata(txt);
-              return { ok: true, meta, snippet: txt.slice(0, 4000) };
-            } catch {
-              return { ok: false };
-            }
+          async function fetchMaybePlaylist(url, withRange=true){
+            const headers = withRange ? {
+              'Range': RANGE_HEADER, 'Accept':'*/*','Accept-Encoding':'identity','Connection':'keep-alive'
+            } : {
+              'Accept':'*/*','Accept-Encoding':'identity','Connection':'keep-alive'
+            };
+            const {res, txt}=await fetchText(url,{headers});
+            const ok = res.ok && res.status < 400;
+            const ct = (res.headers.get('content-type')||'').toLowerCase();
+            const isPlaylist = /\.m3u8?(\?|$)/i.test(url) || ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl') || /^#EXTM3U/m.test(txt);
+            return {ok, isPlaylist, txt};
           }
 
-          // --- 3) Match working streams to EPG channels ---
-          function findBestEPGMatch(nameGuess, epg) {
-            if (!nameGuess) return null;
-            const n = normalizeName(nameGuess);
-            let best = { id: null, score: 0, name: '' };
-
-            for (const [id, obj] of epg.channels.entries()) {
-              // quick exact/contains on normalized names first
-              if (obj.norm.has(n)) return { id, score: 1, name: [...obj.names][0] };
-
-              let maxLocal = 0;
-              for (const epgName of obj.names) {
-                const s = jaccard(nameGuess, epgName);
-                if (s > maxLocal) maxLocal = s;
+          async function testStream(url){
+            try{
+              let r = await fetchMaybePlaylist(url, true);
+              if(!(r.ok && r.isPlaylist)) {
+                r = await fetchMaybePlaylist(url, false); // retry without Range
               }
-              if (maxLocal > best.score) {
-                best = { id, score: maxLocal, name: [...obj.names][0] };
-              }
-            }
-            // require a sane threshold
-            return best.score >= 0.62 ? best : null;
+              if(!(r.ok && r.isPlaylist)) return {ok:false};
+              const meta = parseM3UMetadata(r.txt);
+              return {ok:true, meta, snippet: r.txt.slice(0,4000)};
+            }catch{ return {ok:false}; }
           }
 
-          async function run() {
+          function findBestEPGMatch(nameGuess, epg){
+            if(!nameGuess) return null;
+            let best={id:null, score:0, name:''};
+            for(const [id,obj] of epg.channels){
+              if(obj.norm.has(normalizeName(nameGuess))) return {id, score:1, name:[...obj.names][0]};
+              let local=0;
+              for(const epgName of obj.names) local=Math.max(local, jaccard(nameGuess, epgName));
+              if(local>best.score) best={id, score:local, name:[...obj.names][0]};
+            }
+            return best.score>=0.62 ? best : null;
+          }
+
+          async function run(){
             const epg = await loadEpg();
-            const urls = await scrapeM3UUrls();
 
-            // Simple pool
-            const results = [];
-            let idx = 0;
-            async function worker() {
-              while (idx < urls.length) {
-                const my = idx++;
-                const u = urls[my];
+            let urls = await getIptvCatUrls();
+            if(urls.length < MIN_IPTVCAT_URLS){
+              console.log(`iptvcat yielded ${urls.length} (< ${MIN_IPTVCAT_URLS}), adding fallback…`);
+              const more = await getFallbackUrls();
+              for(const u of more) urls.push(u);
+              urls = [...new Set(urls)];
+            }
+            urls = urls.slice(0, MAX_URLS);
+            console.log('Total URLs to probe:', urls.length);
+
+            const results=[];
+            let idx=0;
+            async function worker(){
+              while(idx<urls.length){
+                const u = urls[idx++];
                 const t = await testStream(u);
-                if (!t.ok) continue;
+                if(!t.ok) continue;
 
-                // Try match by tvg-id first
-                let matched = null;
-                if (t.meta?.tvgId && epg.channels.has(t.meta.tvgId)) {
-                  matched = { id: t.meta.tvgId, name: [...epg.channels.get(t.meta.tvgId).names][0], score: 1 };
+                let match=null;
+                if(t.meta?.tvgId && epg.channels.has(t.meta.tvgId)){
+                  match={id:t.meta.tvgId, score:1, name:[...epg.channels.get(t.meta.tvgId).names][0]};
                 } else {
-                  // fallback: tvg-name or guess from URL
                   const guess = t.meta?.tvgName || guessNameFromUrl(u);
-                  matched = findBestEPGMatch(guess, epg);
+                  match = findBestEPGMatch(guess, epg);
                 }
-
-                if (matched && (epg.programmeCount.get(matched.id) || 0) > 0) {
+                if(match && (epg.programmeCount.get(match.id)||0)>0){
                   results.push({
-                    country: 'MX',
-                    source_page: 'iptvcat',
-                    stream_url: u,
-                    tvg_id: t.meta?.tvgId || null,
-                    tvg_name: t.meta?.tvgName || null,
-                    epg_id: matched.id,
-                    epg_name: matched.name,
-                    match_score: Number(matched.score.toFixed(3))
+                    country:'MX', source_page:'iptvcat+fallback',
+                    stream_url:u, tvg_id:t.meta?.tvgId||null, tvg_name:t.meta?.tvgName||null,
+                    epg_id:match.id, epg_name:match.name, match_score:+match.score.toFixed(3)
                   });
                 }
               }
             }
+            await Promise.all(Array.from({length:Math.max(1,CONCURRENCY)}, worker));
 
-            const workers = Array.from({ length: Math.max(1, CONCURRENCY) }, () => worker());
-            await Promise.all(workers);
+            // de-dup by epg_id
+            const byId=new Map();
+            for(const r of results) if(!byId.has(r.epg_id)) byId.set(r.epg_id, r);
+            const rows=[...byId.values()];
 
-            // De-dup by epg_id (keep first good stream per channel)
-            const byEpg = new Map();
-            for (const r of results) if (!byEpg.has(r.epg_id)) byEpg.set(r.epg_id, r);
-            const finalRows = [...byEpg.values()];
+            await fs.writeFile('out/mx-working.json', JSON.stringify(rows,null,2),'utf8');
+            console.log(`Matched ${rows.length} channels with working streams & EPG.`);
 
-            await fs.writeFile('out/mx-working.json', JSON.stringify(finalRows, null, 2), 'utf8');
-            console.log(`Matched ${finalRows.length} channels with working streams & EPG.`);
-
-            if (SUPABASE_URL && SUPABASE_KEY && finalRows.length) {
-              console.log('Uploading rows to Supabase…');
-              const resp = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`, {
-                method: 'POST',
-                headers: {
-                  'apikey': SUPABASE_KEY,
-                  'Authorization': `Bearer ${SUPABASE_KEY}`,
-                  'Content-Type': 'application/json',
-                  'Prefer': 'resolution=merge-duplicates'
+            if(SUPABASE_URL && SUPABASE_KEY && rows.length){
+              console.log('Uploading to Supabase…');
+              const resp=await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`,{
+                method:'POST',
+                headers:{
+                  'apikey':SUPABASE_KEY,
+                  'Authorization':`Bearer ${SUPABASE_KEY}`,
+                  'Content-Type':'application/json',
+                  'Prefer':'resolution=merge-duplicates'
                 },
-                body: JSON.stringify(finalRows)
+                body:JSON.stringify(rows)
               });
-              const txt = await resp.text();
+              const body=await resp.text();
               console.log('Supabase status:', resp.status);
-              if (!resp.ok) {
-                console.error('Supabase error body:', txt);
-                process.exit(1);
-              } else {
-                console.log('Supabase response:', txt || '(empty)');
-              }
+              if(!resp.ok){ console.error('Supabase error:', body); process.exit(1);}
             } else {
-              console.log('Supabase env missing or no rows; skipped DB upload.');
+              console.log('Supabase not configured or no rows; skipping upload.');
             }
           }
 
-          run().catch(err => {
-            console.error(err);
-            process.exit(1);
-          });
+          run().catch(e=>{console.error(e);process.exit(1);});
           EOF
 
       - name: Run MX scrape + match
         env:
           MX_EPG_URL: ${{ env.MX_EPG_URL }}
           M3U_PAGES: ${{ env.M3U_PAGES }}
+          M3U_FALLBACK: ${{ env.M3U_FALLBACK }}
           MAX_URLS: ${{ env.MAX_URLS }}
           CONCURRENCY: ${{ env.CONCURRENCY }}
           FETCH_TIMEOUT_MS: ${{ env.FETCH_TIMEOUT_MS }}
           RANGE_HEADER: ${{ env.RANGE_HEADER }}
+          MIN_IPTVCAT_URLS: ${{ env.MIN_IPTVCAT_URLS }}
           SUPABASE_URL: ${{ env.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ env.SUPABASE_SERVICE_ROLE }}
           SUPABASE_TABLE: ${{ env.SUPABASE_TABLE }}
