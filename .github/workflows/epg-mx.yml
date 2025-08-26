@@ -35,13 +35,11 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Write script
-        run: |
-          mkdir -p scripts out/mx
-          cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-# Scrape iptv-org.github.io for live MX channels (no JSON APIs), pull .m3u8s,
-# download EPGShare MX XML, match by display-name, probe stream, write artifact,
-# optional Supabase upsert.
-
+  shell: bash
+  run: |
+    set -e
+    mkdir -p scripts out/mx
+    cat > scripts/mx-scrape-and-match.mjs <<'EOF'
 import { chromium } from 'playwright';
 import { XMLParser } from 'fast-xml-parser';
 import zlib from 'node:zlib';
@@ -49,6 +47,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createClient } from '@supabase/supabase-js';
+
+const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
+// ...the rest of your JS exactly as-is...
+// make sure there are no ${ { }} expressions or tabs in this block
+EOF
 
 const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
 const EPG_GZ_URL = process.env.MX_EPG_URL || 'https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz';
