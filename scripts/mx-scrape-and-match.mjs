@@ -1,12 +1,8 @@
-// Scrape iptv-org for MX channels, pull .m3u8s, probe,
-// stream-parse ALL_SOURCES1 EPG safely, broadened MX detection,
-// match (exact/anchor/subset/fuzzy), write artifacts,
-// and insert into Supabase public.mx_channels.
-//
-// DB columns expected at minimum:
-//   stream_url (text, PK/unique recommended), channel_name (text NOT NULL),
-//   channel_guess (text), epg_channel_id (text), epg_display_name (text),
-//   working (boolean), checked_at (timestamptz)
+// Scrape iptv-org for MX channels, pull .m3u8s, probe them,
+// stream-parse huge EPG (ALL_SOURCES1) safely,
+// match channels (exact/anchor/subset/fuzzy), write artifacts,
+// and insert into Supabase public.mx_channels:
+//   stream_url, channel_guess, epg_channel_id, epg_display_name, working, checked_at
 
 import { chromium } from 'playwright';
 import { createGunzip } from 'node:zlib';
@@ -22,14 +18,14 @@ const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=l
 const EPG_GZ_URL = process.env.MX_EPG_URL || 'https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz';
 
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
-const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0');
+const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0'); // 0 = unlimited
 const PER_PAGE_DELAY_MS = Number(process.env.PER_PAGE_DELAY_MS || '150');
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || '30000');
 const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '5000');
 
 const FUZZY_MIN = Number(process.env.FUZZY_MIN || '0.45');
 const LOG_UNMATCHED = process.env.LOG_UNMATCHED === '1';
-const REQUIRE_PROGRAMS = (process.env.EPG_REQUIRE_PROGRAMS || '0') === '1'; // <- NEW
+const REQUIRE_PROGRAMMES = process.env.REQUIRE_PROGRAMMES === '1'; // default off to allow sparse guides
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -39,7 +35,7 @@ const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mx_channels';
 // ---------- NORMALIZATION ----------
 function stripAccents(s) { return String(s).normalize('NFD').replace(/\p{Diacritic}+/gu, ''); }
 function normalizeNumerals(s) {
-  const map = { 'uno':'1','dos':'2','tres':'3','cuatro':'4','cinco':'5','seis':'6','siete':'7','ocho':'8','nueve':'9','diez':'10','once':'11','doce':'12','trece':'13' };
+  const map = { uno:'1', dos:'2', tres:'3', cuatro:'4', cinco:'5', seis:'6', siete:'7', ocho:'8', nueve:'9', diez:'10', once:'11', doce:'12', trece:'13' };
   return String(s).replace(/\b(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece)\b/gi, m => map[m.toLowerCase()]);
 }
 function dropTimeshift(s) {
@@ -52,14 +48,16 @@ function dropTimeshift(s) {
     .trim();
 }
 function stripLeadingCanal(s) { return String(s).replace(/^\s*canal[\s._-]+/i, ''); }
-function stripCountryTagMx(s) { return String(s).replace(/(\.mx|\s+\(?mx\)?|\s+m[eé]xico)\s*$/i,'').trim(); }
+function stripCountryTag(s) { return String(s).replace(/(\.(mx|us|ca)|\s+\(?mx\)?|\s+m[eé]xico|\s+usa|\s+eeuu)\s*$/i,'').trim(); }
+function stripCallsignParens(s) { return String(s).replace(/\(\s*[A-Z]{2,5}[A-Z0-9-]*\s*\)/gi, '').trim(); }
 
 const STOP = new Set(['canal','tv','television','hd','sd','mx','mexico','méxico','hora','horas','us','usa','eeuu']);
 function tokensOf(s) {
   if (!s) return [];
   let plain = stripAccents(normalizeNumerals(String(s).toLowerCase()));
   plain = dropTimeshift(plain);
-  plain = stripCountryTagMx(plain);
+  plain = stripCountryTag(plain);
+  plain = stripCallsignParens(plain);
   plain = plain.replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
   return plain.split(/\s+/).filter(t => t && !STOP.has(t));
 }
@@ -72,8 +70,9 @@ function expandNameVariants(s) {
   const noCanal = stripLeadingCanal(orig);
   const flat = x => x.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim();
   const noTS = dropTimeshift(noCanal);
-  const noMx = stripCountryTagMx(noTS);
-  [orig, noCanal, noTS, noMx, flat(orig), flat(noCanal), flat(noTS), flat(noMx)]
+  const noCountry = stripCountryTag(noTS);
+  const noCall = stripCallsignParens(noCountry);
+  [orig, noCanal, noTS, noCountry, noCall, flat(orig), flat(noCanal), flat(noTS), flat(noCountry), flat(noCall)]
     .forEach(v => { if (v) out.add(v); });
   return [...out];
 }
@@ -187,22 +186,21 @@ async function probeM3U8(url) {
   }
 }
 
-// ---------- STREAM-PARSE EPG (broad Mexico test) ----------
-function hasMxMarker(s) {
-  if (!s) return false;
-  const str = String(s);
-  // accept .mx anywhere OR token-ish "mx" OR the word "mexico"/"méxico"
-  return /\.mx\b/i.test(str)
-      || /(^|[.\s,()\-])mx($|[.\s,()\-])/i.test(str)
-      || /\bm[eé]xico\b/i.test(str)
-      || /mexico/i.test(str); // liberal catch-all for dotted IDs like "...Mexico.us"
-}
-function isMexicoEntry(id, names) {
-  if (hasMxMarker(id)) return true;
-  return names.some(n => hasMxMarker(n));
+// ---------- STREAM-PARSE EPG SAFELY ----------
+function looksMexican(id, names) {
+  const hay = (names || []).join(' ').toLowerCase() + ' ' + String(id || '').toLowerCase();
+  if (/(^|[.\-_/])(mx|mex|méxico)([.\-_/]|$)/i.test(hay)) return true;
+  if (/\b(xh|xe)[a-z0-9-]{2,}\b/i.test(hay)) return true; // MX callsigns
+  if (/(teleritmo|azteca|multimedios|adn ?40|imagen|las estrellas|unicable|a\+|canal ?once|canal ?5|once tv)/i.test(hay)) return true;
+  return false;
 }
 
-async function parseEpgStream() {
+function setIntersects(A, B) {
+  for (const x of A) if (B.has(x)) return true;
+  return false;
+}
+
+async function parseEpgStream(scrapedTokenUniverse) {
   console.log(`Downloading EPG (stream)… ${EPG_GZ_URL}`);
   const res = await fetch(EPG_GZ_URL);
   if (!res.ok || !res.body) throw new Error(`Fetch failed ${res.status} ${EPG_GZ_URL}`);
@@ -220,11 +218,8 @@ async function parseEpgStream() {
   const MAX_NAMES_PER_CH = 24;
   const MAX_VARIANTS = 64;
 
-  let cur = null;
-  let inDisp = false;
-  let dispChunks = [];
-  let dispLen = 0;
-  let dispTruncated = false;
+  let cur = null; // { id, namesRaw:[] }
+  let inDisp = false, dispChunks = [], dispLen = 0, dispTruncated = false;
 
   parser.on('error', (e) => { throw e; });
 
@@ -261,14 +256,17 @@ async function parseEpgStream() {
       inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'channel' && cur) {
       const id = cur.id || '';
-      if (isMexicoEntry(id, cur.namesRaw)) {
-        const names = new Set();
-        for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
-        for (const v of expandNameVariants(id)) if (v) names.add(v);
-        const limited = [];
-        for (const v of names) { limited.push(v); if (limited.length >= MAX_VARIANTS) break; }
-        const entry = { id, names: limited, tokenSet: new Set(), hasProgs: false };
-        for (const nm2 of entry.names) for (const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
+      // Build variants & tokens for gating decision
+      const variants = new Set();
+      for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) variants.add(v);
+      for (const v of expandNameVariants(id)) if (v) variants.add(v);
+      const tokenSet = new Set(); for (const v of variants) for (const t of tokensOf(v)) tokenSet.add(t);
+
+      const keep = setIntersects(tokenSet, scrapedTokenUniverse) || looksMexican(id, cur.namesRaw);
+      if (keep) {
+        const limitedNames = [];
+        for (const v of variants) { limitedNames.push(v); if (limitedNames.length >= MAX_VARIANTS) break; }
+        const entry = { id, names: limitedNames, tokenSet, hasProgs: false };
         idTo.set(id, entry);
         for (const n of entry.names) {
           const k = keyOf(n);
@@ -294,16 +292,16 @@ async function parseEpgStream() {
     src.pipe(gunzip);
   });
 
-  // programme presence
   for (const cid of programmesSeen) {
     const o = idTo.get(cid);
     if (o) o.hasProgs = true;
   }
-  if (REQUIRE_PROGRAMS) {
+  if (REQUIRE_PROGRAMMES) {
     for (const [k, v] of nameMap.entries()) if (!v.hasProgs) nameMap.delete(k);
   }
 
-  console.log(`EPG entries kept (Mexico-related): ${new Set([...nameMap.values()]).size}`);
+  const kept = new Set([...nameMap.values()]).size;
+  console.log(`EPG entries kept (token-gated${REQUIRE_PROGRAMMES ? ', require programmes' : ''}): ${kept}`);
   return { nameMap, entries: [...new Set([...nameMap.values()])] };
 }
 
@@ -321,7 +319,7 @@ function findMatch(channelName, nameKey, nameMap, entries) {
   const sTokArr = tokensOf(channelName);
   const sTok = new Set(sTokArr);
 
-  // anchor (single strong token), e.g., "teleritmo"
+  // anchor: single strong token (e.g., "teleritmo")
   if (sTok.size === 1) {
     const [only] = [...sTok];
     for (const e of entries) if (e.tokenSet && e.tokenSet.has(only)) {
@@ -329,7 +327,7 @@ function findMatch(channelName, nameKey, nameMap, entries) {
     }
   }
 
-  // subset: all scraped tokens contained in an entry
+  // subset: all scraped tokens inside an entry's tokens; prefer smallest entry
   let subsetBest = null, subsetBestSize = Infinity;
   for (const e of entries) {
     const E = e.tokenSet || new Set();
@@ -364,24 +362,18 @@ async function saveRows(rows) {
     db: { schema: SUPABASE_SCHEMA }
   });
 
-  // Some schemas require NOT NULL channel_name. Provide it.
-  const payload = rows.map(r => ({
-    ...r,
-    channel_name: r.epg_display_name || r.channel_guess || null
-  }));
-
-  let { error } = await supabase.from(SUPABASE_TABLE).upsert(payload, {
+  let { error } = await supabase.from(SUPABASE_TABLE).upsert(rows, {
     onConflict: 'stream_url',
     ignoreDuplicates: false
   });
   if (error) {
     console.warn(`Upsert failed (${error.code ?? 'no-code'}): ${error.message}. Falling back to insert…`);
-    ({ error } = await supabase.from(SUPABASE_TABLE).insert(payload));
+    ({ error } = await supabase.from(SUPABASE_TABLE).insert(rows));
   }
   if (error) {
     console.warn(`Insert failed: ${error.message} (${error.code ?? 'no-code'})`);
   } else {
-    console.log(`DB write OK: ${payload.length} rows`);
+    console.log(`DB write OK: ${rows.length} rows`);
   }
 }
 
@@ -410,7 +402,12 @@ async function main() {
     const filtered = scraped.filter(r => r.streams.length > 0);
     console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
 
-    const { nameMap, entries } = await parseEpgStream();
+    // Build token universe from our scraped channel names
+    const scrapedTokenUniverse = new Set();
+    for (const r of filtered) for (const t of tokensOf(r.channelName)) scrapedTokenUniverse.add(t);
+    console.log(`Scraped token universe size: ${scrapedTokenUniverse.size}`);
+
+    const { nameMap, entries } = await parseEpgStream(scrapedTokenUniverse);
 
     const records = [];
     const matchedOnly = [];
