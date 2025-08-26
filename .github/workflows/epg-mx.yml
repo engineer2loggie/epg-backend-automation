@@ -17,7 +17,6 @@ jobs:
       NAV_TIMEOUT_MS: "30000"
       PROBE_TIMEOUT_MS: "5000"
       SUPABASE_TABLE: epg_streams
-      # Provide these as repo secrets to enable DB upload:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
@@ -38,9 +37,9 @@ jobs:
         run: |
           mkdir -p scripts out/mx
           cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-# Scrape iptv-org.github.io for live MX channels (no JSON APIs), pull .m3u8s,
-# download EPGShare MX XML, match by display-name, probe stream, write artifact,
-# optional Supabase upsert.
+// Scrape iptv-org.github.io for live MX channels (no JSON APIs), pull .m3u8s,
+// download EPGShare MX XML, match by display-name, probe stream, write artifact,
+// optional Supabase upsert.
 
 import { chromium } from 'playwright';
 import { XMLParser } from 'fast-xml-parser';
@@ -205,7 +204,6 @@ async function probeM3U8(url) {
       signal: ac.signal
     });
     if (!r.ok) return false;
-    // tiny read to ensure content is accessible
     const txt = await r.text();
     return txt.includes('#EXTM3U');
   } catch {
@@ -359,7 +357,7 @@ async function main() {
     const scraped = await scrapeAll(browser, links);
     console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-    // Flatten streams for probing
+    // Probe each stream quickly; keep only working ones
     for (const row of scraped) {
       const tested = [];
       for (const s of row.streams) {
@@ -392,6 +390,17 @@ main().catch((e) => {
 EOF
 
       - name: Run MX scrape & match
+        env:
+          MX_SEARCH_URL: ${{ env.MX_SEARCH_URL }}
+          MX_EPG_URL: ${{ env.MX_EPG_URL }}
+          HEADLESS: ${{ env.HEADLESS }}
+          MAX_CHANNELS: ${{ env.MAX_CHANNELS }}
+          PER_PAGE_DELAY_MS: ${{ env.PER_PAGE_DELAY_MS }}
+          NAV_TIMEOUT_MS: ${{ env.NAV_TIMEOUT_MS }}
+          PROBE_TIMEOUT_MS: ${{ env.PROBE_TIMEOUT_MS }}
+          SUPABASE_TABLE: ${{ env.SUPABASE_TABLE }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/mx-scrape-and-match.mjs
 
       - name: Upload artifact
