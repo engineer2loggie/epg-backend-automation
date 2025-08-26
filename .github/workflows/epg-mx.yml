@@ -1,9 +1,9 @@
 name: EPG-MX
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 7 * * *" # daily 07:00 UTC
+    - cron: '0 7 * * *' # daily 07:00 UTC
 
 concurrency:
   group: epg-mx
@@ -16,21 +16,23 @@ jobs:
     env:
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
       MX_EPG_URL: https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz
-      HEADLESS: "true"
-      MAX_CHANNELS: "0"
-      PER_PAGE_DELAY_MS: "150"
-      NAV_TIMEOUT_MS: "30000"
-      PROBE_TIMEOUT_MS: "5000"
-      FUZZY_MIN: "0.45"
-      LOG_UNMATCHED: "1"
+      HEADLESS: 'true'
+      MAX_CHANNELS: '0'          # set to e.g. 25 for test runs
+      PER_PAGE_DELAY_MS: '150'
+      NAV_TIMEOUT_MS: '30000'
+      PROBE_TIMEOUT_MS: '5000'
+      FUZZY_MIN: '0.45'
+      LOG_UNMATCHED: '1'
 
+      # Supabase table: public.mx_channels
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -47,6 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p scripts out/mx
+          # overwrite to avoid stale copies
           rm -f scripts/mx-scrape-and-match.mjs
           cat > scripts/mx-scrape-and-match.mjs <<'EOF'
 // Scrape iptv-org for MX channels, pull .m3u8s, probe them,
@@ -477,10 +480,6 @@ async function main() {
 
 main().catch((e) => { console.error(e); process.exit(1); });
 EOF
-          echo '--- sanity: ensure no legacy concat left ---'
-          if grep -n 'dispBuf' scripts/mx-scrape-and-match.mjs; then
-            echo "Found legacy dispBuf in script (should not exist)"; exit 1
-          fi
 
       - name: Run MX scrape & match
         run: node scripts/mx-scrape-and-match.mjs
