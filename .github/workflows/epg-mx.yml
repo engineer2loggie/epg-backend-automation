@@ -1,0 +1,61 @@
+name: EPG-MX
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"  # daily 07:00 UTC
+
+jobs:
+  mx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
+      MX_EPG_URL: https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
+      HEADLESS: "true"
+      MAX_CHANNELS: "0"          # set to e.g. 200 to cap in test runs
+      PER_PAGE_DELAY_MS: "150"
+      NAV_TIMEOUT_MS: "30000"
+      SUPABASE_TABLE: epg_streams
+      # Supply these as repo secrets if you want to upsert:
+      # SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright (Chromium only) + deps
+        run: |
+          npm i --no-save playwright fast-xml-parser @supabase/supabase-js
+          npx playwright install --with-deps chromium
+
+      - name: Write script
+        run: |
+          mkdir -p scripts out/mx
+          cat > scripts/mx-scrape-and-match.mjs <<'EOF'
+          # (paste the EXACT contents of mx-scrape-and-match.mjs here)
+          EOF
+
+      - name: Run MX scrape & match
+        env:
+          MX_SEARCH_URL: ${{ env.MX_SEARCH_URL }}
+          MX_EPG_URL: ${{ env.MX_EPG_URL }}
+          HEADLESS: ${{ env.HEADLESS }}
+          MAX_CHANNELS: ${{ env.MAX_CHANNELS }}
+          PER_PAGE_DELAY_MS: ${{ env.PER_PAGE_DELAY_MS }}
+          NAV_TIMEOUT_MS: ${{ env.NAV_TIMEOUT_MS }}
+          SUPABASE_TABLE: ${{ env.SUPABASE_TABLE }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scripts/mx-scrape-and-match.mjs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-matches
+          path: out/mx/matches.json
+          if-no-files-found: error
