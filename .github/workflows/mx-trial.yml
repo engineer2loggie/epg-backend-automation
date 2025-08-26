@@ -1,0 +1,304 @@
+name: MX Trial (M3U ↔ EPG → Supabase)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  mx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # Sources you gave
+      M3U_SOURCES: "https://iptvcat.net/mexico__1 https://iptvcat.com/mexico__6/2"
+      EPG_URL: "https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz"
+
+      # Optional: write EPG blob to Supabase Storage bucket `epg`
+      SUPABASE_STORAGE_BUCKET: "epg"
+
+      # Required: set these in repo secrets
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install tiny deps
+        run: |
+          npm i fast-xml-parser@^4 p-limit@^4
+
+      - name: Write scripts
+        shell: bash
+        run: |
+          mkdir -p scripts out
+
+          cat > scripts/trial-mx.mjs <<'EOF'
+          import fs from 'node:fs/promises';
+          import { createWriteStream, createReadStream } from 'node:fs';
+          import zlib from 'node:zlib';
+          import { XMLParser } from 'fast-xml-parser';
+          import pLimit from 'p-limit';
+
+          const UA = 'VLC/3.0 libmpv (GitHubActions MX trial)';
+          const M3U_SOURCES = (process.env.M3U_SOURCES || '').split(/\s+/).filter(Boolean);
+          const EPG_URL = process.env.EPG_URL;
+          const SUPABASE_URL = process.env.SUPABASE_URL || '';
+          const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+          const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || '';
+
+          if (!EPG_URL) {
+            console.error('EPG_URL missing');
+            process.exit(1);
+          }
+
+          // --- helpers ---
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          function normalizeName(s) {
+            if (!s) return '';
+            // crude de-accent
+            s = s.normalize('NFD').replace(/\p{Diacritic}+/gu, '');
+            return s
+              .toLowerCase()
+              .replace(/&/g, ' and ')
+              .replace(/[\s._-]+/g, ' ')
+              .replace(/hd|uhd|sd|canal|canal\s+\d+/g, ' ')
+              .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+          }
+
+          async function fetchText(url) {
+            const res = await fetch(url, { headers: { 'user-agent': UA } });
+            if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
+            return await res.text();
+          }
+
+          async function fetchBuffer(url, destPathIfWant) {
+            const res = await fetch(url, { headers: { 'user-agent': UA } });
+            if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            if (destPathIfWant) await fs.writeFile(destPathIfWant, buf);
+            return buf;
+          }
+
+          async function decompressGzipToFile(gzBuf, outPath) {
+            await new Promise((resolve, reject) => {
+              const gunzip = zlib.createGunzip();
+              const out = createWriteStream(outPath);
+              gunzip.on('error', reject);
+              out.on('error', reject);
+              out.on('finish', resolve);
+              gunzip.end(gzBuf);
+              gunzip.pipe(out);
+            });
+          }
+
+          function extractM3U8FromHtml(html) {
+            const set = new Set();
+            const re = /https?:\/\/[^\s"'<>]+\.m3u8(?:\?[^\s"'<>]*)?/gi;
+            let m;
+            while ((m = re.exec(html)) !== null) {
+              set.add(m[0]);
+            }
+            return [...set];
+          }
+
+          async function testStream(url, ms = 2500) {
+            // Try quick GET; some servers block HEAD
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort(), ms);
+            try {
+              const res = await fetch(url, {
+                method: 'GET',
+                headers: {
+                  'user-agent': UA,
+                  'accept': 'application/vnd.apple.mpegurl, */*',
+                  'range': 'bytes=0-2048'
+                },
+                signal: ctrl.signal
+              });
+              if (!res.ok) return { ok: false, code: res.status };
+              const ct = (res.headers.get('content-type') || '').toLowerCase();
+              const buf = Buffer.from(await res.arrayBuffer());
+              const head = buf.toString('utf8', 0, Math.min(256, buf.length));
+              const looksLikeM3U = head.includes('#EXTM3U') || ct.includes('mpegurl') || url.toLowerCase().includes('.m3u8');
+              return { ok: looksLikeM3U, code: res.status };
+            } catch (e) {
+              return { ok: false, err: String(e) };
+            } finally {
+              clearTimeout(to);
+            }
+          }
+
+          // --- Step 1: pull candidate streams from iptvcat pages ---
+          let candidates = new Set();
+          for (const src of M3U_SOURCES) {
+            try {
+              const html = await fetchText(src);
+              for (const u of extractM3U8FromHtml(html)) candidates.add(u);
+            } catch (e) {
+              console.warn(`[scrape] failed ${src}: ${e}`);
+            }
+            await sleep(250);
+          }
+          candidates = [...candidates];
+          console.log(`Found ${candidates.length} candidate .m3u8 links`);
+
+          // --- Step 2: fetch & parse EPG (channels) ---
+          await fs.mkdir('out', { recursive: true });
+          const gzPath = 'out/epg_MX.xml.gz';
+          const xmlPath = 'out/epg_MX.xml';
+          const gzBuf = await fetchBuffer(EPG_URL, gzPath);
+          await decompressGzipToFile(gzBuf, xmlPath);
+
+          const xml = await fs.readFile(xmlPath, 'utf8');
+          const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' });
+          const j = parser.parse(xml);
+          const tv = j?.tv || {};
+          let channels = tv.channel || [];
+          if (!Array.isArray(channels)) channels = [channels];
+
+          const epgIndex = new Map(); // normName -> {id, name}
+          for (const ch of channels) {
+            const id = ch?.id || null;
+            let names = ch?.['display-name'];
+            if (!names) continue;
+            if (!Array.isArray(names)) names = [names];
+            // display-name items may be strings or objects
+            const primary =
+              (names.find(x => typeof x === 'string') ??
+               names.find(x => typeof x?.['#text'] === 'string')?.['#text'] ??
+               String(names[0]));
+
+            const norm = normalizeName(primary);
+            if (norm) epgIndex.set(norm, { id, name: primary });
+          }
+          console.log(`EPG channels indexed: ${epgIndex.size}`);
+
+          // --- Step 3: test streams + fuzzy match to EPG by normalized name ---
+          function guessNameFromUrl(u) {
+            try {
+              const url = new URL(u);
+              const last = url.pathname.split('/').filter(Boolean).pop() || '';
+              const stem = last.replace(/\.m3u8.*/i, '');
+              return stem || url.hostname.split('.').slice(0, -1).join('.');
+            } catch {
+              return u;
+            }
+          }
+
+          const limit = pLimit(10);
+          const results = [];
+          await Promise.all(
+            candidates.map(u => limit(async () => {
+              const test = await testStream(u);
+              if (!test.ok) return;
+
+              const guess = normalizeName(guessNameFromUrl(u));
+              let match = null;
+              if (guess && epgIndex.has(guess)) {
+                match = epgIndex.get(guess);
+              } else if (guess) {
+                // weak contains search
+                for (const [k, v] of epgIndex) {
+                  if (k.includes(guess) || guess.includes(k)) { match = v; break; }
+                }
+              }
+              results.push({
+                stream_url: u,
+                channel_guess: guess || null,
+                epg_channel_id: match?.id ?? null,
+                epg_display_name: match?.name ?? null,
+                working: true,
+                checked_at: new Date().toISOString()
+              });
+            }))
+          );
+
+          await fs.writeFile('out/mx_results.json', JSON.stringify(results, null, 2), 'utf8');
+          console.log(`Working streams matched: ${results.length}`);
+
+          // --- Step 4: optional upload raw EPG to Supabase Storage ---
+          if (SUPABASE_URL && SUPABASE_KEY && SUPABASE_BUCKET) {
+            const path = `MX/epg_ripper_MX1.xml.gz`;
+            const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${path}`, {
+              method: 'POST',
+              headers: {
+                'authorization': `Bearer ${SUPABASE_KEY}`,
+                'apikey': SUPABASE_KEY,
+                'x-upsert': 'true',
+                'content-type': 'application/gzip'
+              },
+              body: createReadStream(gzPath)
+            });
+            console.log(`[storage] upload ${path} -> ${res.status}`);
+          }
+          EOF
+
+          cat > scripts/upload-supabase.mjs <<'EOF'
+          import fs from 'node:fs/promises';
+
+          const SUPABASE_URL = process.env.SUPABASE_URL || '';
+          const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+          if (!SUPABASE_URL || !SUPABASE_KEY) {
+            console.error('Supabase env missing; skip upload.');
+            process.exit(0);
+          }
+
+          const table = 'mx_channels';
+          const onConflict = 'stream_url'; // unique constraint recommended
+
+          const rows = JSON.parse(await fs.readFile('out/mx_results.json', 'utf8'));
+          if (!Array.isArray(rows) || rows.length === 0) {
+            console.log('No rows to upload.');
+            process.exit(0);
+          }
+
+          // Chunk to avoid payload limits
+          const chunkSize = 500;
+          for (let i = 0; i < rows.length; i += chunkSize) {
+            const chunk = rows.slice(i, i + chunkSize);
+            const url = `${SUPABASE_URL}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`;
+            const res = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'authorization': `Bearer ${SUPABASE_KEY}`,
+                'apikey': SUPABASE_KEY,
+                'content-type': 'application/json',
+                'prefer': 'resolution=merge-duplicates,return=representation'
+              },
+              body: JSON.stringify(chunk)
+            });
+            if (!res.ok) {
+              const text = await res.text().catch(() => '');
+              console.error(`[supabase] upsert chunk ${i}-${i + chunk.length} -> ${res.status}\n${text}`);
+              process.exit(1);
+            } else {
+              console.log(`[supabase] upserted ${chunk.length} rows`);
+            }
+          }
+          EOF
+
+      - name: Run trial (scrape, test, match, store EPG)
+        run: node scripts/trial-mx.mjs
+
+      - name: Upload to Supabase (REST upsert)
+        run: node scripts/upload-supabase.mjs
+
+      - name: Upload artifacts (JSON + EPG)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-trial-output
+          path: |
+            out/mx_results.json
+            out/epg_MX.xml
+            out/epg_MX.xml.gz
+          if-no-files-found: warn
