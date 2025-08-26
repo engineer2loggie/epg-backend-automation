@@ -1,6 +1,7 @@
-// Scrape iptv-org.github.io for live MX channels, pull .m3u8s, probe,
-// stream-parse huge EPG (ALL_SOURCES1) safely, match channels (exact/anchor/subset/fuzzy),
-// write artifacts, and insert into Supabase public.mx_channels:
+// Scrape iptv-org for MX channels, pull .m3u8s, probe them,
+// stream-parse huge EPG (ALL_SOURCES1) safely (no giant string concat),
+// match channels (exact/anchor/subset/fuzzy), write artifacts,
+// and insert into Supabase public.mx_channels:
 //   stream_url, channel_guess, epg_channel_id, epg_display_name, working, checked_at
 
 import { chromium } from 'playwright';
@@ -200,23 +201,28 @@ async function parseEpgStream() {
   const nameMap = new Map(); // keyOf(name) -> entry
   const programmesSeen = new Set();
 
-  // caps to avoid huge string builds inside <display-name>
-  const MAX_NAME_CHARS = 1024;
+  const MAX_NAME_CHARS = 1024;  // cap per <display-name>
+  const MAX_NAMES_PER_CH = 24;  // cap number of display-names we keep per channel
 
-  let cur = null;                 // { id, namesRaw:[] }
+  let cur = null;                // { id, namesRaw:[] }
   let inDisp = false;
   let dispChunks = [];
   let dispLen = 0;
+  let dispTruncated = false;
 
   parser.on('error', (e) => { throw e; });
 
   parser.on('opentag', (tag) => {
-    const name = String(tag.name).toLowerCase();
-    if (name === 'channel') {
+    const nm = String(tag.name).toLowerCase();
+    if (nm === 'channel') {
       cur = { id: tag.attributes?.id ? String(tag.attributes.id) : '', namesRaw: [] };
-    } else if (name === 'display-name' && cur) {
-      inDisp = true; dispChunks = []; dispLen = 0;
-    } else if (name === 'programme') {
+    } else if (nm === 'display-name' && cur) {
+      // start a new, bounded buffer for this display-name
+      inDisp = true;
+      dispChunks = [];
+      dispLen = 0;
+      dispTruncated = false;
+    } else if (nm === 'programme') {
       const cid = tag.attributes?.channel;
       if (cid) programmesSeen.add(String(cid));
     }
@@ -224,47 +230,58 @@ async function parseEpgStream() {
 
   parser.on('text', (t) => {
     if (!inDisp || !cur) return;
-    // guard against pathological chunks
     if (!t) return;
+    if (dispTruncated) return; // already at cap
     let chunk = String(t);
     if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
     const remain = MAX_NAME_CHARS - dispLen;
-    if (remain <= 0) return;
-    if (chunk.length > remain) chunk = chunk.slice(0, remain);
-    if (chunk) {
-      dispChunks.push(chunk);
-      dispLen += chunk.length;
-    }
+    if (remain <= 0) { dispTruncated = true; return; }
+    if (chunk.length > remain) { chunk = chunk.slice(0, remain); dispTruncated = true; }
+    if (chunk) { dispChunks.push(chunk); dispLen += chunk.length; }
   });
 
   parser.on('closetag', (nameRaw) => {
-    const name = String(nameRaw).toLowerCase();
-    if (name === 'display-name' && cur) {
-      const txt = dispChunks.join('').trim();
-      if (txt) cur.namesRaw.push(txt);
-      inDisp = false; dispChunks = []; dispLen = 0;
-    } else if (name === 'channel' && cur) {
+    const nm = String(nameRaw).toLowerCase();
+    if (nm === 'display-name' && cur) {
+      if (cur.namesRaw.length < MAX_NAMES_PER_CH) {
+        const txt = dispChunks.length ? dispChunks.join('') : '';
+        const clean = txt.trim();
+        if (clean) cur.namesRaw.push(clean);
+      }
+      // reset display-name state
+      inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
+    } else if (nm === 'channel' && cur) {
       const id = cur.id || '';
       if (isMexicoEntry(id, cur.namesRaw)) {
         const names = new Set();
         for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
         for (const v of expandNameVariants(id)) if (v) names.add(v);
-        const entry = { id, names: [...names], tokenSet: new Set(), hasProgs: false };
-        for (const nm of entry.names) for (const t of tokensOf(nm)) entry.tokenSet.add(t);
+
+        // optional: cap variants to keep memory bounded
+        const limitedNames = [];
+        for (const v of names) { limitedNames.push(v); if (limitedNames.length >= 64) break; }
+
+        const entry = { id, names: limitedNames, tokenSet: new Set(), hasProgs: false };
+        for (const nm2 of entry.names) for (const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
         idTo.set(id, entry);
         for (const n of entry.names) {
           const k = keyOf(n);
           if (k && !nameMap.has(k)) nameMap.set(k, entry);
         }
       }
-      cur = null; inDisp = false; dispChunks = []; dispLen = 0;
+      // reset channel state
+      cur = null; inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     }
   });
 
   await new Promise((resolve, reject) => {
     src.on('error', reject);
     gunzip.on('error', reject);
-    gunzip.on('data', (chunk) => parser.write(decoder.decode(chunk, { stream: true })));
+    gunzip.on('data', (chunk) => {
+      // stream decode + feed parser
+      const text = decoder.decode(chunk, { stream: true });
+      if (text) parser.write(text);
+    });
     gunzip.on('end', () => {
       parser.write(decoder.decode(new Uint8Array(), { stream: false }));
       parser.close();
@@ -291,14 +308,13 @@ function jaccard(aTokens, bTokens) {
 }
 
 function findMatch(channelName, nameKey, nameMap, entries) {
-  // 1) exact key match
   const exact = nameMap.get(nameKey);
   if (exact) return { entry: exact, score: 1, method: 'exact' };
 
-  // 2) token containment / single-token anchor
   const sTokArr = tokensOf(channelName);
   const sTok = new Set(sTokArr);
 
+  // anchor: single strong token like "teleritmo"
   if (sTok.size === 1) {
     const [only] = [...sTok];
     for (const e of entries) if (e.tokenSet && e.tokenSet.has(only)) {
@@ -306,7 +322,7 @@ function findMatch(channelName, nameKey, nameMap, entries) {
     }
   }
 
-  // subset: scraped tokens ⊆ entry tokens (pick smallest entry)
+  // subset: all scraped tokens inside an entry's tokens
   let subsetBest = null, subsetBestSize = Infinity;
   for (const e of entries) {
     const E = e.tokenSet || new Set();
@@ -316,7 +332,7 @@ function findMatch(channelName, nameKey, nameMap, entries) {
   }
   if (subsetBest) return { entry: subsetBest, score: 0.9, method: 'subset' };
 
-  // 3) fuzzy fallback
+  // fuzzy Jaccard
   let best = null, bestScore = 0;
   for (const e of entries) for (const nm of e.names) {
     const score = jaccard(sTokArr, tokensOf(nm));
