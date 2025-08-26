@@ -452,8 +452,7 @@ async function main() {
           checked_at: new Date().toISOString()
         };
         records.push(rec);
-        if (entry) matchedOnly.push({ ...rec, _match_method: method });
-      }
+        if (entry) matchedOnly.push({ ...rec, _match_method: method });      }
     }
 
     console.log(`Matched with EPG: ${matchedOnly.length} stream rows (across ${filtered.length} channels).`);
