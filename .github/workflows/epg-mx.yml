@@ -21,13 +21,19 @@ jobs:
       PER_PAGE_DELAY_MS: "150"
       NAV_TIMEOUT_MS: "30000"
       PROBE_TIMEOUT_MS: "5000"
-      SUPABASE_TABLE: epg_streams
+      SUPABASE_TABLE: mx_channels
+      SUPABASE_SCHEMA: public
       # Provide these via repo secrets:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: Install Playwright and deps
         run: |
@@ -59,7 +65,8 @@ jobs:
 
           const SUPABASE_URL = process.env.SUPABASE_URL || '';
           const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-          const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'epg_streams';
+          const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mx_channels';
+          const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
 
           function stripAccents(s) { return String(s).normalize('NFD').replace(/\p{Diacritic}+/gu, ''); }
           const STOP = new Set(['canal', 'tv', 'television', 'hd', 'sd', 'mx', 'mexico', 'méxico']);
@@ -72,6 +79,23 @@ jobs:
           function keyOf(s) {
             const t = Array.from(new Set(tokensOf(s))).sort();
             return t.join(' ');
+          }
+
+          // --- Name variant helpers for matching ("Canal." removal, dot/underscore flatten)
+          function stripLeadingCanal(s) {
+            if (!s) return s;
+            return String(s).replace(/^\s*canal[\s._-]+/i, '');
+          }
+          function expandNameVariants(s) {
+            if (!s) return [];
+            const out = new Set();
+            const orig = String(s).trim();
+            const noCanal = stripLeadingCanal(orig);
+            out.add(orig);
+            out.add(noCanal);
+            out.add(orig.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim());
+            out.add(noCanal.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim());
+            return [...out].filter(Boolean);
           }
 
           function uniqBy(arr, keyFn) {
@@ -94,7 +118,6 @@ jobs:
             const page = await browser.newPage();
             page.setDefaultTimeout(NAV_TIMEOUT_MS);
             await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded' });
-            // Wait for channel anchors to show (client-side filter)
             await page.waitForSelector('a[href*="/channels/"]', { timeout: 15000 }).catch(() => {});
             await page.waitForTimeout(1000);
 
@@ -105,7 +128,6 @@ jobs:
                 if (!href.includes('/channels/')) continue;
                 const url = new URL(href, location.href).href;
                 const name = (a.textContent || '').trim();
-                // find closest image as logo
                 let logo = null;
                 const row = a.closest('tr,li,article,div') || a.parentElement;
                 if (row) {
@@ -135,19 +157,16 @@ jobs:
               await page.goto(link.url, { waitUntil: 'domcontentloaded' });
               await page.waitForTimeout(500);
 
-              // Try to click "Streams" tab/section if present
               const tab = await page.$('text=Streams');
               if (tab) {
                 await tab.click().catch(() => {});
                 await page.waitForTimeout(400);
               }
 
-              // Anchors to .m3u8
               let anchors = await page.$$eval('a[href*=".m3u8"]', els =>
                 els.map(e => ({ url: e.href, text: (e.textContent || '').trim() }))
               );
 
-              // Fallback: regex search in HTML
               if (!anchors.length) {
                 const html = await page.content();
                 const rx = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi;
@@ -232,13 +251,12 @@ jobs:
               : [];
 
             const idTo = new Map();
-            const nameMap = new Map(); // normalized display-name -> { id, names:Set, icon, hasProgs }
+            const nameMap = new Map();
 
             for (const ch of channels) {
               const id = ch?.id;
               if (!id) continue;
 
-              // icon can be object or array; pick first .src if present
               let icon = null;
               if (ch.icon) {
                 if (Array.isArray(ch.icon)) {
@@ -248,19 +266,13 @@ jobs:
                 }
               }
 
-              // collect display-names (strings or objects)
               const names = [];
               const dn = ch['display-name'];
-              const addName = v => {
-                if (!v) return;
-                if (typeof v === 'string') names.push(v);
-                else if (typeof v === 'object') names.push(v['#text'] || v.text || '');
-              };
-              if (Array.isArray(dn)) dn.forEach(addName);
-              else addName(dn);
+              const pushVariants = (v) => { for (const x of expandNameVariants(v)) names.push(x); };
+              if (Array.isArray(dn)) dn.forEach(v => pushVariants(typeof v === 'object' ? (v['#text'] || v.text || '') : v));
+              else pushVariants(typeof dn === 'object' ? (dn?.['#text'] || dn?.text || '') : dn);
 
-              // also consider id as a candidate “name”
-              names.push(id);
+              for (const x of expandNameVariants(id)) names.push(x);
 
               const entry = { id, names: Array.from(new Set(names.filter(Boolean))), icon, hasProgs: false };
               idTo.set(id, entry);
@@ -277,7 +289,6 @@ jobs:
               if (o) o.hasProgs = true;
             }
 
-            // Keep only channels that actually have programmes
             for (const [k, v] of nameMap.entries()) if (!v.hasProgs) nameMap.delete(k);
 
             console.log(`EPG channels: ${channels.length}, with programmes for ${[...new Set([...idTo.values()].filter(x=>x.hasProgs).map(x=>x.id))].length}`);
@@ -313,7 +324,10 @@ jobs:
               console.log('No rows to upload to Supabase.');
               return;
             }
-            const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
+            const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+              auth: { persistSession: false },
+              db: { schema: SUPABASE_SCHEMA }
+            });
             const payload = [];
             for (const r of rows) {
               for (const s of r.streams) {
@@ -334,14 +348,15 @@ jobs:
               onConflict: 'country,channel_name,stream_url',
               ignoreDuplicates: false
             });
-            if (error) throw error;
-            console.log(`Supabase upsert done: ${payload.length} rows`);
+            if (error) {
+              console.warn(`Supabase upsert skipped: ${error.message} (${error.code ?? 'no-code'})`);
+            } else {
+              console.log(`Supabase upsert done: ${payload.length} rows`);
+            }
           }
 
           // ---------- MAIN ----------
-          async function ensureDir(p) {
-            await fs.mkdir(p, { recursive: true });
-          }
+          async function ensureDir(p) { await fs.mkdir(p, { recursive: true }); }
 
           async function main() {
             await ensureDir('out/mx');
@@ -353,7 +368,6 @@ jobs:
               const scraped = await scrapeAll(browser, links);
               console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-              // Probe streams
               for (const row of scraped) {
                 const tested = [];
                 for (const s of row.streams) {
