@@ -15,23 +15,28 @@ jobs:
     timeout-minutes: 300
 
     env:
-      MX_SEARCH_URL: "https://iptv-org.github.io/?q=live%20country:MX"
+      MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
+      # Parse multiple EPG files in one run (MX + US sets that contain MX)
       MX_EPG_URLS: >-
         https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
-      HEADLESS: "true"
-      MAX_CHANNELS: "0"
-      PER_PAGE_DELAY_MS: "150"
-      NAV_TIMEOUT_MS: "30000"
-      PROBE_TIMEOUT_MS: "5000"
-      FUZZY_MIN: "0.45"
-      LOG_UNMATCHED: "1"
+      HEADLESS: 'true'
+      MAX_CHANNELS: '0'
+      PER_PAGE_DELAY_MS: '150'
+      NAV_TIMEOUT_MS: '30000'
+      PROBE_TIMEOUT_MS: '5000'
+      FUZZY_MIN: '0.45'
+      LOG_UNMATCHED: '1'
+
+      # Supabase
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
+
+      # EPG table name (programmes go here)
+      SUPABASE_EPG_TABLE: epg_programs
 
     steps:
       - name: Checkout
@@ -42,13 +47,7 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install system deps (Expect for non-interactive NordVPN)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl gnupg lsb-release expect
-
-      - name: Install Node deps (Playwright/Supabase)
+      - name: Install Node deps (Playwright, Supabase)
         run: |
           set -euo pipefail
           npm i --no-save playwright saxes @supabase/supabase-js
@@ -57,6 +56,8 @@ jobs:
       - name: Install NordVPN CLI (non-interactive)
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg lsb-release expect
           curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/nordvpn-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/nordvpn-archive-keyring.gpg] https://repo.nordvpn.com/deb/nordvpn/debian stable main" \
@@ -83,7 +84,9 @@ jobs:
           EXP
           chmod +x scripts/nordvpn.exp
 
-      - name: NordVPN login & connect (Mexico)
+      - name: NordVPN login & connect (Mexico) — non-interactive
+        env:
+          NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${NORDVPN_TOKEN:-}" ]; then
@@ -111,9 +114,9 @@ jobs:
           mkdir -p scripts out/mx
           cat > scripts/mx-scrape-and-match.mjs <<'EOF'
           // Scrape iptv-org for MX channels, pull .m3u8s, probe them.
-          // Stream-parse multiple EPG XML.GZ files safely; mark channels that actually have programmes.
-          // Save to Supabase: public.mx_channels (stream_url, channel_guess, epg_channel_id, epg_display_name, working, checked_at)
-
+          // Stream-parse multiple EPG XML.GZ files safely; keep Mexico-related channels.
+          // Upload streams -> public.mx_channels
+          // Upload programmes -> public.epg_programs  (separate table with start_ts/stop_ts)
           import { chromium } from 'playwright';
           import { createGunzip } from 'node:zlib';
           import { Readable } from 'node:stream';
@@ -124,21 +127,24 @@ jobs:
           import { SaxesParser } from 'saxes';
 
           const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
-          const EPG_URLS   = (process.env.MX_EPG_URLS || '').trim().split(/\s+/).filter(Boolean);
+          const EPG_URLS = (process.env.MX_EPG_URLS || '').trim().split(/\s+/).filter(Boolean);
 
-          const HEADLESS         = (process.env.HEADLESS ?? 'true') !== 'false';
-          const MAX_CHANNELS     = Number(process.env.MAX_CHANNELS || '0');
-          const PER_PAGE_DELAY_MS= Number(process.env.PER_PAGE_DELAY_MS || '150');
-          const NAV_TIMEOUT_MS   = Number(process.env.NAV_TIMEOUT_MS || '30000');
+          const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
+          const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0');
+          const PER_PAGE_DELAY_MS = Number(process.env.PER_PAGE_DELAY_MS || '150');
+          const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || '30000');
           const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '5000');
-          const FUZZY_MIN        = Number(process.env.FUZZY_MIN || '0.45');
-          const LOG_UNMATCHED    = process.env.LOG_UNMATCHED === '1';
 
-          const SUPABASE_URL        = process.env.SUPABASE_URL || '';
-          const SUPABASE_SERVICE_KEY= process.env.SUPABASE_SERVICE_KEY || '';
-          const SUPABASE_SCHEMA     = process.env.SUPABASE_SCHEMA || 'public';
-          const SUPABASE_TABLE      = process.env.SUPABASE_TABLE || 'mx_channels';
+          const FUZZY_MIN = Number(process.env.FUZZY_MIN || '0.45');
+          const LOG_UNMATCHED = process.env.LOG_UNMATCHED === '1';
 
+          const SUPABASE_URL = process.env.SUPABASE_URL || '';
+          const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+          const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
+          const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mx_channels';
+          const SUPABASE_EPG_TABLE = process.env.SUPABASE_EPG_TABLE || 'epg_programs';
+
+          // ---------- normalization ----------
           function stripAccents(s){return String(s).normalize('NFD').replace(/\p{Diacritic}+/gu,'');}
           function normalizeNumerals(s){
             const map={uno:'1',dos:'2',tres:'3',cuatro:'4',cinco:'5',seis:'6',siete:'7',ocho:'8',nueve:'9',diez:'10',once:'11',doce:'12',trece:'13'};
@@ -182,6 +188,18 @@ jobs:
           }
           function uniqBy(arr,keyFn){const m=new Map();for(const x of arr){const k=keyFn(x);if(!m.has(k))m.set(k,x);}return[...m.values()];}
 
+          // ---------- time parse ----------
+          // XMLTV: YYYYMMDDHHMMSS ±HHMM  -> ISO string
+          function xmltvToISO(s){
+            if(!s) return null;
+            const m = String(s).match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\s*([+-]\d{4})?$/);
+            if(!m) return null;
+            const [_,Y,Mo,D,h,mi,se,off] = m;
+            const tz = off ? `${off.slice(0,3)}:${off.slice(3)}` : '+00:00';
+            return `${Y}-${Mo}-${D}T${h}:${mi}:${se}${tz}`;
+          }
+
+          // ---------- scraping ----------
           async function collectChannelPages(browser){
             const page=await browser.newPage();
             page.setDefaultTimeout(NAV_TIMEOUT_MS);
@@ -197,8 +215,7 @@ jobs:
                 const name=(a.textContent||'').trim();
                 out.push({url,name});
               }
-              const m=new Map();for(const it of out)if(!m.has(it.url))m.set(it.url,it);
-              return[...m.values()];
+              const m=new Map();for(const it of out)if(!m.has(it.url))m.set(it.url,it);return[...m.values()];
             });
             items=items.filter(i=>i.name&&i.url);
             items=uniqBy(items,x=>x.url);
@@ -212,13 +229,12 @@ jobs:
             try{
               await page.goto(link.url,{waitUntil:'domcontentloaded'});
               await page.waitForTimeout(500);
-              const tab=await page.$('text=Streams');
-              if(tab){await tab.click().catch(()=>{});await page.waitForTimeout(400);}
+              const tab=await page.$('text=Streams'); if(tab){await tab.click().catch(()=>{});await page.waitForTimeout(400);}
               let anchors=await page.$$eval('a[href*=".m3u8"]',els=>els.map(e=>({url:e.href,text:(e.textContent||'').trim()})));
               if(!anchors.length){
                 const html=await page.content();
                 const rx=/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi;
-                const set=new Set();let m;while((m=rx.exec(html)))set.add(m[0]);
+                const set=new Set(); let m; while((m=rx.exec(html))) set.add(m[0]);
                 anchors=[...set].map(u=>({url:u,text:''}));
               }
               anchors=uniqBy(anchors.filter(a=>/^https?:\/\//i.test(a.url)),a=>a.url);
@@ -240,12 +256,12 @@ jobs:
             const t=setTimeout(()=>ac.abort(),PROBE_TIMEOUT_MS);
             try{
               const r=await fetch(url,{method:'GET',headers:{'user-agent':'Mozilla/5.0','accept':'application/vnd.apple.mpegurl,text/plain,*/*'},signal:ac.signal});
-              if(!r.ok)return false;
-              const txt=await r.text();
-              return txt.includes('#EXTM3U');
-            }catch{return false;}finally{clearTimeout(t);}
+              if(!r.ok)return false; const txt=await r.text(); return txt.includes('#EXTM3U');
+            }catch{ return false; }
+            finally{ clearTimeout(t); }
           }
 
+          // ---------- EPG parsing (channels + programmes) ----------
           function isMexicoEntry(id,names){
             if(!id&&(!names||!names.length))return false;
             if(id&&containsMexicoTag(id))return true;
@@ -266,44 +282,98 @@ jobs:
             const parser=new SaxesParser({xmlns:false});
 
             const MAX_NAME_CHARS=1024, MAX_NAMES_PER_CH=24, MAX_VARIANTS=64;
-            let cur=null,inDisp=false,dispChunks=[],dispLen=0,dispTruncated=false;
+
+            let curCh=null, inDisp=false, dispChunks=[], dispLen=0, dispTruncated=false;
+            let curProg=null, curField=null, buf='';
 
             parser.on('error',(e)=>{throw e;});
+
             parser.on('opentag',(tag)=>{
               const nm=String(tag.name).toLowerCase();
-              if(nm==='channel'){cur={id:tag.attributes?.id?String(tag.attributes.id):'',namesRaw:[]};}
-              else if(nm==='display-name'&&cur){inDisp=true;dispChunks=[];dispLen=0;dispTruncated=false;}
-              else if(nm==='programme'){const cid=tag.attributes?.channel; if(cid) agg.programmesSeen.add(String(cid));}
+              if(nm==='channel'){
+                curCh={ id: tag.attributes?.id? String(tag.attributes.id):'', namesRaw:[] };
+              } else if(nm==='display-name' && curCh){
+                inDisp=true; dispChunks=[]; dispLen=0; dispTruncated=false;
+              } else if(nm==='programme'){
+                const ch = String(tag.attributes?.channel || '');
+                const start = xmltvToISO(tag.attributes?.start);
+                const stop  = xmltvToISO(tag.attributes?.stop);
+                curProg = { channel_raw: ch, channel_id: stripLeadingCanal(ch), start_ts: start, stop_ts: stop,
+                            title:null, sub_title:null, summary:null, language:null, orig_language:null,
+                            categories:[], credits:{}, episode:null, episode_num_xmltv:null,
+                            rating:null, star_rating:null, icon_url:null, program_url:null,
+                            premiere:false, previously_shown:false, extras:{} };
+              } else if(curProg){
+                if(['title','sub-title','desc','category','episode-num','rating','star-rating','icon','url','credits','audio','date','language','orig-language','premiere','previously-shown'].includes(nm)){
+                  curField=nm; buf='';
+                  if(nm==='premiere') curProg.premiere = true;
+                  if(nm==='previously-shown') curProg.previously_shown = true;
+                }
+                if(nm==='icon' && tag.attributes?.src) { curProg.icon_url = String(tag.attributes.src); }
+              }
             });
+
             parser.on('text',(t)=>{
-              if(!inDisp||!cur||!t||dispTruncated) return;
-              let chunk=String(t); if(chunk.length>MAX_NAME_CHARS) chunk=chunk.slice(0,MAX_NAME_CHARS);
-              const remain=MAX_NAME_CHARS-dispLen; if(remain<=0){dispTruncated=true;return;}
-              if(chunk.length>remain){chunk=chunk.slice(0,remain);dispTruncated=true;}
-              if(chunk){dispChunks.push(chunk);dispLen+=chunk.length;}
+              if(inDisp && curCh){
+                if(!t) return;
+                if(dispTruncated) return;
+                let chunk=String(t); if(chunk.length>MAX_NAME_CHARS)chunk=chunk.slice(0,MAX_NAME_CHARS);
+                const remain=MAX_NAME_CHARS-dispLen; if(remain<=0){dispTruncated=true;return;}
+                if(chunk.length>remain){chunk=chunk.slice(0,remain);dispTruncated=true;}
+                if(chunk){dispChunks.push(chunk);dispLen+=chunk.length;}
+              } else if(curProg && curField){
+                buf += t || '';
+              }
             });
+
             parser.on('closetag',(nameRaw)=>{
               const nm=String(nameRaw).toLowerCase();
-              if(nm==='display-name'&&cur){
-                if(cur.namesRaw.length<MAX_NAMES_PER_CH){
-                  const txt=dispChunks.length?dispChunks.join(''):'';
-                  const clean=txt.trim(); if(clean)cur.namesRaw.push(clean);
+              if(nm==='display-name' && curCh){
+                if(curCh.namesRaw.length<MAX_NAMES_PER_CH){
+                  const clean=(dispChunks.join('')).trim();
+                  if(clean) curCh.namesRaw.push(clean);
                 }
                 inDisp=false; dispChunks=[]; dispLen=0; dispTruncated=false;
-              }else if(nm==='channel'&&cur){
-                const id=cur.id||'';
-                if(forceAllMex || isMexicoEntry(id,cur.namesRaw)){
+              } else if(nm==='channel' && curCh){
+                const id = curCh.id || '';
+                if(forceAllMex || isMexicoEntry(id,curCh.namesRaw)){
                   const names=new Set();
-                  for(const n of cur.namesRaw) for (const v of expandNameVariants(n)) if(v) names.add(v);
-                  for (const v of expandNameVariants(id)) if(v) names.add(v);
+                  for(const n of curCh.namesRaw) for(const v of expandNameVariants(n)) if(v) names.add(v);
+                  for(const v of expandNameVariants(id)) if(v) names.add(v);
                   const limited=[]; for(const v of names){limited.push(v); if(limited.length>=MAX_VARIANTS) break;}
                   let entry=agg.idTo.get(id);
-                  if(!entry){entry={id,names:[],tokenSet:new Set(),hasProgs:false}; agg.idTo.set(id,entry);}
+                  if(!entry){entry={id, names:[], tokenSet:new Set(), hasProgs:false}; agg.idTo.set(id,entry);}
                   entry.names=Array.from(new Set(entry.names.concat(limited))).slice(0,MAX_VARIANTS);
-                  entry.tokenSet=new Set(); for(const nm2 of entry.names) for(const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
-                  for(const n of entry.names){const k=keyOf(n); if(k&&!agg.nameMap.has(k)) agg.nameMap.set(k,entry);}
+                  entry.tokenSet = new Set(); for(const nm2 of entry.names) for(const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
+                  for(const n of entry.names){const k=keyOf(n); if(k && !agg.nameMap.has(k)) agg.nameMap.set(k,entry);}
                 }
-                cur=null; inDisp=false; dispChunks=[]; dispLen=0; dispTruncated=false;
+                curCh=null;
+              } else if(curProg){
+                if(['title','sub-title','desc','episode-num','rating','star-rating','url','language','orig-language','date','category','credits'].includes(nm)){
+                  const txt = (buf||'').trim();
+                  if(nm==='title'){ curProg.title = txt || curProg.title; }
+                  else if(nm==='sub-title'){ curProg.sub_title = txt || curProg.sub_title; }
+                  else if(nm==='desc'){ curProg.summary = txt || curProg.summary; }
+                  else if(nm==='language'){ curProg.language = txt || curProg.language; }
+                  else if(nm==='orig-language'){ curProg.orig_language = txt || curProg.orig_language; }
+                  else if(nm==='episode-num'){ curProg.episode_num_xmltv = txt || curProg.episode_num_xmltv; }
+                  else if(nm==='rating'){ curProg.rating = txt || curProg.rating; }
+                  else if(nm==='star-rating'){ curProg.star_rating = txt || curProg.star_rating; }
+                  else if(nm==='url'){ curProg.program_url = txt || curProg.program_url; }
+                  else if(nm==='category'){ if(txt) curProg.categories.push(txt); }
+                  else if(nm==='credits'){ /* if needed, parse roles from inner text later */ }
+                  buf='';
+                }
+                if(nm==='programme'){
+                  // keep only Mexico-related unless forceAllMex
+                  if(forceAllMex || containsMexicoTag(curProg.channel_raw) || containsMexicoTag(curProg.title||'')){
+                    // mark programme presence for the channel:
+                    const ent = agg.idTo.get(curProg.channel_raw) || agg.idTo.get(curProg.channel_id) || null;
+                    if(ent) ent.hasProgs = true;
+                    agg.programmes.push(curProg);
+                  }
+                  curProg=null; curField=null; buf='';
+                }
               }
             });
 
@@ -317,18 +387,19 @@ jobs:
           }
 
           async function parseAllEpg(urls){
-            const agg={idTo:new Map(),nameMap:new Map(),programmesSeen:new Set()};
-            for(const url of urls){await parseOneEpg(url,agg);}
-            for (const cid of agg.programmesSeen) {
-              const o = agg.idTo.get(cid);
-              if (o) o.hasProgs = true;
+            const agg={ idTo:new Map(), nameMap:new Map(), programmes:[] };
+            for(const url of urls){ await parseOneEpg(url,agg); }
+            // Cull channels without programmes from the matcher map
+            const keptEntries = new Set();
+            for(const [k,entry] of agg.nameMap.entries()){
+              if(entry && entry.hasProgs) { keptEntries.add(entry); }
+              else { agg.nameMap.delete(k); }
             }
-            for (const [k,v] of agg.nameMap.entries()) if (!v.hasProgs) agg.nameMap.delete(k);
-            const kept=new Set([...agg.nameMap.values()]);
-            console.log(`EPG entries kept (Mexico-related): ${kept.size}`);
-            return {nameMap:agg.nameMap, entries:[...kept]};
+            console.log(`EPG entries kept (Mexico-related): ${keptEntries.size}`);
+            return { nameMap: agg.nameMap, entries: [...keptEntries], programmes: agg.programmes };
           }
 
+          // ---------- matching ----------
           function jaccard(aTokens,bTokens){const A=new Set(aTokens),B=new Set(bTokens);let inter=0;for(const t of A)if(B.has(t))inter++;return inter/(A.size+B.size-inter||1);}
           function findMatch(channelName,nameKey,nameMap,entries){
             const exact=nameMap.get(nameKey); if(exact) return {entry:exact,score:1,method:'exact'};
@@ -342,19 +413,72 @@ jobs:
             return {entry:null,score:0,method:'none'};
           }
 
-          async function saveRows(rows){
-            if(!SUPABASE_URL||!SUPABASE_SERVICE_KEY){console.log('Supabase env missing; skipped DB upload.'); return;}
-            if(!rows.length){console.log('No rows to upload to Supabase.'); return;}
+          // ---------- DB ----------
+          async function saveRows(table, rows){
+            if(!SUPABASE_URL||!SUPABASE_SERVICE_KEY){ console.log('Supabase env missing; skipped DB upload.'); return; }
+            if(!rows.length){ console.log(`No rows to upload to Supabase (${table}).`); return; }
             const supabase=createClient(SUPABASE_URL,SUPABASE_SERVICE_KEY,{auth:{persistSession:false},db:{schema:SUPABASE_SCHEMA}});
-            let {error}=await supabase.from(SUPABASE_TABLE).upsert(rows,{onConflict:'stream_url',ignoreDuplicates:false});
-            if(error){console.warn(`Upsert failed (${error.code??'no-code'}): ${error.message}. Falling back to insert…`); ({error}=await supabase.from(SUPABASE_TABLE).insert(rows));}
-            if(error){console.warn(`Insert failed: ${error.message} (${error.code??'no-code'})`);} else {console.log(`DB write OK: ${rows.length} rows`);}
+            let { error } = await supabase.from(table).upsert(rows, { onConflict: 'stream_url', ignoreDuplicates: false });
+            if(error && table===SUPABASE_TABLE){
+              console.warn(`Upsert to ${table} failed (${error.code??'no-code'}): ${error.message}. Falling back to insert…`);
+              ({ error } = await supabase.from(table).insert(rows));
+            }
+            if(error){
+              console.warn(`Insert to ${table} failed: ${error.message} (${error.code??'no-code'})`);
+            } else {
+              console.log(`DB write OK to ${table}: ${rows.length} rows`);
+            }
           }
 
-          async function ensureDir(p){await fs.mkdir(p,{recursive:true});}
+          async function savePrograms(programs){
+            if(!SUPABASE_URL||!SUPABASE_SERVICE_KEY){ console.log('Supabase env missing; skipped EPG upload.'); return; }
+            if(!programs.length){ console.log('No programme rows to upload.'); return; }
+            // Map to your epg_programs schema
+            const rows = programs.map(p => ({
+              channel_id: p.channel_id,                // normalized (leading "Canal." stripped)
+              start_ts:   p.start_ts,                  // ISO timestamptz
+              stop_ts:    p.stop_ts,                   // ISO timestamptz
+              title:      p.title,
+              sub_title:  p.sub_title,
+              summary:    p.summary,
+              language:   p.language,
+              orig_language: p.orig_language,
+              categories: (p.categories && p.categories.length) ? p.categories : null,
+              credits:    (p.credits && Object.keys(p.credits).length)? p.credits : null,
+              episode:    p.episode,
+              episode_num_xmltv: p.episode_num_xmltv,
+              extras:     (p.extras && Object.keys(p.extras).length)? p.extras : null,
+              icon_url:   p.icon_url,
+              program_url:p.program_url,
+              rating:     p.rating ? { value: p.rating } : null,
+              star_rating:p.star_rating,
+              season:     p.season ?? null,
+              premiere:   p.premiere || false,
+              previously_shown: p.previously_shown || false,
+              ingested_at: new Date().toISOString()
+            }));
+            const supabase=createClient(SUPABASE_URL,SUPABASE_SERVICE_KEY,{auth:{persistSession:false},db:{schema:SUPABASE_SCHEMA}});
+            // Upsert on (channel_id,start_ts,title) — requires a unique index in DB (see SQL below).
+            let { error } = await supabase
+              .from(SUPABASE_EPG_TABLE)
+              .upsert(rows, { onConflict: 'channel_id,start_ts,title', ignoreDuplicates: false });
+            if(error){
+              console.warn(`Upsert to ${SUPABASE_EPG_TABLE} failed (${error.code??'no-code'}): ${error.message}. Falling back to insert…`);
+              ({ error } = await supabase.from(SUPABASE_EPG_TABLE).insert(rows));
+            }
+            if(error){
+              console.warn(`Insert to ${SUPABASE_EPG_TABLE} failed: ${error.message} (${error.code??'no-code'})`);
+            } else {
+              console.log(`DB write OK to ${SUPABASE_EPG_TABLE}: ${rows.length} rows`);
+            }
+          }
+
+          // ---------- MAIN ----------
+          async function ensureDir(p){ await fs.mkdir(p,{recursive:true}); }
+
           async function main(){
             await ensureDir('out/mx');
-            const browser=await chromium.launch({headless:HEADLESS});
+            const browser=await chromium.launch({ headless: HEADLESS });
             try{
               console.log(`Scraping: ${SEARCH_URL}`);
               const links=await collectChannelPages(browser);
@@ -362,45 +486,60 @@ jobs:
               const scraped=await scrapeAll(browser,links);
               console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-              for(const row of scraped){
-                const tested=[]; for(const s of row.streams){const ok=await probeM3U8(s.url); if(ok)tested.push(s);} row.streams=tested;
+              // Probe each stream
+              for (const row of scraped){
+                const tested=[];
+                for (const s of row.streams){
+                  const ok = await probeM3U8(s.url);
+                  if (ok) tested.push(s);
+                }
+                row.streams=tested;
               }
-              const filtered=scraped.filter(r=>r.streams.length>0);
+              const filtered = scraped.filter(r => r.streams.length>0);
               console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
 
               if(!EPG_URLS.length) throw new Error('No EPG URLs provided in MX_EPG_URLS');
-              const {nameMap,entries}=await parseAllEpg(EPG_URLS);
+              const { nameMap, entries, programmes } = await parseAllEpg(EPG_URLS);
 
+              // Build mx_channels rows
               const records=[], matchedOnly=[];
               for(const r of filtered){
-                const {entry,method}=findMatch(r.channelName,r.channelNameKey,nameMap,entries);
+                // try to match EPG channel for reference (optional for streams table)
+                const exact=nameMap.get(r.channelNameKey);
+                const entry = exact || null;
                 for(const s of r.streams){
                   const rec={
                     stream_url:s.url,
                     channel_guess:r.channelName,
-                    epg_channel_id:entry?entry.id:null,
-                    epg_display_name:entry?(entry.names[0]||null):null,
+                    epg_channel_id: entry ? entry.id : null,
+                    epg_display_name: entry ? (entry.names[0] || null) : null,
                     working:true,
                     checked_at:new Date().toISOString()
                   };
                   records.push(rec);
-                  if(entry) matchedOnly.push({...rec,_match_method:method});
+                  if(entry) matchedOnly.push(rec);
                 }
               }
 
               console.log(`Matched with EPG: ${matchedOnly.length} stream rows (across ${filtered.length} channels).`);
               await fs.writeFile(path.join('out','mx','records.json'),JSON.stringify(records,null,2),'utf8');
               await fs.writeFile(path.join('out','mx','matches.json'),JSON.stringify(matchedOnly,null,2),'utf8');
-              if(LOG_UNMATCHED){
+              if (LOG_UNMATCHED){
                 const matchedUrls=new Set(matchedOnly.map(x=>x.stream_url));
                 const unmatched=records.filter(x=>!matchedUrls.has(x.stream_url));
                 await fs.writeFile(path.join('out','mx','unmatched.json'),JSON.stringify(unmatched,null,2),'utf8');
                 console.log(`Wrote out/mx/unmatched.json with ${unmatched.length} unmatched rows`);
               }
-              await saveRows(records);
-            } finally { await browser.close(); }
+
+              // Save to DB
+              await saveRows(SUPABASE_TABLE, records);       // streams
+              await savePrograms(programmes);                // programmes
+            } finally {
+              await browser.close();
+            }
           }
-          main().catch((e)=>{console.error(e);process.exit(1);});
+
+          main().catch((e)=>{ console.error(e); process.exit(1); });
           EOF
 
       - name: Run MX scrape & match
