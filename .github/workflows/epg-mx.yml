@@ -20,7 +20,7 @@ jobs:
         https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
-      # Recommended: M3U containing tvg-id mappings
+      # Optional, recommended: M3U containing tvg-id mappings
       M3U_URL: ${{ secrets.M3U_URL }}
 
       HEADLESS: 'true'
@@ -31,7 +31,7 @@ jobs:
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
 
-      # Program ingestion controls
+      # Programme ingestion
       INGEST_PROGRAMS: '1'
       PROGRAMS_HOURS_AHEAD: '36'
 
@@ -42,7 +42,7 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
-      # Optional NordVPN (Mexico)
+      # Optional NordVPN (Mexico). Leave empty to skip.
       NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
 
     steps:
@@ -55,6 +55,7 @@ jobs:
           node-version: '20'
 
       - name: Install Node deps (Playwright, Supabase, Saxes)
+        shell: bash
         run: |
           set -euo pipefail
           npm i --no-save playwright saxes @supabase/supabase-js
@@ -62,6 +63,7 @@ jobs:
 
       - name: Install NordVPN CLI (non-interactive)
         if: ${{ env.NORDVPN_TOKEN != '' }}
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -76,6 +78,7 @@ jobs:
 
       - name: Write non-interactive nordvpn wrapper
         if: ${{ env.NORDVPN_TOKEN != '' }}
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p scripts
@@ -94,6 +97,7 @@ jobs:
 
       - name: NordVPN login & connect (Mexico)
         if: ${{ env.NORDVPN_TOKEN != '' }}
+        shell: bash
         env:
           NORDVPN_TOKEN: ${{ env.NORDVPN_TOKEN }}
         run: |
@@ -217,7 +221,6 @@ async function fetchText(u) {
   return await r.text();
 }
 function parseXmltvToISO(s) {
-  // XMLTV time like 20250827100000 +0000  or 20250827100000 -0500  or 20250827100000
   const m = String(s).match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-]\d{4}))?$/);
   if (!m) return null;
   const [, Y,Mo,D,h,mi,se, off] = m;
@@ -401,7 +404,6 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       inDisp = true; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'programme') {
       const cid = String(tag.attributes?.channel || '');
-      // Programme ingestion is handled on closetag when we have text nodes collected
       if (cid) agg.programmeOpen = { channel: cid, attrs: tag.attributes, text: {} };
       else agg.programmeOpen = null;
     }
@@ -416,7 +418,6 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       if (chunk.length > remain) { chunk = chunk.slice(0, remain); dispTruncated = true; }
       if (chunk) { dispChunks.push(chunk); dispLen += chunk.length; }
     } else if (agg.programmeOpen) {
-      // collect simple text nodes by current tag (title, sub-title, desc, category, etc.)
       const curTag = parser.tag.name?.toLowerCase?.() || '';
       if (!curTag) return;
       const str = String(t).trim();
@@ -470,14 +471,13 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
 
       const startISO = parseXmltvToISO(attrs.start || '');
       const stopISO  = parseXmltvToISO(attrs.stop  || '');
-
       if (!startISO || !stopISO) { agg.programmeOpen = null; return; }
 
       const startMs = Date.parse(startISO);
       const stopMs  = Date.parse(stopISO);
       if (Number.isFinite(startMs) && Number.isFinite(stopMs)) {
-        if (stopMs < now - 6*3600*1000) { agg.programmeOpen = null; return; } // drop very old
-        if (startMs > ahead) { agg.programmeOpen = null; return; } // too far ahead
+        if (stopMs < now - 6*3600*1000) { agg.programmeOpen = null; return; }
+        if (startMs > ahead) { agg.programmeOpen = null; return; }
       }
 
       const textOf = (k) => (t[k]?.join(' ') || null);
@@ -507,20 +507,16 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
         ingested_at: new Date().toISOString()
       };
 
-      // Try to derive season/episode from xmltv_ns: "S.E.P/.."
       if (t['episode-num']) {
         const ns = t['episode-num'].find(x => /xmltv_ns/.test(x)) || null;
         const m = ns && ns.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
         if (m) { rec.season = Number(m[1]) + 1; rec.episode = Number(m[2]) + 1; }
       }
 
-      // Collect credits (actors, directors, etc.) if present
       const creditKeys = ['actor','director','writer','adapter','producer','composer','editor','presenter','commentator','guest'];
       const credits = {};
       for (const k of creditKeys) if (t[k]) credits[k] = Array.from(new Set(t[k]));
       rec.credits = Object.keys(credits).length ? credits : null;
-
-      // Icon child tags are ignored in streaming text capture.
 
       agg.programmeBatch.push(rec);
       if (agg.programmeBatch.length >= 500) {
@@ -542,7 +538,6 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
     gunzip.on('end', async () => {
       parser.write(decoder.decode(new Uint8Array(), { stream: false }));
       parser.close();
-      // flush any remaining programme batch
       if (INGEST_PROGRAMS && agg.programmeBatch.length) {
         await saveProgramsBatch(agg.programmeBatch);
         agg.programmeBatch = [];
@@ -555,10 +550,10 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
 
 async function parseAllEpg(urls) {
   const agg = {
-    channels: new Map(),     // id -> { id, names[], tokenSet:Set }
-    nameMap: new Map(),      // keyOf(name) -> entry
-    programmeOpen: null,     // temp holder
-    programmeBatch: []       // buffered programme rows
+    channels: new Map(),
+    nameMap: new Map(),
+    programmeOpen: null,
+    programmeBatch: []
   };
   for (const url of urls) {
     const keepAllMexFile = /_MX/i.test(url);
@@ -580,15 +575,12 @@ function findMatchByName(channelName, nameKey, nameMap, entries) {
   if (exact) return { entry: exact, score: 1, method: 'exact' };
   const sTokArr = tokensOf(channelName);
   const sTok = new Set(sTokArr);
-
-  // anchor
   if (sTok.size === 1) {
     const [only] = [...sTok];
     for (const e of entries) if (e.tokenSet && e.tokenSet.has(only)) {
       return { entry: e, score: 0.99, method: 'anchor' };
     }
   }
-  // subset
   let subsetBest = null, subsetBestSize = Infinity;
   for (const e of entries) {
     const E = e.tokenSet || new Set();
@@ -597,14 +589,12 @@ function findMatchByName(channelName, nameKey, nameMap, entries) {
     if (allIn && E.size < subsetBestSize) { subsetBest = e; subsetBestSize = E.size; }
   }
   if (subsetBest) return { entry: subsetBest, score: 0.9, method: 'subset' };
-
-  // fuzzy
   let best = null, bestScore = 0;
   for (const e of entries) for (const nm of e.names) {
     const score = jaccard(sTokArr, tokensOf(nm));
     if (score > bestScore) { bestScore = score; best = e; }
   }
-  if (best && bestScore >= FUZZY_MIN) return { entry: best, score: bestScore, method: 'fuzzy' };
+  if (best && bestScore >= FUZZY_MIN) return { entry: best, score: bestScore, method:'fuzzy' };
   return { entry: null, score: 0, method: 'none' };
 }
 
@@ -627,7 +617,6 @@ async function saveStreams(rows) {
   }
   const sb = supabaseClient();
 
-  // Try with tvg_id included first; if it fails due to missing column, retry without it.
   const tryUpsert = async (withTvgId) => {
     const payload = rows.map(r => {
       const base = {
@@ -726,9 +715,7 @@ async function main() {
     const records = [];
     const matchedOnly = [];
     for (const r of filtered) {
-      // First try M3U tvg-id (by exact URL, else by normalized name)
       const nameTvg = m3u.byNameNorm.get(r.channelNameKey) || null;
-
       const { entry, method } = findMatchByName(r.channelName, r.channelNameKey, nameMap, entries);
       for (const s of r.streams) {
         const urlTvg = m3u.byUrl.get(s.url) || null;
@@ -762,7 +749,6 @@ async function main() {
 
     await saveStreams(records);
 
-    // Optional programme sample artifact (useful for quick sanity)
     if (INGEST_PROGRAMS) {
       await fs.writeFile(path.join('out','mx','epg_programs_sample.json'),
         JSON.stringify({ note: 'programs inserted directly to DB in batches; this is just a stub artifact' }, null, 2),
@@ -778,10 +764,14 @@ main().catch((e) => { console.error(e); process.exit(1); });
 EOF
 
       - name: Run MX scrape & match
-        run: node scripts/mx-scrape-and-match.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/mx-scrape-and-match.mjs
 
       - name: NordVPN disconnect
         if: always()
+        shell: bash
         run: |
           set -euo pipefail
           if command -v nordvpn >/dev/null 2>&1; then
