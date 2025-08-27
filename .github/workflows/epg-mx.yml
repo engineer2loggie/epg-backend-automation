@@ -29,11 +29,11 @@ jobs:
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
       SUPABASE_SCHEMA: public
-      SUPABASE_TABLE: mx_channels          # streams table (already in your DB)
-      PROGRAMS_TABLE: epg_programs         # programs table (already in your DB)
+      SUPABASE_TABLE: mx_channels          # streams table
+      PROGRAMS_TABLE: epg_programs         # programs table
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      # Optional: NordVPN token; if omitted, scraper runs without VPN
+      # Optional: provide to use VPN
       NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
 
     steps:
@@ -52,12 +52,9 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Install NordVPN CLI (non-interactive)
+        if: ${{ env.NORDVPN_TOKEN != '' }}
         run: |
           set -euo pipefail
-          if [ -z "${NORDVPN_TOKEN:-}" ]; then
-            echo "NORDVPN_TOKEN not set — skipping VPN installation."
-            exit 0
-          fi
           sudo apt-get update
           sudo apt-get install -y curl gnupg expect
           curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
@@ -69,7 +66,7 @@ jobs:
           sudo systemctl enable --now nordvpnd || true
 
       - name: Write non-interactive nordvpn wrapper
-        if: env.NORDVPN_TOKEN != ''
+        if: ${{ env.NORDVPN_TOKEN != '' }}
         run: |
           set -euo pipefail
           mkdir -p scripts
@@ -87,7 +84,7 @@ jobs:
           chmod +x scripts/nordvpn.exp
 
       - name: NordVPN login & connect (Mexico)
-        if: env.NORDVPN_TOKEN != ''
+        if: ${{ env.NORDVPN_TOKEN != '' }}
         run: |
           set -euo pipefail
           scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
@@ -103,6 +100,15 @@ jobs:
             fi
             sleep 2
           done
+
+      - name: Write scraper script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scripts out/mx
+          cat > scripts/mx-scrape-and-match.mjs <<'EOF'
+          // PASTE YOUR FULL JS SCRAPER HERE (the complete, working version)
+          EOF
 
       - name: Run MX scrape & match
         run: node scripts/mx-scrape-and-match.mjs
