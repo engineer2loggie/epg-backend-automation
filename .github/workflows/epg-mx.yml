@@ -16,11 +16,14 @@ jobs:
 
     env:
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
+      # Three smaller EPGs parsed in one run (space-separated via folded scalar):
       MX_EPG_URLS: >-
         https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
-      MX_M3U_URL: ''
+      # M3U with tvg-id mapping (recommended)
+      M3U_URL: ${{ secrets.M3U_URL }}
+
       HEADLESS: 'true'
       MAX_CHANNELS: '0'
       PER_PAGE_DELAY_MS: '150'
@@ -28,13 +31,19 @@ jobs:
       PROBE_TIMEOUT_MS: '5000'
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
+
+      # Program ingestion controls
       INGEST_PROGRAMS: '1'
       PROGRAMS_HOURS_AHEAD: '36'
+
+      # Supabase
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       PROGRAMS_TABLE: epg_programs
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      # Optional NordVPN (Mexico)
       NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
 
     steps:
@@ -86,6 +95,8 @@ jobs:
 
       - name: NordVPN login & connect (Mexico)
         if: ${{ env.NORDVPN_TOKEN != '' }}
+        env:
+          NORDVPN_TOKEN: ${{ env.NORDVPN_TOKEN }}
         run: |
           set -euo pipefail
           scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
@@ -108,13 +119,7 @@ jobs:
           set -euo pipefail
           mkdir -p scripts out/mx
           cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-          // minimal sanity script to verify YAML structure; replace with full scraper once this runs
-          console.log('Scraping:', process.env.MX_SEARCH_URL || '(missing)');
-          console.log('EPG URLs:', (process.env.MX_EPG_URLS || '').split(/\s+/).filter(Boolean));
-          import('node:fs/promises').then(fs => fs.writeFile('out/mx/records.json', '[]'));
-          import('node:fs/promises').then(fs => fs.writeFile('out/mx/matches.json', '[]'));
-          import('node:fs/promises').then(fs => fs.writeFile('out/mx/unmatched.json', '[]'));
-          import('node:fs/promises').then(fs => fs.writeFile('out/mx/epg_programs_sample.json', '[]'));
+          (paste script from next block here)
           EOF
 
       - name: Run MX scrape & match
