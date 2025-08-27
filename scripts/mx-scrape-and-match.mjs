@@ -81,19 +81,21 @@ function containsMexicoTag(s){
 function uniqBy(arr,keyFn){ const m=new Map(); for(const x of arr){const k=keyFn(x); if(!m.has(k)) m.set(k,x);} return [...m.values()]; }
 
 // ---------- scraping ----------
+// Replace your existing parseAllEpg with this
 async function parseAllEpg(urls, sb) {
   const keptEntries = new Map(); // id -> { id, names[], tokenSet:Set }
   const nameMap = new Map();     // keyOf(name) -> entry
   const keptIds = new Set();     // channel ids we keep
 
-  // program batching
+  // (Optional) batch insert into epg_programs if you pass a Supabase client
+  const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE || 'epg_programs';
   const BATCH_SIZE = 500;
   let batch = [];
   const nowIso = new Date().toISOString();
 
   async function flushBatch() {
     if (!batch.length) return;
-    if (!sb) { batch = []; return; } // no DB creds => skip
+    if (!sb) { batch = []; return; }
     const { error } = await sb.from(PROGRAMS_TABLE).insert(batch);
     if (error) {
       console.warn(`Insert programs failed: ${error.message} (${error.code ?? 'no-code'})`);
@@ -124,7 +126,7 @@ async function parseAllEpg(urls, sb) {
     let inChDisp = false, chDispChunks = [], chDispLen = 0;
     const MAX_NAME_CHARS = 1024, MAX_NAMES_PER_CH = 24, MAX_VARIANTS = 64;
 
-    // program state
+    // programme state
     let inProg = false;
     let prog = null;
     let inTitle=false, inSub=false, inDesc=false, inCat=false, inLang=false, inOrigLang=false, inUrl=false, inEpNum=false, inRating=false, inRatingVal=false, inStar=false, inStarVal=false, inCredits=false;
@@ -316,7 +318,7 @@ async function parseAllEpg(urls, sb) {
   console.log(`EPG channels kept (Mexico-related): ${kept.size}`);
   return { nameMap, entries: [...kept] };
 }
-}
+
 
 // ---------- matching ----------
 function jaccard(aTokens,bTokens){ const A=new Set(aTokens), B=new Set(bTokens); let inter=0; for(const t of A) if(B.has(t)) inter++; return inter/(A.size+B.size-inter||1); }
