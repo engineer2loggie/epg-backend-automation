@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl gnupg expect
+          sudo apt-get install -y curl gnupg expect timeout
           curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/nordvpn-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/nordvpn-archive-keyring.gpg] https://repo.nordvpn.com/deb/nordvpn/debian stable main" \
@@ -100,17 +100,32 @@ jobs:
           scripts/nordvpn.exp set technology nordlynx
           scripts/nordvpn.exp set firewall off
           
-          echo "Connecting to NordVPN..."
-          scripts/nordvpn.exp connect Mexico
-          
-          echo "Verifying connection..."
-          sleep 5 # Give the connection a moment to stabilize
-          
-          if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
-            echo "NordVPN connection successful and verified."
-          else
-            echo "NordVPN connection failed."
-            scripts/nordvpn.exp status # Print final status for debugging
+          MAX_ATTEMPTS=3
+          CONNECTED=false
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "--- Attempt $i of $MAX_ATTEMPTS to connect to NordVPN ---"
+            
+            CONNECT_ARGS="connect Mexico"
+            if [ "$i" -gt 1 ]; then
+              CONNECT_ARGS="connect --group P2P Mexico"
+            fi
+
+            timeout 90s scripts/nordvpn.exp $CONNECT_ARGS || true
+            
+            if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
+              echo "NordVPN connection successful and verified."
+              CONNECTED=true
+              break
+            else
+              echo "Attempt $i failed. Retrying in 10 seconds..."
+              scripts/nordvpn.exp disconnect || true
+              sleep 10
+            fi
+          done
+
+          if [ "$CONNECTED" = "false" ]; then
+            echo "All attempts to connect to NordVPN failed."
+            scripts/nordvpn.exp status
             exit 1
           fi
 
