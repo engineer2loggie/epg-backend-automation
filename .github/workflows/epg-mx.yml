@@ -45,13 +45,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm' # This now works because of package-lock.json
+          cache: 'npm'
 
       - name: Install Dependencies
         shell: bash
         run: |
           set -euo pipefail
-          npm install # Reads package.json and installs dependencies
+          npm install
           npx playwright install --with-deps chromium
 
       - name: Install NordVPN CLI (non-interactive)
@@ -113,8 +113,6 @@ jobs:
             scripts/nordvpn.exp status # Print final status for debugging
             exit 1
           fi
-            sleep 2
-          done
 
       - name: Run MX scrape & match
         shell: bash
