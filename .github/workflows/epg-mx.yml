@@ -60,7 +60,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl gnupg expect timeout
+          # FIX: Removed 'timeout' as it's part of coreutils and not a separate package
+          sudo apt-get install -y curl gnupg expect
           curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/nordvpn-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/nordvpn-archive-keyring.gpg] https://repo.nordvpn.com/deb/nordvpn/debian stable main" \
@@ -110,6 +111,7 @@ jobs:
               CONNECT_ARGS="connect --group P2P Mexico"
             fi
 
+            # The 'timeout' command is available by default, no install needed
             timeout 90s scripts/nordvpn.exp $CONNECT_ARGS || true
             
             if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
