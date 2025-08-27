@@ -1,7 +1,7 @@
 name: EPG-MX
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
     - cron: '0 7 * * *' # daily 07:00 UTC
 
@@ -28,8 +28,6 @@ jobs:
       PROBE_TIMEOUT_MS: '5000'
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
-
-      # Supabase target: public.mx_channels
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -60,7 +58,7 @@ jobs:
 // Stream-parse multiple EPG XML.GZ files safely (no giant strings).
 // Keep channels whose id OR any display-name contains "mexico" or "mx" (anywhere).
 // Match channels and insert into Supabase public.mx_channels:
-//   stream_url, channel_name, epg_channel_id, epg_display_name, working, checked_at
+//    stream_url, channel_name, epg_channel_id, epg_display_name, working, checked_at
 
 import { chromium } from 'playwright';
 import { createGunzip } from 'node:zlib';
