@@ -4,7 +4,10 @@
   "type": "module",
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
-    "xml2js": "^0.6.2"
+    "playwright": "^1.45.3",
+    "saxes": "^6.0.0"
   },
-  "scripts": {}
+  "scripts": {
+    "start": "node scripts/mx-scrape-and-match.mjs"
+  }
 }
