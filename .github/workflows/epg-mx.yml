@@ -16,6 +16,7 @@ jobs:
 
     env:
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
+      # Three smaller EPG files (space-separated). Parser will read all of them.
       MX_EPG_URLS: >-
         https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz
@@ -28,7 +29,7 @@ jobs:
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
 
-      # Supabase (public.mx_channels)
+      # Supabase target: public.mx_channels
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -129,7 +130,7 @@ function expandNameVariants(s){
 function containsMexicoTag(s){
   const t=stripAccents(String(s).toLowerCase()).replace(/[^a-z0-9]+/g,' ').trim();
   const parts=t.split(/\s+/);
-  return parts.includes('mexico')||parts.includes('mx');
+  return parts.includes('mexico')||parts.includes('mx')||/\.mx\b/i.test(String(s));
 }
 function uniqBy(arr,keyFn){const m=new Map();for(const x of arr){const k=keyFn(x);if(!m.has(k))m.set(k,x);}return[...m.values()];}
 
@@ -201,6 +202,7 @@ function isMexicoEntry(id,names){
   for(const n of (names||[])) if(containsMexicoTag(n)) return true;
   return false;
 }
+
 async function parseOneEpg(url,agg){
   console.log(`Downloading EPG (stream)… ${url}`);
   const res=await fetch(url);
@@ -219,8 +221,8 @@ async function parseOneEpg(url,agg){
     else if(nm==='programme'){const cid=tag.attributes?.channel; if(cid) agg.programmesSeen.add(String(cid));}
   });
   parser.on('text',(t)=>{
-    if(!inDisp||!cur||!t||dispTruncated)return;
-    let chunk=String(t); if(chunk.length>MAX_NAME_CHARS)chunk=chunk.slice(0,MAX_NAME_CHARS);
+    if(!inDisp||!cur||!t||dispTruncated) return;
+    let chunk=String(t); if(chunk.length>MAX_NAME_CHARS) chunk=chunk.slice(0,MAX_NAME_CHARS);
     const remain=MAX_NAME_CHARS-dispLen; if(remain<=0){dispTruncated=true;return;}
     if(chunk.length>remain){chunk=chunk.slice(0,remain);dispTruncated=true;}
     if(chunk){dispChunks.push(chunk);dispLen+=chunk.length;}
@@ -232,15 +234,16 @@ async function parseOneEpg(url,agg){
         const txt=dispChunks.length?dispChunks.join(''):'';
         const clean=txt.trim(); if(clean)cur.namesRaw.push(clean);
       }
-      inDisp=false;dispChunks=[];dispLen=0;dispTruncated=false;
+      inDisp=false; dispChunks=[]; dispLen=0; dispTruncated=false;
     }else if(nm==='channel'&&cur){
       const id=cur.id||'';
       if(isMexicoEntry(id,cur.namesRaw)){
         const names=new Set();
-        for(const n of cur.namesRaw)for(const v of expandNameVariants(n))if(v)names.add(v);
-        for(const v of expandNameVariants(id))if(v)names.add(v);
-        const limited=[]; for(const v of names){limited.push(v); if(limited.length>=MAX_VARIANTS)break;}
-        let entry=agg.idTo.get(id); if(!entry){entry={id,names:[],tokenSet:new Set(),hasProgs:false}; agg.idTo.set(id,entry);}
+        for(const n of cur.namesRaw) for(const v of expandNameVariants(n)) if(v) names.add(v);
+        for(const v of expandNameVariants(id)) if(v) names.add(v);
+        const limited=[]; for(const v of names){limited.push(v); if(limited.length>=MAX_VARIANTS) break;}
+        let entry=agg.idTo.get(id);
+        if(!entry){entry={id,names:[],tokenSet:new Set(),hasProgs:false}; agg.idTo.set(id,entry);}
         entry.names=Array.from(new Set(entry.names.concat(limited))).slice(0,MAX_VARIANTS);
         entry.tokenSet=new Set(); for(const nm2 of entry.names) for(const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
         for(const n of entry.names){const k=keyOf(n); if(k&&!agg.nameMap.has(k)) agg.nameMap.set(k,entry);}
@@ -249,16 +252,18 @@ async function parseOneEpg(url,agg){
     }
   });
   await new Promise((resolve,reject)=>{
-    src.on('error',reject); gunzip.on('error',reject);
-    gunzip.on('data',(chunk)=>{const text=decoder.decode(chunk,{stream:true}); if(text)parser.write(text);});
+    src.on('error',reject);
+    gunzip.on('error',reject);
+    gunzip.on('data',(chunk)=>{const text=decoder.decode(chunk,{stream:true}); if(text) parser.write(text);});
     gunzip.on('end',()=>{parser.write(decoder.decode(new Uint8Array(),{stream:false})); parser.close(); resolve();});
     src.pipe(gunzip);
   });
 }
+
 async function parseAllEpg(urls){
   const agg={idTo:new Map(),nameMap:new Map(),programmesSeen:new Set()};
   for(const url of urls){await parseOneEpg(url,agg);}
-  // NOTE: Do NOT require programmesPresent; keep all Mexico-tagged channels
+  // Keep all Mexico-tagged channels (do NOT require programme presence)
   const kept=new Set([...agg.nameMap.values()]);
   console.log(`EPG entries kept (Mexico-related): ${kept.size}`);
   return {nameMap:agg.nameMap, entries:[...kept]};
