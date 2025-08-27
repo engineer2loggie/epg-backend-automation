@@ -270,41 +270,59 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
 
   let cur = null, inDisp = false, dispChunks = [], dispLen = 0, dispTruncated = false;
 
+  // NEW: maintain our own open-tag stack
+  const tagStack = [];
+
   parser.on('error', (e) => { throw e; });
 
   parser.on('opentag', (tag) => {
     const nm = String(tag.name).toLowerCase();
+    tagStack.push(nm);
+
     if (nm === 'channel') {
       cur = { id: tag.attributes?.id ? String(tag.attributes.id) : '', namesRaw: [] };
     } else if (nm === 'display-name' && cur) {
       inDisp = true; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'programme') {
       const cid = String(tag.attributes?.channel || '');
-      if (cid) agg.programmeOpen = { channel: cid, attrs: tag.attributes, text: {} };
-      else agg.programmeOpen = null;
+      if (cid) {
+        agg.programmeOpen = { channel: cid, attrs: tag.attributes, text: {} };
+      } else {
+        agg.programmeOpen = null;
+      }
     }
   });
 
   parser.on('text', (t) => {
-    if (inDisp && cur && t && !dispTruncated) {
-      let chunk = String(t);
+    const raw = String(t);
+    if (!raw) return;
+
+    // Collect channel display-name text
+    if (inDisp && cur && !dispTruncated) {
+      let chunk = raw;
       if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
       const remain = MAX_NAME_CHARS - dispLen;
       if (remain <= 0) { dispTruncated = true; return; }
       if (chunk.length > remain) { chunk = chunk.slice(0, remain); dispTruncated = true; }
       if (chunk) { dispChunks.push(chunk); dispLen += chunk.length; }
-    } else if (agg.programmeOpen) {
-      const curTag = parser.tag.name?.toLowerCase?.() || '';
-      if (!curTag) return;
-      const str = String(t).trim();
-      if (!str) return;
-      if (!agg.programmeOpen.text[curTag]) agg.programmeOpen.text[curTag] = [];
-      agg.programmeOpen.text[curTag].push(str);
+      return;
     }
+
+    // Collect programme child-text safely using the tag stack
+    if (!agg.programmeOpen) return;
+    const curTag = tagStack.length ? tagStack[tagStack.length - 1] : '';
+    if (!curTag || curTag === 'programme') return; // ignore whitespace directly inside <programme>
+
+    const str = raw.trim();
+    if (!str) return;
+
+    if (!agg.programmeOpen.text[curTag]) agg.programmeOpen.text[curTag] = [];
+    agg.programmeOpen.text[curTag].push(str);
   });
 
   parser.on('closetag', async (nameRaw) => {
     const nm = String(nameRaw).toLowerCase();
+
     if (nm === 'display-name' && cur) {
       if (cur.namesRaw.length < MAX_NAMES_PER_CH) {
         const txt = dispChunks.length ? dispChunks.join('') : '';
@@ -333,81 +351,89 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       }
       cur = null; inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'programme' && agg.programmeOpen) {
-      if (!INGEST_PROGRAMS) { agg.programmeOpen = null; return; }
+      if (!INGEST_PROGRAMS) { agg.programmeOpen = null; }
+      else {
+        const cid = agg.programmeOpen.channel;
+        const entry = agg.channels.get(cid);
+        const keep = keepAllMexFile ? true : (entry ? isMexicoEntry(entry.id, entry.names) : containsMexicoTag(cid));
+        if (keep) {
+          const attrs = agg.programmeOpen.attrs || {};
+          const t = agg.programmeOpen.text || {};
+          const now = Date.now();
+          const ahead = now + PROGRAMS_HOURS_AHEAD * 3600 * 1000;
 
-      const cid = agg.programmeOpen.channel;
-      const entry = agg.channels.get(cid);
-      const keep = keepAllMexFile ? true : (entry ? isMexicoEntry(entry.id, entry.names) : containsMexicoTag(cid));
-      if (!keep) { agg.programmeOpen = null; return; }
+          const startISO = parseXmltvToISO(attrs.start || '');
+          const stopISO  = parseXmltvToISO(attrs.stop  || '');
+          if (startISO && stopISO) {
+            const startMs = Date.parse(startISO);
+            const stopMs  = Date.parse(stopISO);
+            // time-window filter (avoid huge writes)
+            if (!(Number.isFinite(startMs) && Number.isFinite(stopMs) &&
+                  (stopMs < now - 6*3600*1000 || startMs > ahead))) {
 
-      const attrs = agg.programmeOpen.attrs || {};
-      const t = agg.programmeOpen.text || {};
-      const now = Date.now();
-      const ahead = now + PROGRAMS_HOURS_AHEAD * 3600 * 1000;
+              const textOf = (k) => (t[k]?.join(' ') || null);
+              const arrOf  = (k) => (t[k] ? Array.from(new Set(t[k])) : null);
 
-      const startISO = parseXmltvToISO(attrs.start || '');
-      const stopISO  = parseXmltvToISO(attrs.stop  || '');
-      if (!startISO || !stopISO) { agg.programmeOpen = null; return; }
+              const rec = {
+                channel_id: cid,
+                title: textOf('title'),
+                sub_title: textOf('sub-title'),
+                summary: textOf('desc'),
+                start_ts: startISO,
+                stop_ts: stopISO,
+                categories: arrOf('category'),
+                icon_url: null,
+                rating: t['rating'] ? { text: t['rating'].join(' ') } : null,
+                star_rating: textOf('star-rating'),
+                program_url: textOf('url'),
+                episode_num_xmltv: textOf('episode-num'),
+                season: null,
+                episode: null,
+                language: textOf('language'),
+                orig_language: textOf('orig-language'),
+                credits: null,
+                premiere: !!t['premiere'],
+                previously_shown: !!t['previously-shown'],
+                extras: null,
+                ingested_at: new Date().toISOString()
+              };
 
-      const startMs = Date.parse(startISO);
-      const stopMs  = Date.parse(stopISO);
-      if (Number.isFinite(startMs) && Number.isFinite(stopMs)) {
-        if (stopMs < now - 6*3600*1000) { agg.programmeOpen = null; return; }
-        if (startMs > ahead) { agg.programmeOpen = null; return; }
+              if (t['episode-num']) {
+                const ns = t['episode-num'].find(x => /xmltv_ns/.test(x)) || null;
+                const m = ns && ns.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+                if (m) { rec.season = Number(m[1]) + 1; rec.episode = Number(m[2]) + 1; }
+              }
+
+              const creditKeys = ['actor','director','writer','adapter','producer','composer','editor','presenter','commentator','guest'];
+              const credits = {};
+              for (const k of creditKeys) if (t[k]) credits[k] = Array.from(new Set(t[k]));
+              rec.credits = Object.keys(credits).length ? credits : null;
+
+              agg.programmeBatch.push(rec);
+              if (agg.programmeBatch.length >= 500) {
+                await saveProgramsBatch(agg.programmeBatch);
+                agg.programmeBatch = [];
+              }
+            }
+          }
+        }
+        agg.programmeOpen = null;
       }
+    }
 
-      const textOf = (k) => (t[k]?.join(' ') || null);
-      const arrOf  = (k) => (t[k] ? Array.from(new Set(t[k])) : null);
-
-      const rec = {
-        channel_id: cid,
-        title: textOf('title'),
-        sub_title: textOf('sub-title'),
-        summary: textOf('desc'),
-        start_ts: startISO,
-        stop_ts: stopISO,
-        categories: arrOf('category'),
-        icon_url: null,
-        rating: t['rating'] ? { text: t['rating'].join(' ') } : null,
-        star_rating: textOf('star-rating'),
-        program_url: textOf('url'),
-        episode_num_xmltv: textOf('episode-num'),
-        season: null,
-        episode: null,
-        language: textOf('language'),
-        orig_language: textOf('orig-language'),
-        credits: null,
-        premiere: !!t['premiere'],
-        previously_shown: !!t['previously-shown'],
-        extras: null,
-        ingested_at: new Date().toISOString()
-      };
-
-      if (t['episode-num']) {
-        const ns = t['episode-num'].find(x => /xmltv_ns/.test(x)) || null;
-        const m = ns && ns.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
-        if (m) { rec.season = Number(m[1]) + 1; rec.episode = Number(m[2]) + 1; }
-      }
-
-      const creditKeys = ['actor','director','writer','adapter','producer','composer','editor','presenter','commentator','guest'];
-      const credits = {};
-      for (const k of creditKeys) if (t[k]) credits[k] = Array.from(new Set(t[k]));
-      rec.credits = Object.keys(credits).length ? credits : null;
-
-      agg.programmeBatch.push(rec);
-      if (agg.programmeBatch.length >= 500) {
-        await saveProgramsBatch(agg.programmeBatch);
-        agg.programmeBatch = [];
-      }
-
-      agg.programmeOpen = null;
+    // pop after handling
+    if (tagStack.length && tagStack[tagStack.length - 1] === nm) tagStack.pop();
+    else {
+      // be resilient if the stream has malformed nesting
+      const idx = tagStack.lastIndexOf(nm);
+      if (idx >= 0) tagStack.splice(idx, 1);
     }
   });
 
   await new Promise((resolve, reject) => {
     src.on('error', reject);
     gunzip.on('error', reject);
-    gunzip.on('data', async (chunk) => {
+    gunzip.on('data', (chunk) => {
       const text = decoder.decode(chunk, { stream: true });
       if (text) parser.write(text);
     });
