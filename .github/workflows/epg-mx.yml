@@ -15,9 +15,11 @@ jobs:
     timeout-minutes: 300
 
     env:
-      # Scraper
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
-      MX_EPG_URLS: "https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz"
+      MX_EPG_URLS: >-
+        https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz
+        https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz
+        https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz
       HEADLESS: 'true'
       MAX_CHANNELS: '0'
       PER_PAGE_DELAY_MS: '150'
@@ -26,18 +28,11 @@ jobs:
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
 
-      # Supabase table: public.mx_channels (has NOT NULL channel_name)
+      # Supabase (public.mx_channels)
       SUPABASE_SCHEMA: public
       SUPABASE_TABLE: mx_channels
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-
-      # Optional VPN (set to '1' and add secrets)
-      NORD_ENABLE: '0'
-      NORD_COUNTRY_PREFIX: mx
-      NORD_PROTOCOL: udp
-      NORD_USERNAME: ${{ secrets.NORD_USERNAME }}
-      NORD_PASSWORD: ${{ secrets.NORD_PASSWORD }}
 
     steps:
       - name: Checkout
@@ -50,43 +45,9 @@ jobs:
 
       - name: Install runtime deps
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           npm i --no-save playwright saxes @supabase/supabase-js
           npx playwright install --with-deps chromium
-
-      - name: Connect NordVPN (OpenVPN) [optional]
-        if: ${{ env.NORD_ENABLE == '1' }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y openvpn unzip curl
-          BASE=""
-          for b in ovpn_legacy ovpn; do
-            URL="https://downloads.nordcdn.com/configs/files/${b}/servers/ovpn.zip"
-            if curl -fsI "$URL" >/dev/null; then
-              BASE="$b"
-              curl -fsSLO "$URL"
-              break
-            fi
-          done
-          if [ -z "$BASE" ]; then
-            echo "Could not find NordVPN ovpn.zip (legacy or new path)"; exit 1
-          fi
-          rm -rf ovpn
-          mkdir -p ovpn
-          unzip -q ovpn.zip -d ovpn
-          PATTERN="${NORD_COUNTRY_PREFIX:-mx}*.${NORD_PROTOCOL:-udp}.ovpn"
-          CONF="$(find ovpn -type f -name "$PATTERN" | head -n 1 || true)"
-          if [ -z "$CONF" ]; then
-            echo "No config found for pattern: $PATTERN"; ls -R ovpn; exit 1
-          fi
-          echo "Using OpenVPN config: $CONF"
-          printf "%s\n%s\n" "${NORD_USERNAME}" "${NORD_PASSWORD}" > cred.txt
-          chmod 600 cred.txt
-          sudo openvpn --config "$CONF" --auth-user-pass cred.txt --daemon --log /tmp/openvpn.log
-          timeout 90 bash -c 'until grep -q "Initialization Sequence Completed" /tmp/openvpn.log; do sleep 1; done'
-          echo "Exit IP: $(curl -s https://ifconfig.co)"
-          echo "Exit country: $(curl -s https://ifconfig.co/country)"
 
       - name: Write scraper
         shell: bash
@@ -297,8 +258,7 @@ async function parseOneEpg(url,agg){
 async function parseAllEpg(urls){
   const agg={idTo:new Map(),nameMap:new Map(),programmesSeen:new Set()};
   for(const url of urls){await parseOneEpg(url,agg);}
-  for(const cid of agg.programmesSeen){const o=agg.idTo.get(cid); if(o)o.hasProgs=true;}
-  for(const [k,v] of agg.nameMap.entries()) if(!v.hasProgs) agg.nameMap.delete(k);
+  // NOTE: Do NOT require programmesPresent; keep all Mexico-tagged channels
   const kept=new Set([...agg.nameMap.values()]);
   console.log(`EPG entries kept (Mexico-related): ${kept.size}`);
   return {nameMap:agg.nameMap, entries:[...kept]};
@@ -344,9 +304,8 @@ async function main(){
     }
     const filtered=scraped.filter(r=>r.streams.length>0);
     console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
-    const urls=EPG_URLS.length?EPG_URLS:[];
-    if(!urls.length) throw new Error('No EPG URLs provided in MX_EPG_URLS');
-    const {nameMap,entries}=await parseAllEpg(urls);
+    if(!EPG_URLS.length) throw new Error('No EPG URLs provided in MX_EPG_URLS');
+    const {nameMap,entries}=await parseAllEpg(EPG_URLS);
     const records=[], matchedOnly=[];
     for(const r of filtered){
       const {entry,method}=findMatch(r.channelName,r.channelNameKey,nameMap,entries);
@@ -373,10 +332,6 @@ EOF
 
       - name: Run MX scrape & match
         run: node scripts/mx-scrape-and-match.mjs
-
-      - name: Disconnect VPN
-        if: ${{ always() && env.NORD_ENABLE == '1' }}
-        run: sudo killall openvpn || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
