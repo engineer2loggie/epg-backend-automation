@@ -32,9 +32,9 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
-      # Optional VPN (OpenVPN to NordVPN). Set to '1' to enable.
-      NORD_ENABLE: '1'
-      NORD_SERVER: mx123.nordvpn.com
+      # Optional VPN (OpenVPN to NordVPN). Set NORD_ENABLE='1' to enable.
+      NORD_ENABLE: '0'
+      NORD_COUNTRY_PREFIX: mx
       NORD_PROTOCOL: udp
       NORD_USERNAME: ${{ secrets.NORD_USERNAME }}
       NORD_PASSWORD: ${{ secrets.NORD_PASSWORD }}
@@ -59,14 +59,41 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y openvpn curl
-          CFG_URL="https://downloads.nordcdn.com/configs/files/ovpn_legacy/servers/${NORD_SERVER}.${NORD_PROTOCOL}.ovpn"
-          curl -fsSL "$CFG_URL" -o nord.ovpn
+          sudo apt-get install -y openvpn unzip curl
+          # Try legacy first, then new path
+          BASE=""
+          for b in ovpn_legacy ovpn; do
+            URL="https://downloads.nordcdn.com/configs/files/${b}/servers/ovpn.zip"
+            if curl -fsI "$URL" >/dev/null; then
+              BASE="$b"
+              curl -fsSLO "$URL"
+              break
+            fi
+          done
+          if [ -z "$BASE" ]; then
+            echo "Could not find NordVPN ovpn.zip (legacy or new path)"; exit 1
+          fi
+
+          rm -rf ovpn
+          mkdir -p ovpn
+          unzip -q ovpn.zip -d ovpn
+
+          # Pick a Mexico server config: mx*.udp.ovpn (or tcp if you change NORD_PROTOCOL)
+          PATTERN="${NORD_COUNTRY_PREFIX:-mx}*.${NORD_PROTOCOL:-udp}.ovpn"
+          CONF="$(find ovpn -type f -name "$PATTERN" | head -n 1 || true)"
+          if [ -z "$CONF" ]; then
+            echo "No config found for pattern: $PATTERN"; ls -R ovpn; exit 1
+          fi
+          echo "Using OpenVPN config: $CONF"
+
           printf "%s\n%s\n" "${NORD_USERNAME}" "${NORD_PASSWORD}" > cred.txt
           chmod 600 cred.txt
-          sudo openvpn --config nord.ovpn --auth-user-pass cred.txt --daemon --log /tmp/openvpn.log
-          timeout 60 bash -c 'until grep -q "Initialization Sequence Completed" /tmp/openvpn.log; do sleep 1; done'
-          echo "Exit country:"; curl -s https://ifconfig.co/country; echo
+
+          sudo openvpn --config "$CONF" --auth-user-pass cred.txt --daemon --log /tmp/openvpn.log
+          # Wait up to 90s until the tunnel is established
+          timeout 90 bash -c 'until grep -q "Initialization Sequence Completed" /tmp/openvpn.log; do sleep 1; done'
+          echo "Exit IP: $(curl -s https://ifconfig.co)"
+          echo "Exit country: $(curl -s https://ifconfig.co/country)"
 
       - name: Run MX scrape & match
         run: node scripts/mx-scrape-and-match.mjs
