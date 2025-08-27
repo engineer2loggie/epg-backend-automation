@@ -16,7 +16,7 @@ jobs:
 
     env:
       MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
-      # Three smaller EPGs parsed in one run (space-separated by folded scalar):
+      # Three smaller EPGs parsed in one run (space-separated via folded scalar):
       MX_EPG_URLS: >-
         https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz
         https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz
@@ -29,10 +29,12 @@ jobs:
       FUZZY_MIN: '0.45'
       LOG_UNMATCHED: '1'
       SUPABASE_SCHEMA: public
-      SUPABASE_TABLE: mx_channels          # streams table
-      PROGRAMS_TABLE: epg_programs         # programs table
+      SUPABASE_TABLE: mx_channels          # streams table (already in your DB)
+      PROGRAMS_TABLE: epg_programs         # programs table (already in your DB)
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # Optional: NordVPN token; if omitted, scraper runs without VPN
+      NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
 
     steps:
       - name: Checkout
@@ -43,15 +45,19 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Node deps (Playwright, Supabase, SAX)
+      - name: Install Node deps (Playwright, Supabase, Saxes)
         run: |
           set -euo pipefail
-          npm i --no-save playwright sax @supabase/supabase-js
+          npm i --no-save playwright saxes @supabase/supabase-js
           npx playwright install --with-deps chromium
 
       - name: Install NordVPN CLI (non-interactive)
         run: |
           set -euo pipefail
+          if [ -z "${NORDVPN_TOKEN:-}" ]; then
+            echo "NORDVPN_TOKEN not set — skipping VPN installation."
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install -y curl gnupg expect
           curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
@@ -63,6 +69,7 @@ jobs:
           sudo systemctl enable --now nordvpnd || true
 
       - name: Write non-interactive nordvpn wrapper
+        if: env.NORDVPN_TOKEN != ''
         run: |
           set -euo pipefail
           mkdir -p scripts
@@ -80,39 +87,22 @@ jobs:
           chmod +x scripts/nordvpn.exp
 
       - name: NordVPN login & connect (Mexico)
-        env:
-          NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
+        if: env.NORDVPN_TOKEN != ''
         run: |
           set -euo pipefail
-          if [ -z "${NORDVPN_TOKEN:-}" ]; then
-            echo "NORDVPN_TOKEN secret is missing — skipping VPN connect (will use runner IP)." >&2
-          else
-            scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
-            scripts/nordvpn.exp set analytics off
-            scripts/nordvpn.exp set technology nordlynx
-            scripts/nordvpn.exp set firewall off
-            scripts/nordvpn.exp set killswitch off
-            scripts/nordvpn.exp connect Mexico
-            for i in $(seq 1 30); do
-              if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
-                echo "NordVPN connected (Mexico)."
-                break
-              fi
-              sleep 2
-            done
-          fi
-
-      - name: Write scraper script
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p scripts out/mx
-          cat > scripts/mx-scrape-and-match.mjs <<'EOF'
-// Scraper + EPG parser (SAX). Uploads streams to mx_channels, programs to epg_programs.
-// (Code omitted here for brevity in this message — use the full script I sent previously.)
-console.log("Placeholder: replace with the full JS from my previous message.");
-process.exit(0);
-EOF
+          scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
+          scripts/nordvpn.exp set analytics off
+          scripts/nordvpn.exp set technology nordlynx
+          scripts/nordvpn.exp set firewall off
+          scripts/nordvpn.exp set killswitch off
+          scripts/nordvpn.exp connect Mexico
+          for i in $(seq 1 30); do
+            if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
+              echo "NordVPN connected (Mexico)."
+              break
+            fi
+            sleep 2
+          done
 
       - name: Run MX scrape & match
         run: node scripts/mx-scrape-and-match.mjs
@@ -121,8 +111,10 @@ EOF
         if: always()
         run: |
           set -euo pipefail
-          sudo nordvpn disconnect || true
-          sudo nordvpn status || true
+          if command -v nordvpn >/dev/null 2>&1; then
+            sudo nordvpn disconnect || true
+            sudo nordvpn status || true
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
