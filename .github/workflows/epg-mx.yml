@@ -89,17 +89,30 @@ jobs:
           chmod +x scripts/nordvpn.exp
 
       - name: NordVPN login & connect (Mexico)
-        # ...
+        if: ${{ env.NORDVPN_TOKEN != '' }}
+        shell: bash
+        env:
+          NORDVPN_TOKEN: ${{ env.NORDVPN_TOKEN }}
         run: |
           set -euo pipefail
           scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
           scripts/nordvpn.exp set analytics off
           scripts/nordvpn.exp set technology nordlynx
           scripts/nordvpn.exp set firewall off
-          # scripts/nordvpn.exp set killswitch off # <-- REMOVE THIS LINE
+          
+          echo "Connecting to NordVPN..."
           scripts/nordvpn.exp connect Mexico
-              break
-            fi
+          
+          echo "Verifying connection..."
+          sleep 5 # Give the connection a moment to stabilize
+          
+          if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
+            echo "NordVPN connection successful and verified."
+          else
+            echo "NordVPN connection failed."
+            scripts/nordvpn.exp status # Print final status for debugging
+            exit 1
+          fi
             sleep 2
           done
 
