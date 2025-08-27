@@ -1,7 +1,6 @@
-// Scrape iptv-org for MX channels, pull .m3u8s, probe them,
-// stream-parse THREE smaller EPG XML.GZ files safely,
-// match channels (exact/anchor/subset/fuzzy), write artifacts,
-// and insert into Supabase public.mx_channels:
+// Scrape iptv-org MX channels, pull .m3u8s, probe, stream-parse 3 EPG gz files safely,
+// match (exact/anchor/subset/fuzzy) favoring Mexico/MX, write artifacts,
+// and insert into Supabase public.mx_channels with columns:
 //   stream_url, channel_guess, epg_channel_id, epg_display_name, working, checked_at
 
 import { chromium } from 'playwright';
@@ -15,14 +14,17 @@ import { SaxesParser } from 'saxes';
 
 // ---------- ENV ----------
 const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
-const EPG_SOURCES =
-  (process.env.EPG_SOURCES &&
-    process.env.EPG_SOURCES.split(',').map(s => s.trim()).filter(Boolean)) ||
-  [
+const EPG_URLS = (() => {
+  const envMulti = (process.env.MX_EPG_URLS || '').trim();
+  if (envMulti) return envMulti.split(/\s+/).filter(Boolean);
+  const single = (process.env.MX_EPG_URL || '').trim();
+  if (single) return [single];
+  return [
     'https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz',
     'https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS2.xml.gz',
     'https://epgshare01.online/epgshare01/epg_ripper_MX1.xml.gz',
   ];
+})();
 
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
 const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0'); // 0 = unlimited
@@ -32,9 +34,7 @@ const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '5000');
 
 const FUZZY_MIN = Number(process.env.FUZZY_MIN || '0.45');
 const LOG_UNMATCHED = process.env.LOG_UNMATCHED === '1';
-const EPG_REQUIRE_PROGS = (process.env.EPG_REQUIRE_PROGS || '0') === '1'; // keep channels only if they have any <programme>
 
-// Supabase
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
@@ -56,9 +56,8 @@ function dropTimeshift(s) {
     .trim();
 }
 function stripLeadingCanal(s) { return String(s).replace(/^\s*canal[\s._-]+/i, ''); }
-function stripCountryTag(s) {
-  return String(s).replace(/(\.(mx|us)|\s+\(?mx\)?|\s+m[eé]xico|\s+usa|\s+eeuu)\s*$/i,'').trim();
-}
+function stripCountryTag(s) { return String(s).replace(/(\.(mx|us)|\s+\(?mx\)?|\s+m[eé]xico|\s+usa|\s+eeuu)\s*$/i,'').trim(); }
+
 const STOP = new Set(['canal','tv','television','hd','sd','mx','mexico','méxico','hora','horas','us','usa','eeuu']);
 function tokensOf(s) {
   if (!s) return [];
@@ -185,156 +184,133 @@ async function probeM3U8(url) {
     if (!r.ok) return false;
     const txt = await r.text();
     return txt.includes('#EXTM3U');
-  } catch { return false; }
-  finally { clearTimeout(t); }
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
-// ---------- EPG STREAM PARSE (three files) ----------
-function mexicoish(id, names) {
-  if (/\.mx\b/i.test(id)) return true;
-  return names.some(n => /méxico|mexico|\bmx\b/i.test(String(n)));
+// ---------- STREAM-PARSE EPG (multi-file, Mexico-related only) ----------
+function isMexicoEntryByText(text) {
+  const t = stripAccents(String(text).toLowerCase());
+  return /\bmexico\b/.test(t) || /(^|[.\s-])mx($|[.\s-])/.test(t);
+}
+function isMexicoEntry(id, names) {
+  const joined = `${id || ''} ${Array.isArray(names) ? names.join(' ') : ''}`;
+  return isMexicoEntryByText(joined);
 }
 
-async function parseManyEpgStreams(epgUrls, scrapedTokenUniverse) {
-  const globalIdTo = new Map();   // id -> entry
-  const nameMap = new Map();      // normalized name key -> entry
+async function parseOneEpgUrl(url, accum) {
+  console.log(`Downloading EPG (stream)… ${url}`);
+  const res = await fetch(url);
+  if (!res.ok || !res.body) throw new Error(`Fetch failed ${res.status} ${url}`);
 
-  for (const url of epgUrls) {
-    console.log(`Downloading EPG (stream)… ${url}`);
-    const res = await fetch(url);
-    if (!res.ok || !res.body) { console.warn(`Fetch failed ${res.status} ${url}`); continue; }
+  const gunzip = createGunzip();
+  const src = Readable.fromWeb(res.body);
+  const decoder = new TextDecoder('utf-8');
+  const parser = new SaxesParser({ xmlns: false });
 
-    const gunzip = createGunzip();
-    const src = Readable.fromWeb(res.body);
-    const decoder = new TextDecoder('utf-8');
-    const parser = new SaxesParser({ xmlns: false });
+  let cur = null;
+  let inDisp = false;
+  let dispChunks = [];
+  let dispLen = 0;
+  let dispTruncated = false;
 
-    // caps
-    const MAX_NAME_CHARS = 512;
-    const MAX_NAMES_PER_CH = 24;
-    const MAX_VARIANTS = 64;
+  const MAX_NAME_CHARS = 1024;
+  const MAX_NAMES_PER_CH = 24;
+  const MAX_VARIANTS = 64;
 
-    const programmesSeen = new Set();
+  parser.on('error', (e) => { throw e; });
 
-    // channel state
-    let cur = null; // { id, namesRaw:[] }
-    let inDisp = false;
-    let dispChunks = [];
-    let dispLen = 0;
-    let dispTruncated = false;
-
-    parser.on('error', (e) => { throw e; });
-
-    parser.on('opentag', (tag) => {
-      const nm = String(tag.name).toLowerCase();
-      if (nm === 'channel') {
-        cur = { id: tag.attributes?.id ? String(tag.attributes.id) : '', namesRaw: [] };
-      } else if (nm === 'display-name' && cur) {
-        inDisp = true; dispChunks = []; dispLen = 0; dispTruncated = false;
-      } else if (nm === 'programme') {
-        const cid = tag.attributes?.channel;
-        if (cid) programmesSeen.add(String(cid));
-      }
-    });
-
-    parser.on('text', (t) => {
-      // bounded <display-name> accumulation
-      if (!inDisp || !cur || !t || dispTruncated) return;
-      let chunk = String(t);
-      if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
-      const remain = MAX_NAME_CHARS - dispLen;
-      if (remain <= 0) { dispTruncated = true; return; }
-      if (chunk.length > remain) { chunk = chunk.slice(0, remain); dispTruncated = true; }
-      if (chunk) { dispChunks.push(chunk); dispLen += chunk.length; }
-    });
-
-    parser.on('closetag', (nameRaw) => {
-      const nm = String(nameRaw).toLowerCase();
-      if (nm === 'display-name' && cur) {
-        if (cur.namesRaw.length < MAX_NAMES_PER_CH) {
-          const txt = dispChunks.length ? dispChunks.join('') : '';
-          const clean = txt.trim();
-          if (clean) cur.namesRaw.push(clean);
-        }
-        inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
-      } else if (nm === 'channel' && cur) {
-        const id = cur.id || '';
-        // keep only Mexico-related channels, and intersect tokens with scraped universe to shrink set
-        const mex = mexicoish(id, cur.namesRaw);
-        if (mex) {
-          // Build variants & tokens
-          const names = new Set();
-          for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
-          for (const v of expandNameVariants(id)) if (v) names.add(v);
-
-          // check token intersection
-          let intersects = false;
-          const tokenSet = new Set();
-          for (const nm2 of names) for (const tok of tokensOf(nm2)) {
-            tokenSet.add(tok);
-            if (!intersects && scrapedTokenUniverse.has(tok)) intersects = true;
-          }
-
-          if (intersects) {
-            const existing = globalIdTo.get(id);
-            if (!existing) {
-              const entry = { id, names: [], tokenSet, hasProgs: false };
-              // clip variants
-              for (const v of names) { entry.names.push(v); if (entry.names.length >= MAX_VARIANTS) break; }
-              globalIdTo.set(id, entry);
-              for (const n of entry.names) {
-                const k = keyOf(n);
-                if (k && !nameMap.has(k)) nameMap.set(k, entry);
-              }
-            } else {
-              // merge tokens/names
-              for (const v of names) if (existing.names.length < MAX_VARIANTS && !existing.names.includes(v)) existing.names.push(v);
-              for (const tok of tokenSet) existing.tokenSet.add(tok);
-              for (const n of names) {
-                const k = keyOf(n);
-                if (k && !nameMap.has(k)) nameMap.set(k, existing);
-              }
-            }
-          }
-        }
-        // reset channel state
-        cur = null; inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
-      }
-    });
-
-    await new Promise((resolve, reject) => {
-      src.on('error', reject);
-      gunzip.on('error', reject);
-      gunzip.on('data', (chunk) => {
-        const text = decoder.decode(chunk, { stream: true });
-        if (text) parser.write(text);
-      });
-      gunzip.on('end', () => {
-        parser.write(decoder.decode(new Uint8Array(), { stream: false }));
-        parser.close();
-        resolve();
-      });
-      src.pipe(gunzip);
-    });
-
-    // mark programme presence
-    for (const cid of programmesSeen) {
-      const o = globalIdTo.get(cid);
-      if (o) o.hasProgs = true;
+  parser.on('opentag', (tag) => {
+    const nm = String(tag.name).toLowerCase();
+    if (nm === 'channel') {
+      cur = { id: tag.attributes?.id ? String(tag.attributes.id) : '', namesRaw: [] };
+    } else if (nm === 'display-name' && cur) {
+      inDisp = true; dispChunks = []; dispLen = 0; dispTruncated = false;
+    } else if (nm === 'programme') {
+      const cid = tag.attributes?.channel;
+      if (cid) accum.programmesSeen.add(String(cid));
     }
-  }
+  });
 
-  // optionally filter out channels with no programmes in any file
-  if (EPG_REQUIRE_PROGS) {
-    for (const [k, v] of nameMap.entries()) {
-      const entry = v && v.id ? v : null;
-      if (!entry || !entry.hasProgs) nameMap.delete(k);
+  parser.on('text', (t) => {
+    if (!inDisp || !cur || !t || dispTruncated) return;
+    let chunk = String(t);
+    if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
+    const remain = MAX_NAME_CHARS - dispLen;
+    if (remain <= 0) { dispTruncated = true; return; }
+    if (chunk.length > remain) { chunk = chunk.slice(0, remain); dispTruncated = true; }
+    if (chunk) { dispChunks.push(chunk); dispLen += chunk.length; }
+  });
+
+  parser.on('closetag', (nameRaw) => {
+    const nm = String(nameRaw).toLowerCase();
+    if (nm === 'display-name' && cur) {
+      if (cur.namesRaw.length < MAX_NAMES_PER_CH) {
+        const txt = dispChunks.length ? dispChunks.join('') : '';
+        const clean = txt.trim();
+        if (clean) cur.namesRaw.push(clean);
+      }
+      inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
+    } else if (nm === 'channel' && cur) {
+      const id = cur.id || '';
+      if (isMexicoEntry(id, cur.namesRaw)) {
+        const names = new Set();
+        for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
+        for (const v of expandNameVariants(id)) if (v) names.add(v);
+        const limitedNames = [];
+        for (const v of names) { limitedNames.push(v); if (limitedNames.length >= MAX_VARIANTS) break; }
+
+        let entry = accum.idTo.get(id);
+        if (!entry) {
+          entry = { id, names: [], tokenSet: new Set(), hasProgs: false };
+          accum.idTo.set(id, entry);
+        }
+        for (const v of limitedNames) {
+          if (!entry.names.includes(v)) entry.names.push(v);
+          for (const tok of tokensOf(v)) entry.tokenSet.add(tok);
+          const k = keyOf(v);
+          if (k && !accum.nameMap.has(k)) accum.nameMap.set(k, entry);
+        }
+      }
+      cur = null; inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     }
-  }
+  });
 
-  const kept = new Set([...nameMap.values()]).size;
-  console.log(`EPG channels kept (Mexico-related ∩ scraped tokens): ${kept}`);
-  return { nameMap, entries: [...new Set([...nameMap.values()])] };
+  await new Promise((resolve, reject) => {
+    src.on('error', reject);
+    gunzip.on('error', reject);
+    gunzip.on('data', (chunk) => {
+      const text = decoder.decode(chunk, { stream: true });
+      if (text) parser.write(text);
+    });
+    gunzip.on('end', () => {
+      parser.write(decoder.decode(new Uint8Array(), { stream: false }));
+      parser.close();
+      resolve();
+    });
+    src.pipe(gunzip);
+  });
+}
+
+async function parseEpgStreams(urls) {
+  const accum = {
+    idTo: new Map(),
+    nameMap: new Map(),
+    programmesSeen: new Set()
+  };
+  for (const u of urls) await parseOneEpgUrl(u, accum);
+
+  for (const cid of accum.programmesSeen) {
+    const o = accum.idTo.get(cid);
+    if (o) o.hasProgs = true;
+  }
+  for (const [k, v] of accum.nameMap.entries()) if (!v.hasProgs) accum.nameMap.delete(k);
+
+  console.log(`EPG entries kept (Mexico-related): ${new Set([...accum.nameMap.values()]).size}`);
+  return { nameMap: accum.nameMap, entries: [...new Set([...accum.nameMap.values()])] };
 }
 
 // ---------- MATCH ----------
@@ -351,7 +327,6 @@ function findMatch(channelName, nameKey, nameMap, entries) {
   const sTokArr = tokensOf(channelName);
   const sTok = new Set(sTokArr);
 
-  // anchor: single strong token
   if (sTok.size === 1) {
     const [only] = [...sTok];
     for (const e of entries) if (e.tokenSet && e.tokenSet.has(only)) {
@@ -359,7 +334,6 @@ function findMatch(channelName, nameKey, nameMap, entries) {
     }
   }
 
-  // subset: all scraped tokens within entry tokens; prefer smallest vocabulary
   let subsetBest = null, subsetBestSize = Infinity;
   for (const e of entries) {
     const E = e.tokenSet || new Set();
@@ -369,7 +343,6 @@ function findMatch(channelName, nameKey, nameMap, entries) {
   }
   if (subsetBest) return { entry: subsetBest, score: 0.9, method: 'subset' };
 
-  // fuzzy Jaccard
   let best = null, bestScore = 0;
   for (const e of entries) for (const nm of e.names) {
     const score = jaccard(sTokArr, tokensOf(nm));
@@ -394,7 +367,6 @@ async function saveRows(rows) {
     db: { schema: SUPABASE_SCHEMA }
   });
 
-  // upsert by stream_url; fall back to insert if constraint missing
   let { error } = await supabase.from(SUPABASE_TABLE).upsert(rows, {
     onConflict: 'stream_url',
     ignoreDuplicates: false
@@ -403,8 +375,11 @@ async function saveRows(rows) {
     console.warn(`Upsert failed (${error.code ?? 'no-code'}): ${error.message}. Falling back to insert…`);
     ({ error } = await supabase.from(SUPABASE_TABLE).insert(rows));
   }
-  if (error) console.warn(`Insert failed: ${error.message} (${error.code ?? 'no-code'})`);
-  else console.log(`DB write OK: ${rows.length} rows`);
+  if (error) {
+    console.warn(`Insert failed: ${error.message} (${error.code ?? 'no-code'})`);
+  } else {
+    console.log(`DB write OK: ${rows.length} rows`);
+  }
 }
 
 // ---------- MAIN ----------
@@ -420,7 +395,6 @@ async function main() {
     const scraped = await scrapeAll(browser, links);
     console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-    // probe streams
     for (const row of scraped) {
       const tested = [];
       for (const s of row.streams) {
@@ -432,11 +406,7 @@ async function main() {
     const filtered = scraped.filter(r => r.streams.length > 0);
     console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
 
-    // build scraped token universe (for pruning EPG)
-    const scrapedTokenUniverse = new Set();
-    for (const r of filtered) for (const t of tokensOf(r.channelName)) scrapedTokenUniverse.add(t);
-
-    const { nameMap, entries } = await parseManyEpgStreams(EPG_SOURCES, scrapedTokenUniverse);
+    const { nameMap, entries } = await parseEpgStreams(EPG_URLS);
 
     const records = [];
     const matchedOnly = [];
@@ -452,7 +422,8 @@ async function main() {
           checked_at: new Date().toISOString()
         };
         records.push(rec);
-        if (entry) matchedOnly.push({ ...rec, _match_method: method });      }
+        if (entry) matchedOnly.push({ ...rec, _match_method: method });
+      }
     }
 
     console.log(`Matched with EPG: ${matchedOnly.length} stream rows (across ${filtered.length} channels).`);
