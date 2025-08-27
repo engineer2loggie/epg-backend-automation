@@ -37,6 +37,9 @@ const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mx_channels';
 const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE || 'epg_programs';
 
+const EPG_RETRIES = 3;
+const EPG_RETRY_DELAY_MS = 2000;
+
 // ---------- NORMALIZATION ----------
 function stripAccents(s) { return String(s).normalize('NFD').replace(/\p{Diacritic}+/gu, ''); }
 function normalizeNumerals(s) {
@@ -91,9 +94,35 @@ function uniqBy(arr, keyFn) {
 }
 
 // ---------- UTILS ----------
+async function retryFetch(url, options = {}, retries = EPG_RETRIES, delayMs = EPG_RETRY_DELAY_MS) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const r = await fetch(url, options);
+            if (!r.ok) throw new Error(`Fetch failed ${r.status} for ${url}`);
+            return r;
+        } catch (e) {
+            if (i === retries - 1) throw e;
+            console.warn(`Fetch failed for ${url}, retrying in ${delayMs}ms... (${i + 1}/${retries})`);
+            await delay(delayMs);
+        }
+    }
+}
+async function promiseAllWithConcurrency(concurrency, items, asyncFn) {
+    const results = [];
+    const queue = [...items];
+    const workers = Array(concurrency).fill(null).map(async () => {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (item) {
+                results.push(await asyncFn(item));
+            }
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
 async function fetchText(u) {
-  const r = await fetch(u);
-  if (!r.ok) throw new Error(`Fetch failed ${r.status} ${u}`);
+  const r = await retryFetch(u);
   return await r.text();
 }
 function parseXmltvToISO(s) {
@@ -220,19 +249,21 @@ async function scrapeChannel(browser, link) {
 }
 
 async function scrapeAll(browser, links) {
-  const out = [];
-  for (const lnk of links) {
-    const streams = await scrapeChannel(browser, lnk);
-    if (streams.length) {
-      out.push({
-        channelName: lnk.name,
-        channelNameKey: lnk.nameKey,
-        streams
-      });
-    }
-    await delay(PER_PAGE_DELAY_MS);
-  }
-  return out;
+    const SCRAPE_CONCURRENCY = 10;
+    const results = await promiseAllWithConcurrency(
+        SCRAPE_CONCURRENCY,
+        links,
+        async (link) => {
+            const streams = await scrapeChannel(browser, link);
+            await delay(PER_PAGE_DELAY_MS); // still delay to be gentle
+            return {
+                channelName: link.name,
+                channelNameKey: link.nameKey,
+                streams
+            };
+        }
+    );
+    return results.filter(r => r.streams.length > 0);
 }
 
 async function probeM3U8(url) {
@@ -258,7 +289,7 @@ function isMexicoEntry(id, names) {
 
 async function parseOneEpg(url, agg, keepAllMexFile) {
   console.log(`Downloading EPG (stream)… ${url}`);
-  const res = await fetch(url);
+  const res = await retryFetch(url); // Use retry fetch
   if (!res.ok || !res.body) throw new Error(`Fetch failed ${res.status} ${url}`);
 
   const gunzip = createGunzip();
@@ -269,8 +300,6 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
   const MAX_NAME_CHARS = 1024, MAX_NAMES_PER_CH = 24, MAX_VARIANTS = 64;
 
   let cur = null, inDisp = false, dispChunks = [], dispLen = 0, dispTruncated = false;
-
-  // NEW: maintain our own open-tag stack
   const tagStack = [];
 
   parser.on('error', (e) => { throw e; });
@@ -297,7 +326,6 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
     const raw = String(t);
     if (!raw) return;
 
-    // Collect channel display-name text
     if (inDisp && cur && !dispTruncated) {
       let chunk = raw;
       if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
@@ -308,10 +336,9 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       return;
     }
 
-    // Collect programme child-text safely using the tag stack
     if (!agg.programmeOpen) return;
     const curTag = tagStack.length ? tagStack[tagStack.length - 1] : '';
-    if (!curTag || curTag === 'programme') return; // ignore whitespace directly inside <programme>
+    if (!curTag || curTag === 'programme') return;
 
     const str = raw.trim();
     if (!str) return;
@@ -367,9 +394,8 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
           if (startISO && stopISO) {
             const startMs = Date.parse(startISO);
             const stopMs  = Date.parse(stopISO);
-            // time-window filter (avoid huge writes)
             if (!(Number.isFinite(startMs) && Number.isFinite(stopMs) &&
-                  (stopMs < now - 6*3600*1000 || startMs > ahead))) {
+                (stopMs < now - 6*3600*1000 || startMs > ahead))) {
 
               const textOf = (k) => (t[k]?.join(' ') || null);
               const arrOf  = (k) => (t[k] ? Array.from(new Set(t[k])) : null);
@@ -421,10 +447,8 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       }
     }
 
-    // pop after handling
     if (tagStack.length && tagStack[tagStack.length - 1] === nm) tagStack.pop();
     else {
-      // be resilient if the stream has malformed nesting
       const idx = tagStack.lastIndexOf(nm);
       if (idx >= 0) tagStack.splice(idx, 1);
     }
@@ -457,10 +481,18 @@ async function parseAllEpg(urls) {
     programmeOpen: null,
     programmeBatch: []
   };
+  let successfulFiles = 0;
   for (const url of urls) {
-    const keepAllMexFile = /_MX/i.test(url);
-    await parseOneEpg(url, agg, keepAllMexFile);
+      try {
+          const keepAllMexFile = /_MX/i.test(url);
+          await parseOneEpg(url, agg, keepAllMexFile);
+          successfulFiles++;
+      } catch (e) {
+          console.warn(`Failed to parse EPG file: ${url}. Reason: ${e.message}. Skipping.`);
+      }
   }
+
+  console.log(`EPG files parsed OK: ${successfulFiles}/${urls.length}`);
   const kept = new Set([...agg.nameMap.values()]);
   console.log(`EPG entries kept (Mexico-related): ${kept.size}`);
   return { nameMap: agg.nameMap, entries: [...kept] };
@@ -577,8 +609,13 @@ async function saveProgramsBatch(batch) {
     extras: x.extras,
     ingested_at: x.ingested_at
   }));
-  const { error } = await sb.from(PROGRAMS_TABLE).insert(payload);
-  if (error) console.warn(`Programs insert failed: ${error.message} (${error.code ?? 'no-code'})`);
+  
+  // *** CRITICAL FIX: Use upsert with onConflict instead of insert ***
+  const { error } = await sb
+    .from(PROGRAMS_TABLE)
+    .upsert(payload, { onConflict: 'channel_id, start_ts' });
+
+  if (error) console.warn(`Programs upsert failed: ${error.message} (${error.code ?? 'no-code'})`);
 }
 
 // ---------- MAIN ----------
@@ -600,16 +637,26 @@ async function main() {
     const scraped = await scrapeAll(browser, links);
     console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-    // probe streams
-    for (const row of scraped) {
-      const tested = [];
-      for (const s of row.streams) {
-        const ok = await probeM3U8(s.url);
-        if (ok) tested.push(s);
-      }
-      row.streams = tested;
-    }
-    const filtered = scraped.filter(r => r.streams.length > 0);
+    // *** PERFORMANCE: Probe all streams in parallel ***
+    const allStreams = scraped.flatMap(ch => ch.streams.map(s => s.url));
+    const uniqueStreams = [...new Set(allStreams)];
+    console.log(`Probing ${uniqueStreams.length} unique streams in parallel...`);
+    
+    const probeResults = await promiseAllWithConcurrency(
+        50, // Concurrency limit for probing
+        uniqueStreams,
+        async (url) => ({ url, isWorking: await probeM3U8(url) })
+    );
+
+    const workingUrls = new Set(probeResults.filter(r => r.isWorking).map(r => r.url));
+    console.log(`Found ${workingUrls.size} working streams.`);
+    
+    // Filter channels and their streams based on probe results
+    const filtered = scraped.map(ch => ({
+        ...ch,
+        streams: ch.streams.filter(s => workingUrls.has(s.url))
+    })).filter(ch => ch.streams.length > 0);
+
     console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
 
     const { nameMap, entries } = await parseAllEpg(EPG_URLS);
