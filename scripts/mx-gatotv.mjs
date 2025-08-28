@@ -7,7 +7,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 import { DateTime } from 'luxon';
-import { load as loadHTML } from 'cheerio';
 
 // ---------- ENV ----------
 const GATOTV_DIR_URL = process.env.GATOTV_DIR_URL || 'https://www.gatotv.com/canales_de_tv';
@@ -33,73 +32,95 @@ async function fetchHtml(url) {
   return await r.text();
 }
 
-// Extract ALL /canal/... anchors from the directory page — NO REGEX, Cheerio only
+/**
+ * Extract ALL /canal/... anchors from the directory page WITHOUT REGEX LITERALS.
+ * We scan for href="..." and pull inner text between the current position and the next </a>.
+ */
 function extractDirectoryChannels(html) {
-  const $ = loadHTML(html);
   const out = [];
   const seen = new Set();
+  let i = 0;
 
-  $('a[href^="/canal/"]').each((_, a) => {
-    const rel = $(a).attr('href');
-    const name = $(a).text().replace(/\s+/g, ' ').trim();
-    if (!rel || !name) return;
-    const url = new URL(rel, GATOTV_DIR_URL).href;
-    if (seen.has(url)) return;
-    seen.add(url);
-    out.push({ name, url });
-  });
+  while (true) {
+    const hrefPos = html.indexOf('href="', i);
+    if (hrefPos === -1) break;
+    const urlStart = hrefPos + 6; // past href="
+    const urlEnd = html.indexOf('"', urlStart);
+    if (urlEnd === -1) break;
 
-  // Also catch absolute links if any (rare)
-  $('a[href*="/canal/"]').each((_, a) => {
-    const href = $(a).attr('href') || '';
-    try {
-      const u = new URL(href, GATOTV_DIR_URL).href;
-      if (!u.includes('/canal/')) return;
-      const name = $(a).text().replace(/\s+/g, ' ').trim();
-      if (!name || seen.has(u)) return;
-      seen.add(u);
-      out.push({ name, url: u });
-    } catch { /* ignore bad hrefs */ }
-  });
+    const href = html.slice(urlStart, urlEnd);
+    i = urlEnd + 1;
 
+    // Keep only links that contain /canal/
+    if (!href || !href.includes('/canal/')) continue;
+
+    // Find the <a ...> that contains this href and its closing </a>
+    const aOpenStart = html.lastIndexOf('<a', hrefPos);
+    if (aOpenStart === -1) continue;
+    const aCloseEnd = html.indexOf('</a>', urlEnd);
+    if (aCloseEnd === -1) continue;
+
+    // Extract inner text for this anchor
+    const innerRaw = html.slice(urlEnd + 1, aCloseEnd);
+    const name = innerRaw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!name) continue;
+
+    // Resolve to absolute URL
+    let abs;
+    try { abs = new URL(href, GATOTV_DIR_URL).href; } catch { continue; }
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+
+    out.push({ name, url: abs });
+  }
+
+  if (out.length === 0) {
+    console.warn('extractDirectoryChannels: found 0 anchors — check directory markup or blockers.');
+  }
   return out;
 }
 
-// Table-first parse: <tr> → <td> cells for start/end/title
+// Try a table-driven parse first: <tr> → <td> cells for start/end/title
 function parseScheduleTableRows(html) {
   const rows = [];
-  const $ = loadHTML(html);
-  $('tr').each((_, tr) => {
-    const tds = $(tr).find('td').toArray().map(td => cleanText($(td).html() || ''));
-    if (tds.length < 2) return;
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let m;
+  while ((m = rowRe.exec(html))) {
+    const row = m[1];
+    const tds = [];
+    const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    let k;
+    while ((k = tdRe.exec(row))) tds.push(k[1]);
+    if (tds.length < 2) continue;
 
-    const isTime = (s) => /\b\d{1,2}:\d{2}\b/.test(s);
+    // Find first two time-like cells (Hora Inicio / Hora Fin)
+    const isTime = (s) => /\b\d{1,2}:\d{2}\b/.test(cleanText(s));
     let idxStart = -1, idxEnd = -1;
     for (let i = 0; i < Math.min(4, tds.length); i++) {
       if (idxStart === -1 && isTime(tds[i])) { idxStart = i; continue; }
       if (idxStart !== -1 && idxEnd === -1 && isTime(tds[i])) { idxEnd = i; break; }
     }
-    if (idxStart === -1) return;
+    if (idxStart === -1) continue;
 
+    // Title = first non-empty text cell after the end time (or after start if no end)
     let titleIdx = -1;
     for (let i = Math.max(idxEnd, idxStart) + 1; i < tds.length; i++) {
-      const txt = tds[i];
+      const txt = cleanText(tds[i]);
       if (txt) { titleIdx = i; break; }
     }
     if (titleIdx === -1) titleIdx = tds.length - 1;
 
-    const startLocal = tds[idxStart] || '';
-    const stopLocal = idxEnd !== -1 ? (tds[idxEnd] || '') : null;
-    const title = tds[titleIdx] || '';
-    if (!startLocal || !title) return;
+    const startLocal = cleanText(tds[idxStart] || '');
+    const stopLocal = idxEnd !== -1 ? cleanText(tds[idxEnd] || '') : null;
+    const title = cleanText(tds[titleIdx] || '');
+    if (!startLocal || !title) continue;
 
     rows.push({ startLocal, stopLocal, title });
-  });
-
+  }
   return dedupeRows(rows);
 }
 
-// Fallback heuristic: keep the old robust pattern for odd pages
+// Fallback: heuristic pattern "start [- end] ... <tag>Title</tag>"
 function parseScheduleHeuristic(html) {
   const rows = [];
   const cleaned = html
@@ -234,7 +255,7 @@ async function savePrograms(programs) {
 async function main() {
   await fs.mkdir('out/mx', { recursive: true });
 
-  // 1) Directory → channel links (Cheerio)
+  // 1) Directory → channel links (no regex literals anywhere)
   const dirHtml = await fetchHtml(GATOTV_DIR_URL);
   let channels = extractDirectoryChannels(dirHtml);
   if (GATOTV_MAX_CHANNELS > 0 && channels.length > GATOTV_MAX_CHANNELS) {
@@ -263,8 +284,7 @@ async function main() {
 
     for (const r of clamped) {
       programs.push({
-        // Use the GatoTV channel page URL as the channel_id (safe for testing & SQL joins later)
-        channel_id: ch.url,
+        channel_id: ch.url, // using GatoTV URL as ID for now
         start_ts: r.start_ts,
         stop_ts: r.stop_ts,
         title: r.title,
