@@ -58,6 +58,7 @@ jobs:
       - name: Install Node deps (Playwright + libs)
         run: |
           set -euo pipefail
+          npm i --no-save playwright @supabase/supabase-js luxon cheerio
           npm i --no-save playwright @supabase/supabase-js luxon
           npx playwright install --with-deps chromium
 
