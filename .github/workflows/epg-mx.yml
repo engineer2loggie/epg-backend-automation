@@ -54,13 +54,13 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
-      - name: Install NordVPN CLI (non-interactive)
+      - name: Install NordVPN CLI
         if: ${{ env.NORDVPN_TOKEN != '' }}
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl gnupg expect
+          sudo apt-get install -y curl gnupg
           curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/nordvpn-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/nordvpn-archive-keyring.gpg] https://repo.nordvpn.com/deb/nordvpn/debian stable main" \
@@ -69,30 +69,7 @@ jobs:
           sudo apt-get install -y nordvpn
           sudo systemctl enable --now nordvpnd || true
 
-      - name: Make non-interactive nordvpn wrapper
-        if: ${{ env.NORDVPN_TOKEN != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p scripts
-          cat > scripts/nordvpn.exp <<'EXP'
-          #!/usr/bin/expect -f
-          # FIX: Increased internal timeout for connection stability
-          set timeout 90 
-          if {$argc < 1} { exit 2 }
-          spawn sudo nordvpn {*}$argv
-          expect {
-            -re "(?i)You are connected"      { exp_continue }
-            -re "(?i)Do you allow.*\\(y/n\\)" { send -- "no\r"; exp_continue }
-            -re "(?i)answer with yes/no"     { send -- "no\r"; exp_continue }
-            # FIX: Added an explicit timeout action to prevent hangs
-            timeout                          { exit 1 } 
-            eof
-          }
-          exit 0
-          EXP
-          chmod +x scripts/nordvpn.exp
-
+      # FIX: Replaced expect script and complex loop with a more robust background process handler
       - name: Connect VPN and Run Scraper
         if: ${{ env.NORDVPN_TOKEN != '' }}
         shell: bash
@@ -100,39 +77,29 @@ jobs:
           NORDVPN_TOKEN: ${{ env.NORDVPN_TOKEN }}
         run: |
           set -euo pipefail
-          scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
-          scripts/nordvpn.exp set analytics off
-          scripts/nordvpn.exp set technology nordlynx
-          scripts/nordvpn.exp set firewall off
+          sudo nordvpn login --token "$NORDVPN_TOKEN" --no-tty
+          sudo nordvpn set analytics off --no-tty
+          sudo nordvpn set technology nordlynx --no-tty
           
-          MAX_ATTEMPTS=3
-          CONNECTED=false
-          for i in $(seq 1 $MAX_ATTEMPTS); do
-            echo "--- Attempt $i of $MAX_ATTEMPTS to connect to NordVPN ---"
-            CONNECT_ARGS="connect Mexico"
-            if [ "$i" -gt 1 ]; then
-              CONNECT_ARGS="connect --group P2P Mexico"
+          echo "--- Starting NordVPN connection in the background ---"
+          sudo nordvpn connect Mexico --no-tty &
+          
+          echo "--- Waiting for connection to establish ---"
+          WAIT_SECONDS=90
+          ELAPSED=0
+          while ! sudo nordvpn status --no-tty | grep -qi "Status: Connected"; do
+            if [ $ELAPSED -ge $WAIT_SECONDS ]; then
+              echo "Failed to connect to NordVPN within $WAIT_SECONDS seconds."
+              sudo nordvpn status --no-tty
+              exit 1
             fi
-            
-            # The expect script now handles its own timeout
-            scripts/nordvpn.exp $CONNECT_ARGS
-            
-            if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
-              echo "NordVPN connection successful and verified."
-              CONNECTED=true
-              break
-            else
-              echo "Attempt $i failed. Retrying in 10 seconds..."
-              scripts/nordvpn.exp disconnect || true
-              sleep 10
-            fi
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+            echo "Still connecting... (${ELAPSED}s / ${WAIT_SECONDS}s)"
           done
-
-          if [ "$CONNECTED" = "false" ]; then
-            echo "All attempts to connect to NordVPN failed."
-            scripts/nordvpn.exp status
-            exit 1
-          fi
+          
+          echo "NordVPN connection successful and verified."
+          sudo nordvpn status --no-tty
 
           echo "--- Running scrape & match script inside VPN tunnel ---"
           npm start
@@ -150,8 +117,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "Disconnecting from NordVPN..."
-          sudo nordvpn disconnect || true
-          sudo nordvpn status || true
+          sudo nordvpn disconnect --no-tty || true
+          sudo nordvpn status --no-tty || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
