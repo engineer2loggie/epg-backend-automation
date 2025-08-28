@@ -13,14 +13,16 @@ jobs:
   mx:
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
 
     env:
       MX_SEARCH_URL: "https://iptv-org.github.io/?q=live%20country:MX"
-      # GatoTV directory root (no XMLTV fallback in this test)
       GATOTV_DIR_URL: "https://www.gatotv.com/canales_de_tv"
-      GATOTV_SCORE_MIN: "0.80"        # matcher threshold (Jaccard+brand bonus)
-      GATOTV_TZ: "America/Mexico_City" # default tz for schedule times
-      PROGRAMS_HOURS_AHEAD: "24"      # strictly 24h window
+      GATOTV_SCORE_MIN: "0.80"
+      GATOTV_TZ: "America/Mexico_City"
+      PROGRAMS_HOURS_AHEAD: "24"
       HEADLESS: "true"
       MAX_CHANNELS: "0"
       PER_PAGE_DELAY_MS: "150"
@@ -29,13 +31,107 @@ jobs:
 
       # DB
       SUPABASE_SCHEMA: "public"
-      SUPABASE_TABLE: "mx_channels"    # streams table (unchanged)
-      PROGRAMS_TABLE: "epg_programs"   # programs table
+      SUPABASE_TABLE: "mx_channels"
+      PROGRAMS_TABLE: "epg_programs"
       SUPABASE_URL: "${{ secrets.SUPABASE_URL }}"
       SUPABASE_SERVICE_KEY: "${{ secrets.SUPABASE_SERVICE_KEY }}"
 
-      # VPN (optional)
+      # Optional
       NORDVPN_TOKEN: "${{ secrets.NORDVPN_TOKEN }}"
-
-      # Optional manual URL map JSON
       GATOTV_MAPPING_URL: "${{ secrets.GATOTV_MAPPING_URL }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Node deps (Playwright + libs)
+        run: |
+          set -euo pipefail
+          npm i --no-save playwright @supabase/supabase-js luxon
+          npx playwright install --with-deps chromium
+
+      # If you need VPN for stream probing, keep these; otherwise you can remove.
+      - name: Install NordVPN CLI (only if token set)
+        if: ${{ env.NORDVPN_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg expect
+          curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/nordvpn-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/nordvpn-archive-keyring.gpg] https://repo.nordvpn.com/deb/nordvpn/debian stable main" \
+            | sudo tee /etc/apt/sources.list.d/nordvpn.list
+          sudo apt-get update
+          sudo apt-get install -y nordvpn
+          sudo systemctl enable --now nordvpnd || true
+
+      - name: Make non-interactive nordvpn wrapper
+        if: ${{ env.NORDVPN_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          cat > scripts/nordvpn.exp <<'EXP'
+          #!/usr/bin/expect -f
+          set timeout 180
+          if {$argc < 1} { exit 2 }
+          log_user 0
+          spawn -noecho sudo nordvpn {*}$argv
+          expect {
+            -re "(?i)\(y/n\)\s*$"                { send -- "n\r"; exp_continue }
+            -re "(?i)yes/no\)?\s*$"              { send -- "no\r"; exp_continue }
+            -re "(?i)Would you like.*\(y/n\)"    { send -- "n\r"; exp_continue }
+            -re "(?i)Do you allow.*\(y/n\)"      { send -- "n\r"; exp_continue }
+            -re "(?i)Status:\s*Connected"        { }
+            -re "(?i)Connected"                  { }
+            timeout                              { exit 124 }
+            eof                                  { }
+          }
+          catch wait result
+          if {[lindex $result 3] == 0} { exit 0 } else { exit [lindex $result 3] }
+          EXP
+          chmod +x scripts/nordvpn.exp
+
+      - name: Connect VPN (Mexico) if token present (for stream probes only)
+        if: ${{ env.NORDVPN_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          scripts/nordvpn.exp login --token "$NORDVPN_TOKEN" || true
+          scripts/nordvpn.exp set analytics disabled || true
+          scripts/nordvpn.exp set technology nordlynx || true
+          scripts/nordvpn.exp set firewall off || true
+          scripts/nordvpn.exp set killswitch off || true
+          attempts=5; connected=0
+          for i in $(seq 1 $attempts); do
+            echo "Attempt $i/$attempts: connecting to Mexico..."
+            timeout -k 15s 90s scripts/nordvpn.exp connect Mexico || true
+            if sudo nordvpn status | grep -qi 'Status: Connected'; then echo "VPN Connected."; connected=1; break; fi
+            echo "Retrying in 8s..."; sudo nordvpn disconnect || true; sleep 8
+          done
+          if [ "$connected" -ne 1 ]; then echo "Could not connect to VPN; proceeding WITHOUT VPN."; fi
+
+      - name: Run GatoTV-only 24h ingest
+        run: |
+          set -euo pipefail
+          node scripts/mx-gatotv.mjs
+
+      - name: NordVPN disconnect
+        if: ${{ always() && env.NORDVPN_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          sudo nordvpn disconnect || true
+          sudo nordvpn status || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-output
+          path: |
+            out/mx/gatotv_matches.json
+            out/mx/gatotv_unmatched.json
+            out/mx/epg_programs_sample.json
+          if-no-files-found: warn
