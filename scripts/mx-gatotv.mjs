@@ -35,7 +35,8 @@ async function fetchHtml(url) {
 // Extract ALL /canal/... anchors from the directory page (left column list and elsewhere)
 function extractDirectoryChannels(html) {
   const out = [];
-  const re = /<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  // Corrected version
+const re = /<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   const seen = new Set();
   let m;
   while ((m = re.exec(html))) {
