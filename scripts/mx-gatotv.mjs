@@ -35,17 +35,25 @@ async function fetchHtml(url) {
 // Extract ALL /canal/... anchors from the directory page (left column list and elsewhere)
 function extractDirectoryChannels(html) {
   const out = [];
-  // Corrected version
-const re = /<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  // Build the pattern safely using String.raw so backslashes are not double-interpreted
+  const re = new RegExp(
+    String.raw`<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>`,
+    'gi'
+  );
   const seen = new Set();
   let m;
   while ((m = re.exec(html))) {
     const rel = m[1];
-    const name = cleanText(m[2]);
+    const name = String(m[2] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const url = new URL(rel, GATOTV_DIR_URL).href;
     if (!name || seen.has(url)) continue;
     seen.add(url);
     out.push({ name, url });
+  }
+
+  // Small sanity check to help debug if the selector ever fails
+  if (out.length === 0) {
+    console.warn('extractDirectoryChannels: found 0 anchors — check directory markup or blockers.');
   }
   return out;
 }
