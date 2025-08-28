@@ -1,73 +1,41 @@
 name: EPG-MX
 
-
 on:
-workflow_dispatch: {}
-schedule:
-- cron: "0 7 * * *" # daily 07:00 UTC
-
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 7 * * *" # daily 07:00 UTC
 
 concurrency:
-group: epg-mx
-cancel-in-progress: true
-
+  group: epg-mx
+  cancel-in-progress: true
 
 jobs:
-mx:
-runs-on: ubuntu-latest
-timeout-minutes: 300
+  mx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
 
+    env:
+      MX_SEARCH_URL: "https://iptv-org.github.io/?q=live%20country:MX"
+      # GatoTV directory root (no XMLTV fallback in this test)
+      GATOTV_DIR_URL: "https://www.gatotv.com/canales_de_tv"
+      GATOTV_SCORE_MIN: "0.80"        # matcher threshold (Jaccard+brand bonus)
+      GATOTV_TZ: "America/Mexico_City" # default tz for schedule times
+      PROGRAMS_HOURS_AHEAD: "24"      # strictly 24h window
+      HEADLESS: "true"
+      MAX_CHANNELS: "0"
+      PER_PAGE_DELAY_MS: "150"
+      NAV_TIMEOUT_MS: "30000"
+      PROBE_TIMEOUT_MS: "5000"
 
-env:
-MX_SEARCH_URL: https://iptv-org.github.io/?q=live%20country:MX
-# GatoTV directory root (no XMLTV fallback in this test)
-GATOTV_DIR_URL: https://www.gatotv.com/canales_de_tv
-GATOTV_SCORE_MIN: "0.80" # matcher threshold (Jaccard+brand bonus)
-GATOTV_TZ: America/Mexico_City # default tz for schedule times
-PROGRAMS_HOURS_AHEAD: "24" # strictly 24h window
-HEADLESS: "true"
-MAX_CHANNELS: "0" # 0 = no limit (for testing you can cap to e.g. 50)
-PER_PAGE_DELAY_MS: "150"
-NAV_TIMEOUT_MS: "30000"
-PROBE_TIMEOUT_MS: "5000"
+      # DB
+      SUPABASE_SCHEMA: "public"
+      SUPABASE_TABLE: "mx_channels"    # streams table (unchanged)
+      PROGRAMS_TABLE: "epg_programs"   # programs table
+      SUPABASE_URL: "${{ secrets.SUPABASE_URL }}"
+      SUPABASE_SERVICE_KEY: "${{ secrets.SUPABASE_SERVICE_KEY }}"
 
+      # VPN (optional)
+      NORDVPN_TOKEN: "${{ secrets.NORDVPN_TOKEN }}"
 
-# DB
-SUPABASE_SCHEMA: public
-SUPABASE_TABLE: mx_channels # streams table (unchanged)
-PROGRAMS_TABLE: epg_programs # programs table
-SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-
-
-# Optional, if you want to keep VPN for stream probing step only
-NORDVPN_TOKEN: ${{ secrets.NORDVPN_TOKEN }}
-
-
-# Optional manual URL map for GatoTV (approved mappings). JSON array of objects:
-# [{ "channel_name": "Las Estrellas", "gatotv_url": "https://www.gatotv.com/canal/de_las_estrellas_mexico" }]
-GATOTV_MAPPING_URL: ${{ secrets.GATOTV_MAPPING_URL }}
-
-
- steps:
-- name: Checkout
-uses: actions/checkout@v4
-
-
-- name: Setup Node.js
-uses: actions/setup-node@v4
-with:
-node-version: "20"
-cache: 'npm'
-
-
-- name: Install Node deps (Playwright + runtime libs)
-shell: bash
-run: |
-set -euo pipefail
-npm i --no-save playwright @supabase/supabase-js saxes luxon
-npx playwright install --with-deps chromium
-
-
-- name: Install NordVPN CLI (only if token set)
-if-no-files-found: warn
+      # Optional manual URL map JSON
+      GATOTV_MAPPING_URL: "${{ secrets.GATOTV_MAPPING_URL }}"
