@@ -18,22 +18,25 @@ jobs:
         shell: bash
 
     env:
-      # Step 1: iptv-org discovery/probing
+      # Step A: iptv-org discovery/probing
       MX_SEARCH_URL: "https://iptv-org.github.io/?q=live%20country:MX"
       HEADLESS: "true"
-      MAX_CHANNELS: "0"          # 0 = no cap
+      MAX_CHANNELS: "0"            # 0 = no cap
       PER_PAGE_DELAY_MS: "150"
       NAV_TIMEOUT_MS: "30000"
-      PROBE_TIMEOUT_MS: "5000"
-      # Optional enrichment for channel_id via tvg-id
+
+      # PROBE tuning (no VPN)
+      PROBE_TIMEOUT_MS: "10000"    # 10s as requested
+      PROBE_CONCURRENCY: "10"      # be nice to CDNs; raise carefully
+      PROBE_REFERER: "https://iptv-org.github.io/"  # fallback Referer if we don't know the channel page (we do pass real page when we have it)
+      # Optional: playlist to enrich tvg-id by url/name (not required)
       M3U_URL: "${{ secrets.M3U_URL }}"
 
-      # Step 3: GatoTV matching + 24h schedules
+      # Step B: GatoTV full crawl (no matching here)
       GATOTV_DIR_URL: "https://www.gatotv.com/canales_de_tv"
-      GATOTV_SCORE_MIN: "0.80"
       GATOTV_TZ: "America/Mexico_City"
       PROGRAMS_HOURS_AHEAD: "24"
-      GATOTV_MAPPING_URL: "${{ secrets.GATOTV_MAPPING_URL }}"
+      GATOTV_MAX_CHANNELS: "0"     # 0 = all directory channels
 
       # DB
       SUPABASE_SCHEMA: "public"
@@ -41,9 +44,6 @@ jobs:
       PROGRAMS_TABLE: "epg_programs"
       SUPABASE_URL: "${{ secrets.SUPABASE_URL }}"
       SUPABASE_SERVICE_KEY: "${{ secrets.SUPABASE_SERVICE_KEY }}"
-
-      # VPN for stream probing
-      NORDVPN_TOKEN: "${{ secrets.NORDVPN_TOKEN }}"
 
     steps:
       - name: Checkout
@@ -61,47 +61,7 @@ jobs:
           npm i --no-save playwright @supabase/supabase-js luxon
           npx playwright install --with-deps chromium
 
-      - name: Install NordVPN CLI (only if token set)
-        if: ${{ env.NORDVPN_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl gnupg expect
-          curl -sSf https://repo.nordvpn.com/gpg/nordvpn_public.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/nordvpn-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/nordvpn-archive-keyring.gpg] https://repo.nordvpn.com/deb/nordvpn/debian stable main" \
-            | sudo tee /etc/apt/sources.list.d/nordvpn.list
-          sudo apt-get update
-          sudo apt-get install -y nordvpn
-          sudo systemctl enable --now nordvpnd || true
-
-      - name: Make non-interactive nordvpn wrapper
-        if: ${{ env.NORDVPN_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-          mkdir -p scripts
-          cat > scripts/nordvpn.exp <<'EXP'
-          #!/usr/bin/expect -f
-          set timeout 180
-          if {$argc < 1} { exit 2 }
-          log_user 0
-          spawn -noecho sudo nordvpn {*}$argv
-          expect {
-            -re "(?i)\\(y/n\\)\\s*$"                { send -- "n\r"; exp_continue }
-            -re "(?i)yes/no\\)?\\s*$"               { send -- "no\r"; exp_continue }
-            -re "(?i)Would you like.*\\(y/n\\)"     { send -- "n\r"; exp_continue }
-            -re "(?i)Do you allow.*\\(y/n\\)"       { send -- "n\r"; exp_continue }
-            -re "(?i)Status:\\s*Connected"          { }
-            -re "(?i)Connected"                     { }
-            timeout                                 { exit 124 }
-            eof                                     { }
-          }
-          catch wait result
-          if {[lindex $result 3] == 0} { exit 0 } else { exit [lindex $result 3] }
-          EXP
-          chmod +x scripts/nordvpn.exp
-
-      - name: Write stream discovery script (Step 1)
+      - name: Write Script A – Discover/Probe iptv-org (.m3u8) and save
         run: |
           set -euo pipefail
           mkdir -p scripts out/mx
@@ -109,6 +69,7 @@ jobs:
           import { chromium } from 'playwright';
           import fs from 'node:fs/promises';
           import path from 'node:path';
+          import { setTimeout as delay } from 'node:timers/promises';
           import { createClient } from '@supabase/supabase-js';
 
           const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
@@ -116,7 +77,10 @@ jobs:
           const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0');
           const PER_PAGE_DELAY_MS = Number(process.env.PER_PAGE_DELAY_MS || '150');
           const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || '30000');
-          const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '5000');
+
+          const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '10000');
+          const PROBE_CONCURRENCY = Number(process.env.PROBE_CONCURRENCY || '10');
+          const PROBE_REFERER = (process.env.PROBE_REFERER || '').trim();
 
           const SUPABASE_URL = process.env.SUPABASE_URL || '';
           const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -160,14 +124,12 @@ jobs:
             return out;
           }
 
-          function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
-
           async function collectChannelPages(browser){
             const page = await browser.newPage();
             page.setDefaultTimeout(NAV_TIMEOUT_MS);
             await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded' });
             await page.waitForSelector('a[href*="/channels/"]', { timeout: 15000 }).catch(()=>{});
-            await page.waitForTimeout(800);
+            await page.waitForTimeout(600);
 
             let items = await page.$$eval('a[href*="/channels/"]', as => {
               const out = [];
@@ -196,7 +158,7 @@ jobs:
               await page.goto(link.url, { waitUntil: 'domcontentloaded' });
               await page.waitForTimeout(400);
 
-              // try logo via og:image, else first <img>
+              // Basic logo (best-effort)
               const logoUrl = await page.evaluate(()=>{
                 const og = document.querySelector('meta[property="og:image"]');
                 if (og && og.content) return og.content;
@@ -204,8 +166,9 @@ jobs:
                 return img ? img.src : null;
               });
 
+              // Streams tab (if present)
               const tab = await page.$('text=Streams');
-              if (tab) { await tab.click().catch(()=>{}); await page.waitForTimeout(300); }
+              if (tab) { await tab.click().catch(()=>{}); await page.waitForTimeout(250); }
 
               let anchors = await page.$$eval('a[href*=".m3u8"]', els => els.map(e => e.href));
               if (!anchors.length) {
@@ -222,20 +185,75 @@ jobs:
               return { channelName: link.name, channelUrl: link.url, logoUrl: null, streams: [] };
             } finally {
               await page.close();
-              await new Promise(r => setTimeout(r, PER_PAGE_DELAY_MS));
+              await delay(PER_PAGE_DELAY_MS);
             }
           }
 
-          async function probeM3U8(url){
-            const ac = new AbortController();
-            const t = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
-            try{
-              const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0', 'accept': 'application/vnd.apple.mpegurl,text/plain,*/*' }, signal: ac.signal });
-              if (!r.ok) return false;
-              const txt = await r.text();
-              return txt.includes('#EXTM3U');
-            } catch { return false } finally { clearTimeout(t); }
+          function buildProbeHeaders(channelPageUrl){
+            const ref = channelPageUrl || PROBE_REFERER || undefined;
+            let origin;
+            try { origin = ref ? new URL(ref).origin : undefined; } catch { origin = undefined; }
+            const h = {
+              'user-agent': 'Mozilla/5.0',
+              'accept': 'application/vnd.apple.mpegurl,text/plain,*/*'
+            };
+            if (ref) h['referer'] = ref;
+            if (origin) h['origin'] = origin;
+            return h;
           }
+
+          async function head(url, headers, signal){
+            try {
+              const r = await fetch(url, { method: 'HEAD', headers, redirect: 'follow', signal });
+              return { ok: r.ok, status: r.status, ct: r.headers.get('content-type')||'', redirected: r.redirected, finalUrl: r.url };
+            } catch (e) { return { ok:false, status:0, error:String(e) }; }
+          }
+          async function getRange(url, headers, signal){
+            try {
+              const r = await fetch(url, { method: 'GET', headers: { ...headers, Range: 'bytes=0-1023' }, redirect: 'follow', signal });
+              return { ok: r.status===200 || r.status===206, status: r.status, ct: r.headers.get('content-type')||'', redirected: r.redirected, finalUrl: r.url };
+            } catch (e) { return { ok:false, status:0, error:String(e) }; }
+          }
+          async function get200(url, headers, signal){
+            try {
+              const r = await fetch(url, { method: 'GET', headers, redirect: 'follow', signal });
+              return { ok: r.status===200, status: r.status, ct: r.headers.get('content-type')||'', redirected: r.redirected, finalUrl: r.url };
+            } catch (e) { return { ok:false, status:0, error:String(e) }; }
+          }
+
+          async function probeOne(url, channelPageUrl){
+            const ac = new AbortController();
+            const to = setTimeout(()=>ac.abort(), PROBE_TIMEOUT_MS);
+            const headers = buildProbeHeaders(channelPageUrl);
+
+            // 1) HEAD
+            let res = await head(url, headers, ac.signal);
+            if (!res.ok) {
+              // 2) GET with Range
+              res = await getRange(url, headers, ac.signal);
+            }
+            if (!res.ok) {
+              // 3) plain GET 200 check
+              res = await get200(url, headers, ac.signal);
+            }
+
+            clearTimeout(to);
+            return { url, ok: !!res.ok, status: res.status, contentType: res.ct, redirected: res.redirected, finalUrl: res.finalUrl, error: res.error || null };
+          }
+
+          async function pLimit(n, items, fn){
+            const ret = new Array(items.length);
+            let i=0; const workers = Array.from({length:n}, async ()=>{
+              while (i < items.length) {
+                const idx = i++;
+                ret[idx] = await fn(items[idx], idx);
+              }
+            });
+            await Promise.all(workers);
+            return ret;
+          }
+
+          function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
 
           async function main(){
             await fs.mkdir('out/mx', { recursive: true });
@@ -246,28 +264,47 @@ jobs:
               const links = await collectChannelPages(browser);
               console.log(`Found ${links.length} channel pages.`);
               const scraped = await Promise.all(links.map(l => scrapeChannel(browser, l)));
-              const allUrls = [...new Set(scraped.flatMap(ch => ch.streams.map(s => s.url)))];
-              console.log(`Probing ${allUrls.length} unique streams...`);
 
-              const probe = await Promise.all(allUrls.map(async u => ({ u, ok: await probeM3U8(u) })));
-              const workingSet = new Set(probe.filter(x => x.ok).map(x => x.u));
+              const records = [];
+              const probes = [];
+              const urls = [];
+              const byUrlMeta = new Map();
 
-              // Build rows and write to DB
-              const rows = [];
               for (const ch of scraped) {
-                const streams = ch.streams.filter(s => workingSet.has(s.url));
-                for (let i = 0; i < streams.length; i++) {
-                  const url = streams[i].url;
-                  const tvgFromUrl = m3u.byUrl.get(url) || null;
-                  const tvgFromName = m3u.byNameKey.get(keyOf(ch.channelName)) || null;
-                  rows.push({
-                    stream_url: url,
+                for (const s of ch.streams) {
+                  if (!byUrlMeta.has(s.url)) {
+                    byUrlMeta.set(s.url, { channelName: ch.channelName, channelUrl: ch.channelUrl, logoUrl: ch.logoUrl });
+                    urls.push(s.url);
+                  }
+                }
+              }
+
+              console.log(`Probing ${urls.length} unique streams with concurrency ${PROBE_CONCURRENCY}...`);
+
+              const probeRes = await pLimit(PROBE_CONCURRENCY, urls, async (u) => {
+                const meta = byUrlMeta.get(u);
+                const pr = await probeOne(u, meta?.channelUrl);
+                return pr;
+              });
+
+              await fs.writeFile(path.join('out','mx','probe_results.json'), JSON.stringify(probeRes, null, 2), 'utf8');
+
+              const working = new Set(probeRes.filter(x => x.ok).map(x => x.url));
+              console.log(`Working streams: ${working.size}`);
+
+              for (const u of urls) {
+                const meta = byUrlMeta.get(u);
+                const tvgFromUrl = m3u.byUrl.get(u) || null;
+                const tvgFromName = m3u.byNameKey.get(keyOf(meta.channelName)) || null;
+                if (working.has(u)) {
+                  records.push({
+                    stream_url: u,
                     channel_id: tvgFromUrl || tvgFromName || null,
-                    channel_name: ch.channelName,
-                    logo_url: ch.logoUrl || null,
-                    source_page_url: ch.channelUrl,
+                    channel_name: meta.channelName,
+                    logo_url: meta.logoUrl || null,
+                    source_page_url: meta.channelUrl,
                     quality: null,
-                    rank: i + 1,
+                    rank: 1,
                     extras: null,
                     working: true,
                     checked_at: new Date().toISOString()
@@ -275,18 +312,18 @@ jobs:
                 }
               }
 
-              await fs.writeFile(path.join('out','mx','working_channels.json'), JSON.stringify(rows, null, 2), 'utf8');
+              await fs.writeFile(path.join('out','mx','working_channels.json'), JSON.stringify(records, null, 2), 'utf8');
 
               if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.log('No Supabase creds; skipping DB upsert'); return; }
-              const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession:false }, db: { schema: SUPABASE_SCHEMA } });
+              if (!records.length) { console.log('No working streams to save.'); return; }
 
-              const BATCH = 500;
-              for (let i = 0; i < rows.length; i += BATCH) {
-                const slice = rows.slice(i, i + BATCH);
-                const { error } = await sb.from(STREAMS_TABLE).upsert(slice, { onConflict: 'stream_url' });
+              const client = sb(); const BATCH=500;
+              for (let i=0;i<records.length;i+=BATCH){
+                const slice = records.slice(i,i+BATCH);
+                const { error } = await client.from(STREAMS_TABLE).upsert(slice, { onConflict: 'stream_url' });
                 if (error) { console.warn(`Upsert batch failed: ${error.message}`); break; }
               }
-              console.log(`Saved ${rows.length} working streams to ${STREAMS_TABLE}`);
+              console.log(`Saved ${records.length} working streams to ${STREAMS_TABLE}`);
             } finally {
               await browser.close();
             }
@@ -295,126 +332,79 @@ jobs:
           main().catch(e => { console.error(e); process.exit(1); });
           EOF
 
-      - name: Connect VPN (Mexico) if token present
-        if: ${{ env.NORDVPN_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-          scripts/nordvpn.exp login --token "$NORDVPN_TOKEN" || true
-          scripts/nordvpn.exp set analytics disabled || true
-          scripts/nordvpn.exp set technology nordlynx || true
-          scripts/nordvpn.exp set firewall off || true
-          scripts/nordvpn.exp set killswitch off || true
-          attempts=5; connected=0
-          for i in $(seq 1 $attempts); do
-            echo "Attempt $i/$attempts: connecting to Mexico..."
-            timeout -k 15s 90s scripts/nordvpn.exp connect Mexico || true
-            if sudo nordvpn status | grep -qi 'Status: Connected'; then echo "VPN Connected."; connected=1; break; fi
-            echo "Retrying in 8s..."; sudo nordvpn disconnect || true; sleep 8
-          done
-          if [ "$connected" -ne 1 ]; then echo "Could not connect to VPN; proceeding WITHOUT VPN."; fi
-
-      - name: Run Step 1 – Discover & save working streams
+      - name: Run Script A – Discover & save working streams (no VPN)
         run: |
           set -euo pipefail
           node scripts/mx-discover-streams.mjs
 
-      - name: Disconnect VPN
-        if: ${{ always() && env.NORDVPN_TOKEN != '' }}
+      - name: Write Script B – Crawl ALL GatoTV channels and ingest 24h
         run: |
           set -euo pipefail
-          sudo nordvpn disconnect || true
-          sudo nordvpn status || true
-
-      - name: Write GatoTV 24h scraper (Step 3)
-        run: |
-          set -euo pipefail
-          cat > scripts/mx-gatotv-24h.mjs <<'EOF'
+          cat > scripts/mx-gatotv-all.mjs <<'EOF'
           import fs from 'node:fs/promises';
           import path from 'node:path';
           import { createClient } from '@supabase/supabase-js';
           import { DateTime } from 'luxon';
 
           const GATOTV_DIR_URL = process.env.GATOTV_DIR_URL || 'https://www.gatotv.com/canales_de_tv';
-          const GATOTV_SCORE_MIN = Number(process.env.GATOTV_SCORE_MIN || '0.80');
           const GATOTV_TZ = process.env.GATOTV_TZ || 'America/Mexico_City';
           const PROGRAMS_HOURS_AHEAD = Number(process.env.PROGRAMS_HOURS_AHEAD || '24');
-          const GATOTV_MAPPING_URL = (process.env.GATOTV_MAPPING_URL || '').trim();
+          const GATOTV_MAX_CHANNELS = Number(process.env.GATOTV_MAX_CHANNELS || '0'); // 0 = no cap
 
           const SUPABASE_URL = process.env.SUPABASE_URL || '';
           const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
           const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
-          const STREAMS_TABLE = process.env.STREAMS_TABLE || 'mx_working_streams';
           const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE || 'epg_programs';
 
-          function stripAccents(s){return String(s).normalize('NFD').replace(/\p{Diacritic}+/gu,'');}
-          const STOP=new Set(['canal','tv','television','hd','sd','mx','mexico','méxico','el','la','los','las','de','del','y','en','the','channel']);
-          function tokensOf(s){ if(!s) return []; let p=stripAccents(String(s).toLowerCase()).replace(/&/g,' and ').replace(/[^a-z0-9]+/g,' ').trim(); return p.split(/\s+/).filter(t=>t && !STOP.has(t));}
-          function keyOf(s){ return Array.from(new Set(tokensOf(s))).sort().join(' '); }
+          function cleanText(html){return String(html).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();}
 
-          const BRAND=new Set(['azteca','adn','milenio','mvs','estrellas','teleformula','teleritmo','multimedios','fox','once']);
-          function jacc(a,b){ const A=new Set(a), B=new Set(b); let i=0; for(const t of A) if(B.has(t)) i++; const j=i/(A.size+B.size-i||1); let bonus=0; for(const t of A) if(B.has(t) && BRAND.has(t)) bonus++; return j + Math.min(bonus,3)*0.05; }
-
-          function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
-
-          async function fetchWorkingChannels(){
-            if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return [];
-            const { data, error } = await sb().from(STREAMS_TABLE).select('channel_name, channel_id').eq('working', true);
-            if (error || !data) return [];
-            const seen = new Map();
-            for (const r of data) if (!seen.has(r.channel_name)) seen.set(r.channel_name, { name:r.channel_name, channel_id:r.channel_id || null });
-            return [...seen.values()];
+          async function fetchHtml(url){
+            const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
+            if(!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+            return await r.text();
           }
 
-          function extractAnchors(html){
-            const anchors=[]; const re=/<a\s+([^>]*?)>([\s\S]*?)<\/a>/gi; let m;
+          function extractDirectoryChannels(html){
+            const out = [];
+            const re = /<a\\s+[^>]*href=["'](\\/canal\\/[^"'#?]+)["'][^>]*>([\\s\\S]*?)<\\/a>/gi;
+            const seen = new Set();
+            let m;
             while((m=re.exec(html))){
-              const attr=m[1]||''; const text=m[2]||'';
-              const href=(attr.match(/href=["']([^"']+)["']/i)||[])[1]||'';
-              if(!href) continue;
-              const abs=href.startsWith('http')?href:new URL(href,GATOTV_DIR_URL).href;
-              if(!/\/canal\//i.test(abs)) continue;
-              const title=(attr.match(/title=["']([^"']+)["']/i)||[])[1]||'';
-              const clean=text.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
-              anchors.push({ url:abs, text:clean||title, tokens:[...tokensOf(clean), ...tokensOf(title)] });
+              const rel = m[1];
+              const name = cleanText(m[2]);
+              const url = new URL(rel, GATOTV_DIR_URL).href;
+              if(!name || seen.has(url)) continue;
+              seen.add(url);
+              out.push({ name, url });
             }
-            return anchors;
-          }
-
-          async function fetchGatoDirectory(){
-            const r=await fetch(GATOTV_DIR_URL,{headers:{'user-agent':'Mozilla/5.0'}});
-            if(!r.ok) throw new Error(`GatoTV dir HTTP ${r.status}`);
-            const html=await r.text();
-            return extractAnchors(html);
-          }
-
-          function bestGatoMatch(name, dir){
-            const t=tokensOf(name); let best=null,score=0;
-            for(const e of dir){ const s=jacc(t,e.tokens); if(s>score){best=e; score=s;} }
-            return { entry:best, score };
+            return out;
           }
 
           function parseSchedule(html){
-            const rows=[]; const cleaned=html.replace(/\r|\n/g,' ').replace(/<\s*br\s*\/?>(?=\S)/gi,' ').replace(/\s+/g,' ');
-            const rx=/(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.)?)\s*-?\s*(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.)?)?[^>]*?<[^>]*?>([^<]{2,120})/gi;
-            let m; const seen=new Set();
+            const rows=[]; 
+            const cleaned=html.replace(/\\r|\\n/g,' ').replace(/<\\s*br\\s*\\/?>(?=\\S)/gi,' ').replace(/\\s+/g,' ');
+            const rx=/(\\b\\d{1,2}:\\d{2}\\s*(?:a\\.?m\\.?|p\\.?m\\.)?)\\s*-?\\s*(\\b\\d{1,2}:\\d{2}\\s*(?:a\\.?m\\.?|p\\.?m\\.)?)?[^>]*?<[^>]*?>([^<]{2,200})/gi;
+            const seen=new Set(); let m;
             while((m=rx.exec(cleaned))){
-              const start=m[1]?.trim(); const stop=m[2]?.trim()||null; const title=m[3]?.trim();
-              const key=`${start}|${stop}|${title}`; if(!title || seen.has(key)) continue; seen.add(key);
-              rows.push({ startLocal:start, stopLocal:stop, title });
+              const start=m[1]?.trim(); const stop=(m[2]||'').trim()||null; const title=(m[3]||'').trim();
+              const key=\`\${start}|\${stop}|\${title}\`;
+              if(!title || !start || seen.has(key)) continue;
+              seen.add(key); rows.push({ startLocal:start, stopLocal:stop, title });
             }
             return rows;
           }
 
           function parseLocal(dateISO, timeStr, tz){
-            let s=(timeStr||'').toLowerCase().replace(/\./g,'').replace(/\s+/g,' ');
-            const m=s.match(/(\d{1,2}):(\d{2})/); if(!m) return null;
-            let h=+m[1], mi=+m[2]; const ampm=/(am|pm)\b/.test(s); const isPM=/pm\b/.test(s);
+            let s=(timeStr||'').toLowerCase().replace(/\\./g,'').replace(/\\s+/g,' ');
+            const m=s.match(/(\\d{1,2}):(\\d{2})/); if(!m) return null;
+            let h=+m[1], mi=+m[2]; const ampm=/(am|pm)\\b/.test(s); const isPM=/pm\\b/.test(s);
             if(ampm){ if(isPM && h<12) h+=12; if(!isPM && h===12) h=0; }
-            return DateTime.fromISO(`${dateISO}T${String(h).padStart(2,'0')}:${String(mi).padStart(2,'0')}:00`,{zone:tz}).toUTC().toISO();
+            return DateTime.fromISO(\`\${dateISO}T\${String(h).padStart(2,'0')}:\${String(mi).padStart(2,'0')}:00\`,{zone:tz}).toUTC().toISO();
           }
 
           function materializeDay(rows, localISO, tz){
-            const out=[]; for(let i=0;i<rows.length;i++){
+            const out=[]; 
+            for(let i=0;i<rows.length;i++){
               const r=rows[i]; const start=parseLocal(localISO, r.startLocal, tz); if(!start) continue;
               let stop=null;
               if(r.stopLocal) stop=parseLocal(localISO, r.stopLocal, tz);
@@ -427,81 +417,62 @@ jobs:
           }
 
           async function fetchChannelDay(url, localISO){
-            let u=url; if(!/\/(\d{4}-\d{2}-\d{2})$/.test(url)) u=url.replace(/\/?$/,`/${localISO}`);
-            const r=await fetch(u,{headers:{'user-agent':'Mozilla/5.0'}});
-            if(!r.ok) return { url:u, rows:[] };
-            const html=await r.text(); return { url:u, rows:parseSchedule(html) };
+            let u=url; if(!/(\\/)\\d{4}-\\d{2}-\\d{2}$/.test(url)) u=url.replace(/\\/?$/, \`/\${localISO}\`);
+            try{
+              const html = await fetchHtml(u);
+              return { url:u, rows:parseSchedule(html) };
+            }catch{ return { url:u, rows:[] }; }
           }
 
           function clamp24h(programs, nowUTC, hours){
-            const end=nowUTC.plus({hours}); return programs
-              .filter(x => DateTime.fromISO(x.start_ts) < end)
-              .map(x => ({ ...x, stop_ts: DateTime.fromISO(x.stop_ts) > end ? end.toISO() : x.stop_ts }));
+            const end=nowUTC.plus({hours});
+            return programs
+              .filter(p => DateTime.fromISO(p.start_ts) < end)
+              .map(p => ({ ...p, stop_ts: DateTime.fromISO(p.stop_ts) > end ? end.toISO() : p.stop_ts }));
           }
 
-          async function savePrograms(rows){
-            if(!rows.length) return;
+          function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
+
+          async function savePrograms(programs){
+            if(!programs.length) return;
             if(!SUPABASE_URL || !SUPABASE_SERVICE_KEY){ console.log('No Supabase creds; skip'); return; }
             const client=sb(); const BATCH=500;
-            for(let i=0;i<rows.length;i+=BATCH){
-              const slice=rows.slice(i,i+BATCH);
+            for(let i=0;i<programs.length;i+=BATCH){
+              const slice=programs.slice(i,i+BATCH);
               let { error } = await client.from(PROGRAMS_TABLE).upsert(slice,{ onConflict:'channel_id, start_ts' });
               if(error && /no unique|no exclusion/i.test(error.message||'')) ({ error } = await client.from(PROGRAMS_TABLE).insert(slice));
-              if(error){ console.warn(`Programs batch failed: ${error.message}`); break; }
+              if(error){ console.warn(\`Programs batch failed: \${error.message}\`); break; }
             }
-            console.log(`Program ingest attempted: ${rows.length}`);
+            console.log(\`Program ingest attempted: \${programs.length}\`);
           }
 
           async function main(){
-            await fs.mkdir('out/mx', { recursive:true });
+            await fs.mkdir('out/mx',{recursive:true});
 
-            // known working channels from DB
-            const channels = await fetchWorkingChannels();
-            console.log(`Known working channels: ${channels.length}`);
+            // 1) Directory → channel links
+            const dirHtml = await fetchHtml(GATOTV_DIR_URL);
+            let channels = extractDirectoryChannels(dirHtml);
+            if(GATOTV_MAX_CHANNELS>0 && channels.length>GATOTV_MAX_CHANNELS) channels = channels.slice(0, GATOTV_MAX_CHANNELS);
+            await fs.writeFile(path.join('out','mx','gatotv_directory.json'), JSON.stringify(channels,null,2),'utf8');
+            console.log(\`GatoTV directory channels: \${channels.length}\`);
 
-            // directory + optional manual map
-            const [dir, manualRaw] = await Promise.all([
-              fetchGatoDirectory(),
-              (async()=>{ if(!GATOTV_MAPPING_URL) return []; try{ const r=await fetch(GATOTV_MAPPING_URL); if(!r.ok) return []; return await r.json(); }catch{ return []; } })()
-            ]);
-            const manual = new Map();
-            for(const m of manualRaw) if(m.channel_name && m.gatotv_url) manual.set(keyOf(m.channel_name), m.gatotv_url);
-
-            // match
-            const matches=[], unmatched=[];
-            for(const ch of channels){
-              const k=keyOf(ch.name);
-              let url = manual.get(k) || null;
-              let score = url ? 1 : 0;
-              if(!url){
-                const { entry, score:s } = bestGatoMatch(ch.name, dir);
-                if(entry && s >= GATOTV_SCORE_MIN){ url=entry.url; score=s; }
-              }
-              if(url) matches.push({ channel_name: ch.name, channel_id: ch.channel_id || null, url, score });
-              else unmatched.push({ channel_name: ch.name, reason: 'no_match_or_below_threshold' });
-            }
-
-            await fs.writeFile(path.join('out','mx','gatotv_matches.json'), JSON.stringify(matches,null,2),'utf8');
-            await fs.writeFile(path.join('out','mx','gatotv_unmatched.json'), JSON.stringify(unmatched,null,2),'utf8');
-
-            // 24h scrape (today + tomorrow)
+            // 2) Today + tomorrow → clamp to 24h
             const nowUTC = DateTime.utc();
             const localNow = nowUTC.setZone(GATOTV_TZ);
             const todayISO = localNow.toISODate();
             const tomorrowISO = localNow.plus({days:1}).toISODate();
 
             const programs=[];
-            for(const m of matches){
-              const d1 = await fetchChannelDay(m.url, todayISO);
-              const d2 = await fetchChannelDay(m.url, tomorrowISO);
-              const rows = materializeDay(d1.rows, todayISO, GATOTV_TZ).concat(
-                           materializeDay(d2.rows, tomorrowISO, GATOTV_TZ));
+            for(const ch of channels){
+              const d1 = await fetchChannelDay(ch.url, todayISO);
+              const d2 = await fetchChannelDay(ch.url, tomorrowISO);
+              const a1 = materializeDay(d1.rows, todayISO, GATOTV_TZ);
+              const a2 = materializeDay(d2.rows, tomorrowISO, GATOTV_TZ);
+              const clamped = clamp24h(a1.concat(a2), nowUTC, PROGRAMS_HOURS_AHEAD);
 
-              const clamped = clamp24h(rows, nowUTC, PROGRAMS_HOURS_AHEAD);
               for(const r of clamped){
-                const channel_id = m.channel_id || m.url; // GatoTV URL as temporary channel_id
                 programs.push({
-                  channel_id,
+                  channel_id: ch.url,       // use GatoTV URL as ID (you'll join in SQL)
                   start_ts: r.start_ts,
                   stop_ts: r.stop_ts,
                   title: r.title,
@@ -520,26 +491,26 @@ jobs:
                   credits: null,
                   premiere: false,
                   previously_shown: false,
-                  extras: { source: 'gatotv' },
+                  extras: { source: 'gatotv', channel_name: ch.name },
                   ingested_at: DateTime.utc().toISO(),
                   source_epg: 'gatotv',
-                  source_url: m.url
+                  source_url: ch.url
                 });
               }
             }
 
             await fs.writeFile(path.join('out','mx','epg_programs_sample.json'), JSON.stringify(programs.slice(0,200),null,2),'utf8');
             await savePrograms(programs);
-            console.log(`GatoTV 24h ingest complete. Channels matched: ${matches.length}, programs: ${programs.length}`);
+            console.log(\`GatoTV 24h ingest complete. Channels scraped: \${channels.length}, programs: \${programs.length}\`);
           }
 
-          main().catch(e => { console.error(e); process.exit(1); });
+          main().catch(e=>{ console.error(e); process.exit(1); });
           EOF
 
-      - name: Run Step 3 – Scrape 24h schedules to epg_programs
+      - name: Run Script B – GatoTV 24h ingest (no matching here)
         run: |
           set -euo pipefail
-          node scripts/mx-gatotv-24h.mjs
+          node scripts/mx-gatotv-all.mjs
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -547,7 +518,7 @@ jobs:
           name: mx-output
           path: |
             out/mx/working_channels.json
-            out/mx/gatotv_matches.json
-            out/mx/gatotv_unmatched.json
+            out/mx/probe_results.json
+            out/mx/gatotv_directory.json
             out/mx/epg_programs_sample.json
           if-no-files-found: warn
