@@ -69,7 +69,6 @@ jobs:
           sudo apt-get install -y nordvpn
           sudo systemctl enable --now nordvpnd || true
 
-      # FIX: Reinstated a more robust expect script to handle all commands
       - name: Make non-interactive nordvpn wrapper
         if: ${{ env.NORDVPN_TOKEN != '' }}
         shell: bash
@@ -92,7 +91,7 @@ jobs:
           EXP
           chmod +x scripts/nordvpn.exp
 
-      # FIX: Corrected nordvpn commands and use expect script for all interactions
+      # FIX: Using a more aggressive timeout to prevent the connection step from hanging
       - name: Connect VPN and Run Scraper
         if: ${{ env.NORDVPN_TOKEN != '' }}
         shell: bash
@@ -101,7 +100,6 @@ jobs:
         run: |
           set -euo pipefail
           scripts/nordvpn.exp login --token "$NORDVPN_TOKEN"
-          # Corrected syntax for disabling analytics
           scripts/nordvpn.exp set analytics disabled
           scripts/nordvpn.exp set technology nordlynx
           
@@ -114,7 +112,9 @@ jobs:
               CONNECT_ARGS="connect --group P2P Mexico"
             fi
             
-            scripts/nordvpn.exp $CONNECT_ARGS
+            # Use timeout with a kill-after signal to ensure the process terminates if it hangs.
+            # It will wait 90s, then send a TERM signal. If still running after 15s, it sends a KILL signal.
+            timeout -k 15s 90s scripts/nordvpn.exp $CONNECT_ARGS || true
             
             if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
               echo "NordVPN connection successful and verified."
@@ -149,7 +149,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "Disconnecting from NordVPN..."
-          # Use expect script for disconnect and status as well
           scripts/nordvpn.exp disconnect || true
           scripts/nordvpn.exp status || true
 
