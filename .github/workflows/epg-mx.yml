@@ -77,18 +77,22 @@ jobs:
           mkdir -p scripts
           cat > scripts/nordvpn.exp <<'EXP'
           #!/usr/bin/expect -f
-          set timeout 120
+          # FIX: Increased internal timeout for connection stability
+          set timeout 90 
           if {$argc < 1} { exit 2 }
           spawn sudo nordvpn {*}$argv
           expect {
+            -re "(?i)You are connected"      { exp_continue }
             -re "(?i)Do you allow.*\\(y/n\\)" { send -- "no\r"; exp_continue }
             -re "(?i)answer with yes/no"     { send -- "no\r"; exp_continue }
+            # FIX: Added an explicit timeout action to prevent hangs
+            timeout                          { exit 1 } 
             eof
           }
+          exit 0
           EXP
           chmod +x scripts/nordvpn.exp
 
-      # FIX: Combined VPN connection and scraping into a single step
       - name: Connect VPN and Run Scraper
         if: ${{ env.NORDVPN_TOKEN != '' }}
         shell: bash
@@ -109,7 +113,10 @@ jobs:
             if [ "$i" -gt 1 ]; then
               CONNECT_ARGS="connect --group P2P Mexico"
             fi
-            timeout 90s scripts/nordvpn.exp $CONNECT_ARGS || true
+            
+            # The expect script now handles its own timeout
+            scripts/nordvpn.exp $CONNECT_ARGS
+            
             if scripts/nordvpn.exp status | grep -qi "Status: Connected"; then
               echo "NordVPN connection successful and verified."
               CONNECTED=true
@@ -130,7 +137,6 @@ jobs:
           echo "--- Running scrape & match script inside VPN tunnel ---"
           npm start
 
-      # This step runs if the VPN is NOT used
       - name: Run MX scrape & match (No VPN)
         if: ${{ env.NORDVPN_TOKEN == '' }}
         shell: bash
