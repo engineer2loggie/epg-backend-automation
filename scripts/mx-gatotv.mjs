@@ -28,14 +28,14 @@ async function fetchHtml(url) {
 }
 
 function extractDirectoryChannels(html) {
-  // Collect every anchor that points to /canal/... (covers things like /canal/m_0, /canal/_vamos, etc.)
+  // Collect every anchor that points to /canal/... (covers /canal/m_0, /canal/_vamos, etc.)
   const out = [];
   const re = /<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   const seen = new Set();
   let m;
   while ((m = re.exec(html))) {
     const rel = m[1];
-    const name = cleanText(m[2]);
+    const name = (m[2] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const url = new URL(rel, GATOTV_DIR_URL).href;
     if (!name || seen.has(url)) continue;
     seen.add(url);
@@ -43,6 +43,7 @@ function extractDirectoryChannels(html) {
   }
   return out;
 }
+
 
 function parseSchedule(html) {
   // Heuristic extraction of (start[, stop]) + title triples.
@@ -52,8 +53,7 @@ function parseSchedule(html) {
     .replace(/\r|\n/g, ' ')
     .replace(/<\s*br\s*\/?>(?=\S)/gi, ' ')
     .replace(/\s+/g, ' ');
-  const rx =
-    /(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.)?)\s*-?\s*(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.)?)?[^>]*?<[^>]*?>([^<]{2,200})/gi;
+  const rx = /(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)\s*-?\s*(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)?[^>]*?<[^>]*?>([^<]{2,200})/gi;
   const seen = new Set();
   let m;
   while ((m = rx.exec(cleaned))) {
