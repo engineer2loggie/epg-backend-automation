@@ -7,6 +7,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 import { DateTime } from 'luxon';
+import { load as loadHTML } from 'cheerio';
 
 // ---------- ENV ----------
 const GATOTV_DIR_URL = process.env.GATOTV_DIR_URL || 'https://www.gatotv.com/canales_de_tv';
@@ -32,73 +33,73 @@ async function fetchHtml(url) {
   return await r.text();
 }
 
-// Extract ALL /canal/... anchors from the directory page (left column list and elsewhere)
+// Extract ALL /canal/... anchors from the directory page — NO REGEX, Cheerio only
 function extractDirectoryChannels(html) {
+  const $ = loadHTML(html);
   const out = [];
-  // Build the pattern safely using String.raw so backslashes are not double-interpreted
-  const re = new RegExp(
-    String.raw`<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>`,
-    'gi'
-  );
   const seen = new Set();
-  let m;
-  while ((m = re.exec(html))) {
-    const rel = m[1];
-    const name = String(m[2] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+  $('a[href^="/canal/"]').each((_, a) => {
+    const rel = $(a).attr('href');
+    const name = $(a).text().replace(/\s+/g, ' ').trim();
+    if (!rel || !name) return;
     const url = new URL(rel, GATOTV_DIR_URL).href;
-    if (!name || seen.has(url)) continue;
+    if (seen.has(url)) return;
     seen.add(url);
     out.push({ name, url });
-  }
+  });
 
-  // Small sanity check to help debug if the selector ever fails
-  if (out.length === 0) {
-    console.warn('extractDirectoryChannels: found 0 anchors — check directory markup or blockers.');
-  }
+  // Also catch absolute links if any (rare)
+  $('a[href*="/canal/"]').each((_, a) => {
+    const href = $(a).attr('href') || '';
+    try {
+      const u = new URL(href, GATOTV_DIR_URL).href;
+      if (!u.includes('/canal/')) return;
+      const name = $(a).text().replace(/\s+/g, ' ').trim();
+      if (!name || seen.has(u)) return;
+      seen.add(u);
+      out.push({ name, url: u });
+    } catch { /* ignore bad hrefs */ }
+  });
+
   return out;
 }
 
-// Try a table-driven parse first: <tr> → <td> cells for start/end/title
+// Table-first parse: <tr> → <td> cells for start/end/title
 function parseScheduleTableRows(html) {
   const rows = [];
-  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  let m;
-  while ((m = rowRe.exec(html))) {
-    const row = m[1];
-    const tds = [];
-    const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-    let k;
-    while ((k = tdRe.exec(row))) tds.push(k[1]);
-    if (tds.length < 2) continue;
+  const $ = loadHTML(html);
+  $('tr').each((_, tr) => {
+    const tds = $(tr).find('td').toArray().map(td => cleanText($(td).html() || ''));
+    if (tds.length < 2) return;
 
-    // Find first two time-like cells (Hora Inicio / Hora Fin)
-    const isTime = (s) => /\b\d{1,2}:\d{2}\b/.test(cleanText(s));
+    const isTime = (s) => /\b\d{1,2}:\d{2}\b/.test(s);
     let idxStart = -1, idxEnd = -1;
     for (let i = 0; i < Math.min(4, tds.length); i++) {
       if (idxStart === -1 && isTime(tds[i])) { idxStart = i; continue; }
       if (idxStart !== -1 && idxEnd === -1 && isTime(tds[i])) { idxEnd = i; break; }
     }
-    if (idxStart === -1) continue;
+    if (idxStart === -1) return;
 
-    // Title = first non-empty text cell after the end time (or after start if no end)
     let titleIdx = -1;
     for (let i = Math.max(idxEnd, idxStart) + 1; i < tds.length; i++) {
-      const txt = cleanText(tds[i]);
+      const txt = tds[i];
       if (txt) { titleIdx = i; break; }
     }
     if (titleIdx === -1) titleIdx = tds.length - 1;
 
-    const startLocal = cleanText(tds[idxStart] || '');
-    const stopLocal = idxEnd !== -1 ? cleanText(tds[idxEnd] || '') : null;
-    const title = cleanText(tds[titleIdx] || '');
-    if (!startLocal || !title) continue;
+    const startLocal = tds[idxStart] || '';
+    const stopLocal = idxEnd !== -1 ? (tds[idxEnd] || '') : null;
+    const title = tds[titleIdx] || '';
+    if (!startLocal || !title) return;
 
     rows.push({ startLocal, stopLocal, title });
-  }
+  });
+
   return dedupeRows(rows);
 }
 
-// Fallback: heuristic pattern "start [- end] ... <tag>Title</tag>"
+// Fallback heuristic: keep the old robust pattern for odd pages
 function parseScheduleHeuristic(html) {
   const rows = [];
   const cleaned = html
@@ -233,7 +234,7 @@ async function savePrograms(programs) {
 async function main() {
   await fs.mkdir('out/mx', { recursive: true });
 
-  // 1) Directory → channel links
+  // 1) Directory → channel links (Cheerio)
   const dirHtml = await fetchHtml(GATOTV_DIR_URL);
   let channels = extractDirectoryChannels(dirHtml);
   if (GATOTV_MAX_CHANNELS > 0 && channels.length > GATOTV_MAX_CHANNELS) {
@@ -262,7 +263,7 @@ async function main() {
 
     for (const r of clamped) {
       programs.push({
-        // Use the GatoTV channel page URL as the channel_id for now (safe for testing & later SQL joins)
+        // Use the GatoTV channel page URL as the channel_id (safe for testing & SQL joins later)
         channel_id: ch.url,
         start_ts: r.start_ts,
         stop_ts: r.stop_ts,
@@ -282,7 +283,6 @@ async function main() {
         credits: null,
         premiere: false,
         previously_shown: false,
-        // pack provenance safely into an existing column
         extras: { source: 'gatotv', channel_name: ch.name },
         ingested_at: DateTime.utc().toISO()
       });
