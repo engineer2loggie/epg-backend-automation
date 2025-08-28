@@ -1,9 +1,6 @@
-// Scrape iptv-org for MX live channels, pull .m3u8s, probe them.
-// Parse multiple EPG XML.GZ streams safely (saxes + streaming gunzip).
-// Prefer mapping via M3U tvg-id (exact URL, then normalized name).
-// Fallback to normalized-name matching vs EPG channels.
-// Write artifacts and upsert streams into Supabase (mx_channels).
-// Optionally ingest programmes into epg_programs (bounded window).
+// Scrape iptv-org (MX), pull m3u8s, probe, parse multiple XMLTV EPGs.
+// Prefer M3U tvg-id + optional manual JSON mapping, then brand-weighted fuzzy.
+// Write artifacts; upsert streams; optionally ingest programmes.
 
 import { chromium } from 'playwright';
 import { createGunzip } from 'node:zlib';
@@ -18,18 +15,18 @@ import { SaxesParser } from 'saxes';
 const SEARCH_URL = process.env.MX_SEARCH_URL || 'https://iptv-org.github.io/?q=live%20country:MX';
 const EPG_URLS = (process.env.MX_EPG_URLS || '').trim().split(/\s+/).filter(Boolean);
 const M3U_URL = (process.env.M3U_URL || '').trim();
+const MAPPING_URL = (process.env.MAPPING_URL || '').trim();
 
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
 const MAX_CHANNELS = Number(process.env.MAX_CHANNELS || '0');
 const PER_PAGE_DELAY_MS = Number(process.env.PER_PAGE_DELAY_MS || '150');
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || '30000');
 const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '5000');
-
 const FUZZY_MIN = Number(process.env.FUZZY_MIN || '0.45');
 const LOG_UNMATCHED = process.env.LOG_UNMATCHED === '1';
 
 const INGEST_PROGRAMS = (process.env.INGEST_PROGRAMS || '0') === '1';
-const PROGRAMS_HOURS_AHEAD = Number(process.env.PROGRAMS_HOURS_AHEAD || '36');
+const PROGRAMS_HOURS_AHEAD = Number(process.env.PROGRAMS_HOURS_AHEAD || '48');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -46,6 +43,7 @@ function normalizeNumerals(s) {
   const map = { uno:'1', dos:'2', tres:'3', cuatro:'4', cinco:'5', seis:'6', siete:'7', ocho:'8', nueve:'9', diez:'10', once:'11', doce:'12', trece:'13' };
   return String(s).replace(/\b(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece)\b/gi, m => map[m.toLowerCase()]);
 }
+function stripLeadingCanal(s) { return String(s).replace(/^\s*canal[\s._-]+/i, ''); }
 function dropTimeshift(s) {
   return String(s)
     .replace(/(?:[-+]\s*\d+\s*(?:h|hora|horas)\b)/ig,'')
@@ -55,9 +53,20 @@ function dropTimeshift(s) {
     .replace(/\s{2,}/g,' ')
     .trim();
 }
-function stripLeadingCanal(s) { return String(s).replace(/^\s*canal[\s._-]+/i, ''); }
 function stripCountryTail(s) { return String(s).replace(/(\.(mx|us)|\s+\(?mx\)?|\s+m[eé]xico|\s+usa|\s+eeuu)\s*$/i,'').trim(); }
-const STOP = new Set(['canal','tv','television','hd','sd','mx','mexico','méxico','hora','horas','us','usa','eeuu']);
+function stripGeoAndCallsigns(s) {
+  let x = String(s);
+  x = x.replace(/\((?:[^)]*)\)\s*$/,'').trim();           // drop trailing parentheses group from base
+  x = x.replace(/\s*-\s*[a-z0-9]{3,5}\b$/i,'').trim();    // drop "- XEW"
+  x = x.replace(/\s+(nuevo\s+laredo|monterrey|cdmx|mexico|mx)\b.*$/i,'').trim();
+  return x;
+}
+
+const STOP = new Set([
+  'canal','tv','television','hd','sd','mx','mexico','méxico','hora','horas',
+  'us','usa','eeuu','el','la','los','las','de','del','y','en','the','channel'
+]);
+
 function tokensOf(s) {
   if (!s) return [];
   let p = stripAccents(normalizeNumerals(String(s).toLowerCase()));
@@ -67,18 +76,54 @@ function tokensOf(s) {
   return p.split(/\s+/).filter(t => t && !STOP.has(t));
 }
 function keyOf(s) { return Array.from(new Set(tokensOf(s))).sort().join(' '); }
+
 function expandNameVariants(s) {
   if (!s) return [];
   const out = new Set();
   const orig = String(s).trim();
-  const noCanal = stripLeadingCanal(orig);
-  const flat = x => x.replace(/[._(),]+/g, ' ').replace(/\s+/g, ' ').trim();
-  const noTS = dropTimeshift(noCanal);
-  const noTail = stripCountryTail(noTS);
-  [orig, noCanal, noTS, noTail, flat(orig), flat(noCanal), flat(noTS), flat(noTail)]
-    .forEach(v => { if (v) out.add(v); });
-  return [...out];
+
+  const dotSplit = orig.replace(/[.]/g,' ').replace(/\s+/g,' ').trim();
+  const flat = x => x.replace(/[._(),-]+/g,' ').replace(/\s+/g,' ').trim();
+  const parenBits = [...orig.matchAll(/\(([^)]+)\)/g)].map(m => m[1]);
+
+  const prelim = [orig, dotSplit, flat(orig)];
+  for (const v of prelim) if (v) out.add(v);
+
+  // From parentheses: "Canal Las Estrellas - XEW" → ["Canal Las Estrellas XEW","Canal Las Estrellas","XEW"]
+  for (const p of parenBits) {
+    const f = flat(p);
+    if (f) out.add(f);
+    for (const h of p.split(/\s*-\s*/)) out.add(flat(h));
+  }
+
+  // Drop "Canal" + geo/callsigns
+  out.add(flat(stripGeoAndCallsigns(stripLeadingCanal(orig))));
+
+  // Callsign → brand hints
+  const CALL = { xew: 'Las Estrellas', xhlat: 'Azteca 7' };
+  for (const key of Object.keys(CALL)) if (orig.toLowerCase().includes(key)) out.add(CALL[key]);
+
+  // Alias harmonization
+  const ALIAS = {
+    'teleformula': ['telefórmula','tele formula'],
+    'milenio television': ['milenio tv','milenio'],
+    'azteca 1': ['azteca uno'],
+    'azteca 7': ['azteca siete','azteca7'],
+    'las estrellas': ['canal de las estrellas','estrellas']
+  };
+  const addAlias = (v) => {
+    const k = v.toLowerCase();
+    for (const [canon, alts] of Object.entries(ALIAS)) {
+      if (k === canon || alts.some(a => k === a)) {
+        out.add(canon); alts.forEach(a => out.add(a));
+      }
+    }
+  };
+  [...out].forEach(addAlias);
+
+  return [...out].filter(Boolean);
 }
+
 function containsMexicoTag(s) {
   const t = stripAccents(String(s).toLowerCase()).replace(/[^a-z0-9]+/g, ' ').trim();
   const parts = t.split(/\s+/);
@@ -95,35 +140,29 @@ function uniqBy(arr, keyFn) {
 
 // ---------- UTILS ----------
 async function retryFetch(url, options = {}, retries = EPG_RETRIES, delayMs = EPG_RETRY_DELAY_MS) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const r = await fetch(url, options);
-            if (!r.ok) throw new Error(`Fetch failed ${r.status} for ${url}`);
-            return r;
-        } catch (e) {
-            if (i === retries - 1) throw e;
-            console.warn(`Fetch failed for ${url}, retrying in ${delayMs}ms... (${i + 1}/${retries})`);
-            await delay(delayMs);
-        }
+  for (let i = 0; i < retries; i++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r;
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      console.warn(`Fetch failed for ${url} -> retry ${i+1}/${retries}`);
+      await delay(delayMs);
     }
+  }
 }
 async function promiseAllWithConcurrency(concurrency, items, asyncFn) {
-    const results = [];
-    const queue = [...items];
-    const workers = Array(concurrency).fill(null).map(async () => {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            if (item) {
-                results.push(await asyncFn(item));
-            }
-        }
-    });
-    await Promise.all(workers);
-    return results;
-}
-async function fetchText(u) {
-  const r = await retryFetch(u);
-  return await r.text();
+  const results = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await asyncFn(items[idx], idx);
+    }
+  }
+  await Promise.all(Array(concurrency).fill(0).map(worker));
+  return results;
 }
 function parseXmltvToISO(s) {
   const m = String(s).match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-]\d{4}))?$/);
@@ -136,22 +175,20 @@ function parseXmltvToISO(s) {
     const hh = +off.slice(1,3), mm = +off.slice(3,5);
     delta = sign * (hh*60 + mm) * 60 * 1000;
   }
-  const t = utcMs - delta; // convert to true UTC
+  const t = utcMs - delta; // → true UTC
   return new Date(t).toISOString();
 }
 
-// ---------- M3U PARSER ----------
-function parseM3U(m3uText) {
+// ---------- OPTIONAL INPUTS (M3U + manual map) ----------
+function parseM3U(text) {
   const items = [];
   let cur = null;
-  for (const raw of m3uText.split(/\r?\n/)) {
+  for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
     if (line.startsWith('#EXTINF')) {
       const attrs = {};
-      for (const m of line.matchAll(/\b([a-z0-9_-]+)="([^"]*)"/gi)) {
-        attrs[m[1].toLowerCase()] = m[2];
-      }
+      for (const m of line.matchAll(/\b([a-z0-9_-]+)="([^"]*)"/gi)) attrs[m[1].toLowerCase()] = m[2];
       const comma = line.indexOf(',');
       const title = comma >= 0 ? line.slice(comma + 1).trim() : '';
       cur = { tvg_id: attrs['tvg-id'] || null, tvg_name: attrs['tvg-name'] || title || null, url: null };
@@ -164,21 +201,38 @@ function parseM3U(m3uText) {
   return items;
 }
 async function buildM3ULookups() {
-  const out = { byUrl: new Map(), byNameNorm: new Map() };
+  const out = { byUrl: new Map(), byNameKey: new Map() };
   if (!M3U_URL) return out;
   try {
-    const txt = await fetchText(M3U_URL);
+    const txt = await (await retryFetch(M3U_URL)).text();
     const items = parseM3U(txt);
     for (const it of items) if (it.url && it.tvg_id) out.byUrl.set(it.url, it.tvg_id);
     const seen = new Set();
     for (const it of items) {
-      if (!it.tvg_id) continue;
       const k = keyOf(it.tvg_name || '');
-      if (k && !seen.has(k)) { out.byNameNorm.set(k, it.tvg_id); seen.add(k); }
+      if (it.tvg_id && k && !seen.has(k)) { out.byNameKey.set(k, it.tvg_id); seen.add(k); }
     }
-    console.log(`M3U parsed: ${items.length} entries, ${out.byUrl.size} url→tvg_id, ${out.byNameNorm.size} name→tvg_id.`);
+    console.log(`M3U parsed: ${items.length} entries, url→id:${out.byUrl.size}, name→id:${out.byNameKey.size}`);
   } catch (e) {
     console.warn(`M3U parse skipped: ${e.message}`);
+  }
+  return out;
+}
+async function loadManualMap() {
+  // JSON array: [{ epg_id, m3u_name, "m3u_tvg-id", custom_channel_name }]
+  const out = { byNameKey: new Map(), byTvgId: new Map() };
+  if (!MAPPING_URL) return out;
+  try {
+    const arr = JSON.parse(await (await retryFetch(MAPPING_URL)).text());
+    for (const row of arr || []) {
+      const epg = row.epg_id || null;
+      if (!epg) continue;
+      if (row['m3u_tvg-id']) out.byTvgId.set(String(row['m3u_tvg-id']), epg);
+      if (row.m3u_name) out.byNameKey.set(keyOf(row.m3u_name), epg);
+    }
+    console.log(`Manual map loaded: name→${out.byNameKey.size}, tvg→${out.byTvgId.size}`);
+  } catch (e) {
+    console.warn(`Manual map skipped: ${e.message}`);
   }
   return out;
 }
@@ -189,7 +243,7 @@ async function collectChannelPages(browser) {
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
   await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('a[href*="/channels/"]', { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(800);
 
   let items = await page.$$eval('a[href*="/channels/"]', as => {
     const out = [];
@@ -217,25 +271,22 @@ async function scrapeChannel(browser, link) {
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
   try {
     await page.goto(link.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(400);
 
     const tab = await page.$('text=Streams');
-    if (tab) { await tab.click().catch(() => {}); await page.waitForTimeout(400); }
+    if (tab) { await tab.click().catch(() => {}); await page.waitForTimeout(300); }
 
     let anchors = await page.$$eval('a[href*=".m3u8"]', els =>
       els.map(e => ({ url: e.href, text: (e.textContent || '').trim() }))
     );
-
     if (!anchors.length) {
       const html = await page.content();
       const rx = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi;
-      const set = new Set();
-      let m; while ((m = rx.exec(html))) set.add(m[0]);
+      const set = new Set(); let m; while ((m = rx.exec(html))) set.add(m[0]);
       anchors = [...set].map(u => ({ url: u, text: '' }));
     }
 
     anchors = uniqBy(anchors.filter(a => /^https?:\/\//i.test(a.url)), a => a.url);
-
     return anchors.map(a => ({
       url: a.url,
       quality: (a.text.match(/\b(1080p|720p|480p|360p|HD|SD)\b/i) || [])[0] || null
@@ -249,21 +300,12 @@ async function scrapeChannel(browser, link) {
 }
 
 async function scrapeAll(browser, links) {
-    const SCRAPE_CONCURRENCY = 10;
-    const results = await promiseAllWithConcurrency(
-        SCRAPE_CONCURRENCY,
-        links,
-        async (link) => {
-            const streams = await scrapeChannel(browser, link);
-            await delay(PER_PAGE_DELAY_MS); // still delay to be gentle
-            return {
-                channelName: link.name,
-                channelNameKey: link.nameKey,
-                streams
-            };
-        }
-    );
-    return results.filter(r => r.streams.length > 0);
+  const res = await promiseAllWithConcurrency(10, links, async (lnk) => {
+    const streams = await scrapeChannel(browser, lnk);
+    await delay(PER_PAGE_DELAY_MS);
+    return streams.length ? { channelName: lnk.name, channelNameKey: lnk.nameKey, streams } : null;
+  });
+  return res.filter(Boolean);
 }
 
 async function probeM3U8(url) {
@@ -287,11 +329,9 @@ function isMexicoEntry(id, names) {
   return /\.mx$/i.test(id || '') || (names || []).some(n => /\b(m[eé]xico|mx)\b/i.test(String(n)));
 }
 
-async function parseOneEpg(url, agg, keepAllMexFile) {
+async function parseOneEpg(url, agg, keepAll) {
   console.log(`Downloading EPG (stream)… ${url}`);
-  const res = await retryFetch(url); // Use retry fetch
-  if (!res.ok || !res.body) throw new Error(`Fetch failed ${res.status} ${url}`);
-
+  const res = await retryFetch(url);
   const gunzip = createGunzip();
   const src = Readable.fromWeb(res.body);
   const decoder = new TextDecoder('utf-8');
@@ -300,56 +340,61 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
   const MAX_NAME_CHARS = 1024, MAX_NAMES_PER_CH = 24, MAX_VARIANTS = 64;
 
   let cur = null, inDisp = false, dispChunks = [], dispLen = 0, dispTruncated = false;
-  const tagStack = [];
+
+  // Programme capture (optional)
+  let prog = null, buf = '', inTag = null;
+  const keepWindowTo = new Date(Date.now() + PROGRAMS_HOURS_AHEAD*3600*1000);
 
   parser.on('error', (e) => { throw e; });
 
   parser.on('opentag', (tag) => {
     const nm = String(tag.name).toLowerCase();
-    tagStack.push(nm);
-
     if (nm === 'channel') {
       cur = { id: tag.attributes?.id ? String(tag.attributes.id) : '', namesRaw: [] };
     } else if (nm === 'display-name' && cur) {
       inDisp = true; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'programme') {
+      if (!INGEST_PROGRAMS) return;
       const cid = String(tag.attributes?.channel || '');
-      if (cid) {
-        agg.programmeOpen = { channel: cid, attrs: tag.attributes, text: {} };
+      const st = parseXmltvToISO(tag.attributes?.start || '');
+      const en = parseXmltvToISO(tag.attributes?.stop || '');
+      const stDate = st ? new Date(st) : null;
+      if (cid && st && en && stDate && stDate <= keepWindowTo) {
+        prog = {
+          channel_id: cid, start_ts: st, stop_ts: en,
+          title: null, sub_title: null, summary: null,
+          categories: [], program_url: null, episode_num_xmltv: null,
+          icon_url: null, rating: null, star_rating: null,
+          season: null, episode: null, language: null, orig_language: null,
+          credits: null, premiere: false, previously_shown: false,
+          extras: null, ingested_at: new Date().toISOString()
+        };
       } else {
-        agg.programmeOpen = null;
+        prog = null;
+      }
+    } else if (prog && ['title','sub-title','desc','category','url','episode-num','language','orig-language','star-rating','premiere','previously-shown','icon','credits','rating'].includes(nm)) {
+      inTag = nm; buf = '';
+      if (nm === 'icon') {
+        const u = tag.attributes?.src ? String(tag.attributes.src) : null;
+        if (u) prog.icon_url = u;
       }
     }
   });
 
   parser.on('text', (t) => {
-    const raw = String(t);
-    if (!raw) return;
-
-    if (inDisp && cur && !dispTruncated) {
-      let chunk = raw;
+    if (inDisp && cur && t && !dispTruncated) {
+      let chunk = String(t);
       if (chunk.length > MAX_NAME_CHARS) chunk = chunk.slice(0, MAX_NAME_CHARS);
       const remain = MAX_NAME_CHARS - dispLen;
       if (remain <= 0) { dispTruncated = true; return; }
       if (chunk.length > remain) { chunk = chunk.slice(0, remain); dispTruncated = true; }
       if (chunk) { dispChunks.push(chunk); dispLen += chunk.length; }
-      return;
     }
-
-    if (!agg.programmeOpen) return;
-    const curTag = tagStack.length ? tagStack[tagStack.length - 1] : '';
-    if (!curTag || curTag === 'programme') return;
-
-    const str = raw.trim();
-    if (!str) return;
-
-    if (!agg.programmeOpen.text[curTag]) agg.programmeOpen.text[curTag] = [];
-    agg.programmeOpen.text[curTag].push(str);
+    if (prog && inTag && t) buf += t;
   });
 
   parser.on('closetag', async (nameRaw) => {
     const nm = String(nameRaw).toLowerCase();
-
     if (nm === 'display-name' && cur) {
       if (cur.namesRaw.length < MAX_NAMES_PER_CH) {
         const txt = dispChunks.length ? dispChunks.join('') : '';
@@ -359,98 +404,42 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
     } else if (nm === 'channel' && cur) {
       const id = cur.id || '';
-      const keep = keepAllMexFile ? true : isMexicoEntry(id, cur.namesRaw);
+      const keep = keepAll ? true : isMexicoEntry(id, cur.namesRaw);
       if (keep) {
         const names = new Set();
         for (const n of cur.namesRaw) for (const v of expandNameVariants(n)) if (v) names.add(v);
         for (const v of expandNameVariants(id)) if (v) names.add(v);
-        const limited = [];
-        for (const v of names) { limited.push(v); if (limited.length >= MAX_VARIANTS) break; }
+        const limited = []; for (const v of names) { limited.push(v); if (limited.length >= MAX_VARIANTS) break; }
         let entry = agg.channels.get(id);
         if (!entry) { entry = { id, names: [], tokenSet: new Set() }; agg.channels.set(id, entry); }
         entry.names = Array.from(new Set(entry.names.concat(limited))).slice(0, MAX_VARIANTS);
-        entry.tokenSet = new Set();
-        for (const nm2 of entry.names) for (const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
+        entry.tokenSet = new Set(); for (const nm2 of entry.names) for (const tok of tokensOf(nm2)) entry.tokenSet.add(tok);
         for (const n of entry.names) {
           const k = keyOf(n);
           if (k && !agg.nameMap.has(k)) agg.nameMap.set(k, entry);
         }
       }
-      cur = null; inDisp = false; dispChunks = []; dispLen = 0; dispTruncated = false;
-    } else if (nm === 'programme' && agg.programmeOpen) {
-      if (!INGEST_PROGRAMS) { agg.programmeOpen = null; }
-      else {
-        const cid = agg.programmeOpen.channel;
-        const entry = agg.channels.get(cid);
-        const keep = keepAllMexFile ? true : (entry ? isMexicoEntry(entry.id, entry.names) : containsMexicoTag(cid));
-        if (keep) {
-          const attrs = agg.programmeOpen.attrs || {};
-          const t = agg.programmeOpen.text || {};
-          const now = Date.now();
-          const ahead = now + PROGRAMS_HOURS_AHEAD * 3600 * 1000;
-
-          const startISO = parseXmltvToISO(attrs.start || '');
-          const stopISO  = parseXmltvToISO(attrs.stop  || '');
-          if (startISO && stopISO) {
-            const startMs = Date.parse(startISO);
-            const stopMs  = Date.parse(stopISO);
-            if (!(Number.isFinite(startMs) && Number.isFinite(stopMs) &&
-                (stopMs < now - 6*3600*1000 || startMs > ahead))) {
-
-              const textOf = (k) => (t[k]?.join(' ') || null);
-              const arrOf  = (k) => (t[k] ? Array.from(new Set(t[k])) : null);
-
-              const rec = {
-                channel_id: cid,
-                title: textOf('title'),
-                sub_title: textOf('sub-title'),
-                summary: textOf('desc'),
-                start_ts: startISO,
-                stop_ts: stopISO,
-                categories: arrOf('category'),
-                icon_url: null,
-                rating: t['rating'] ? { text: t['rating'].join(' ') } : null,
-                star_rating: textOf('star-rating'),
-                program_url: textOf('url'),
-                episode_num_xmltv: textOf('episode-num'),
-                season: null,
-                episode: null,
-                language: textOf('language'),
-                orig_language: textOf('orig-language'),
-                credits: null,
-                premiere: !!t['premiere'],
-                previously_shown: !!t['previously-shown'],
-                extras: null,
-                ingested_at: new Date().toISOString()
-              };
-
-              if (t['episode-num']) {
-                const ns = t['episode-num'].find(x => /xmltv_ns/.test(x)) || null;
-                const m = ns && ns.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
-                if (m) { rec.season = Number(m[1]) + 1; rec.episode = Number(m[2]) + 1; }
-              }
-
-              const creditKeys = ['actor','director','writer','adapter','producer','composer','editor','presenter','commentator','guest'];
-              const credits = {};
-              for (const k of creditKeys) if (t[k]) credits[k] = Array.from(new Set(t[k]));
-              rec.credits = Object.keys(credits).length ? credits : null;
-
-              agg.programmeBatch.push(rec);
-              if (agg.programmeBatch.length >= 500) {
-                await saveProgramsBatch(agg.programmeBatch);
-                agg.programmeBatch = [];
-              }
-            }
-          }
-        }
-        agg.programmeOpen = null;
+      cur = null;
+    } else if (prog && nm === inTag) {
+      const v = (buf || '').trim();
+      if (v) {
+        if (inTag === 'title') prog.title = v;
+        else if (inTag === 'sub-title') prog.sub_title = v;
+        else if (inTag === 'desc') prog.summary = v;
+        else if (inTag === 'category') prog.categories.push(v);
+        else if (inTag === 'url') prog.program_url = v;
+        else if (inTag === 'episode-num') prog.episode_num_xmltv = v;
+        else if (inTag === 'language') prog.language = v;
+        else if (inTag === 'orig-language') prog.orig_language = v;
+        else if (inTag === 'star-rating') prog.star_rating = v;
+        else if (inTag === 'premiere') prog.premiere = true;
+        else if (inTag === 'previously-shown') prog.previously_shown = true;
+        else if (inTag === 'rating') prog.rating = { text: v };
       }
-    }
-
-    if (tagStack.length && tagStack[tagStack.length - 1] === nm) tagStack.pop();
-    else {
-      const idx = tagStack.lastIndexOf(nm);
-      if (idx >= 0) tagStack.splice(idx, 1);
+      inTag = null; buf = '';
+    } else if (nm === 'programme' && prog) {
+      agg.programs.push(prog);
+      prog = null;
     }
   });
 
@@ -461,13 +450,9 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
       const text = decoder.decode(chunk, { stream: true });
       if (text) parser.write(text);
     });
-    gunzip.on('end', async () => {
+    gunzip.on('end', () => {
       parser.write(decoder.decode(new Uint8Array(), { stream: false }));
       parser.close();
-      if (INGEST_PROGRAMS && agg.programmeBatch.length) {
-        await saveProgramsBatch(agg.programmeBatch);
-        agg.programmeBatch = [];
-      }
       resolve();
     });
     src.pipe(gunzip);
@@ -475,85 +460,62 @@ async function parseOneEpg(url, agg, keepAllMexFile) {
 }
 
 async function parseAllEpg(urls) {
-  const agg = {
-    channels: new Map(),
-    nameMap: new Map(),
-    programmeOpen: null,
-    programmeBatch: []
-  };
-  let successfulFiles = 0;
+  const agg = { channels: new Map(), nameMap: new Map(), programs: [] };
+  let ok = 0;
   for (const url of urls) {
-      try {
-          const keepAllMexFile = /_MX/i.test(url);
-          await parseOneEpg(url, agg, keepAllMexFile);
-          successfulFiles++;
-      } catch (e) {
-          console.warn(`Failed to parse EPG file: ${url}. Reason: ${e.message}. Skipping.`);
-      }
+    try {
+      await parseOneEpg(url, agg, /_MX/i.test(url)); // keep-all if filename hints MX
+      ok++;
+    } catch (e) {
+      console.warn(`EPG parse failed ${url}: ${e.message}`);
+    }
   }
-
-  console.log(`EPG files parsed OK: ${successfulFiles}/${urls.length}`);
+  console.log(`EPG files parsed OK: ${ok}/${urls.length}`);
   const kept = new Set([...agg.nameMap.values()]);
   console.log(`EPG entries kept (Mexico-related): ${kept.size}`);
-  return { nameMap: agg.nameMap, entries: [...kept] };
+  return { nameMap: agg.nameMap, entries: [...kept], programs: agg.programs };
 }
 
-// ---------- MATCH ----------
-function jaccard(aTokens, bTokens) {
+// ---------- MATCH (brand-weighted fuzzy) ----------
+const BRAND = new Set(['azteca','adn','milenio','fox','sports','premium','estrellas','teleformula','maria','vision','las']);
+function scorePair(aTokens, bTokens) {
   const A = new Set(aTokens), B = new Set(bTokens);
   let inter = 0; for (const t of A) if (B.has(t)) inter++;
-  return inter / (A.size + B.size - inter || 1);
+  const jacc = inter / (A.size + B.size - inter || 1);
+  let brandHits = 0; for (const t of A) if (BRAND.has(t) && B.has(t)) brandHits++;
+  const bonus = Math.min(brandHits, 3) * 0.05;  // up to +0.15
+  return jacc + bonus;
 }
 function findMatchByName(channelName, nameKey, nameMap, entries) {
   const exact = nameMap.get(nameKey);
   if (exact) return { entry: exact, score: 1, method: 'exact' };
+
   const sTokArr = tokensOf(channelName);
-  const sTok = new Set(sTokArr);
-  if (sTok.size === 1) {
-    const [only] = [...sTok];
-    for (const e of entries) if (e.tokenSet && e.tokenSet.has(only)) {
-      return { entry: e, score: 0.99, method: 'anchor' };
-    }
-  }
-  let subsetBest = null, subsetBestSize = Infinity;
-  for (const e of entries) {
-    const E = e.tokenSet || new Set();
-    let allIn = true;
-    for (const t of sTok) { if (!E.has(t)) { allIn = false; break; } }
-    if (allIn && E.size < subsetBestSize) { subsetBest = e; subsetBestSize = E.size; }
-  }
-  if (subsetBest) return { entry: subsetBest, score: 0.9, method: 'subset' };
   let best = null, bestScore = 0;
+
   for (const e of entries) for (const nm of e.names) {
-    const score = jaccard(sTokArr, tokensOf(nm));
-    if (score > bestScore) { bestScore = score; best = e; }
+    const sc = scorePair(sTokArr, tokensOf(nm));
+    if (sc > bestScore) { bestScore = sc; best = e; }
   }
-  if (best && bestScore >= FUZZY_MIN) return { entry: best, score: bestScore, method:'fuzzy' };
-  return { entry: null, score: 0, method: 'none' };
+  if (best && bestScore >= (FUZZY_MIN - 0.05)) return { entry: best, score: bestScore, method: 'brand-fuzzy' };
+  return { entry: null, score: bestScore, method: 'none' };
 }
 
 // ---------- DB ----------
-function supabaseClient() {
-  return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-    auth: { persistSession: false },
-    db: { schema: SUPABASE_SCHEMA }
-  });
+function sbClient() {
+  return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false }, db: { schema: SUPABASE_SCHEMA } });
 }
-
 async function saveStreams(rows) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     console.log('Supabase env missing; skipped DB upload.');
     return;
   }
-  if (!rows.length) {
-    console.log('No stream rows to upload to Supabase.');
-    return;
-  }
-  const sb = supabaseClient();
+  if (!rows.length) { console.log('No stream rows to upload.'); return; }
 
-  const tryUpsert = async (withTvgId) => {
+  const tryUpsert = async (fields) => {
+    const sb = sbClient();
     const payload = rows.map(r => {
-      const base = {
+      const o = {
         stream_url: r.stream_url,
         channel_guess: r.channel_guess,
         epg_channel_id: r.epg_channel_id,
@@ -561,61 +523,41 @@ async function saveStreams(rows) {
         working: r.working,
         checked_at: r.checked_at
       };
-      if (withTvgId && r.tvg_id != null) base.tvg_id = r.tvg_id;
-      return base;
+      if (fields.tvg_id && r.tvg_id != null) o.tvg_id = r.tvg_id;
+      if (fields.channel_name && r.channel_name != null) o.channel_name = r.channel_name;
+      return o;
     });
     return await sb.from(SUPABASE_TABLE).upsert(payload, { onConflict: 'stream_url', ignoreDuplicates: false });
   };
 
-  let { error } = await tryUpsert(true);
-  if (error && /tvg_id/i.test(error.message || '')) {
-    console.warn(`Upsert retry without tvg_id due to: ${error.message}`);
-    ({ error } = await tryUpsert(false));
-  }
-  if (error) {
-    console.warn(`Streams upsert failed: ${error.message} (${error.code ?? 'no-code'})`);
-  } else {
-    console.log(`Streams DB write OK: ${rows.length} rows`);
-  }
+  // Try with tvg_id + channel_name; then fallback if columns don’t exist
+  let fields = { tvg_id: true, channel_name: true };
+  let { error } = await tryUpsert(fields);
+  if (error && /column .*tvg_id/i.test(error.message || '')) { fields.tvg_id = false; ({ error } = await tryUpsert(fields)); }
+  if (error && /column .*channel_name/i.test(error.message || '')) { fields.channel_name = false; ({ error } = await tryUpsert(fields)); }
+
+  if (error) console.warn(`Streams upsert failed: ${error.message} (${error.code ?? 'no-code'})`);
+  else console.log(`Streams DB write OK: ${rows.length} rows`);
 }
 
-async function saveProgramsBatch(batch) {
-  if (!INGEST_PROGRAMS || !batch.length) return;
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.log('Supabase env missing; skipped programs upload.');
-    return;
-  }
-  const sb = supabaseClient();
-  const payload = batch.map(x => ({
-    channel_id: x.channel_id,
-    title: x.title,
-    sub_title: x.sub_title,
-    summary: x.summary,
-    start_ts: x.start_ts,
-    stop_ts: x.stop_ts,
-    categories: x.categories,
-    icon_url: x.icon_url,
-    rating: x.rating,
-    star_rating: x.star_rating,
-    program_url: x.program_url,
-    episode_num_xmltv: x.episode_num_xmltv,
-    season: x.season,
-    episode: x.episode,
-    language: x.language,
-    orig_language: x.orig_language,
-    credits: x.credits,
-    premiere: x.premiere,
-    previously_shown: x.previously_shown,
-    extras: x.extras,
-    ingested_at: x.ingested_at
-  }));
-  
-  // *** CRITICAL FIX: Use upsert with onConflict instead of insert ***
-  const { error } = await sb
-    .from(PROGRAMS_TABLE)
-    .upsert(payload, { onConflict: 'channel_id, start_ts' });
+async function savePrograms(programs) {
+  if (!INGEST_PROGRAMS || !programs.length) return;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.log('Supabase env missing; skipped programs upload.'); return; }
 
-  if (error) console.warn(`Programs upsert failed: ${error.message} (${error.code ?? 'no-code'})`);
+  const sb = sbClient();
+  const BATCH = 500;
+  for (let i = 0; i < programs.length; i += BATCH) {
+    const slice = programs.slice(i, i + BATCH);
+    // Prefer upsert on (channel_id, start_ts); fallback to insert if constraint missing
+    let { error } = await sb
+      .from(PROGRAMS_TABLE)
+      .upsert(slice, { onConflict: 'channel_id, start_ts' });
+    if (error && /no unique|no exclusion constraint/i.test(error.message || '')) {
+      ({ error } = await sb.from(PROGRAMS_TABLE).insert(slice));
+    }
+    if (error) { console.warn(`Programs batch failed: ${error.message}`); break; }
+  }
+  console.log(`Program ingest attempted for ${programs.length} rows`);
 }
 
 // ---------- MAIN ----------
@@ -628,81 +570,91 @@ async function main() {
   const browser = await chromium.launch({ headless: HEADLESS });
 
   const m3u = await buildM3ULookups();
+  const manual = await loadManualMap();
 
   try {
     console.log(`Scraping: ${SEARCH_URL}`);
     const links = await collectChannelPages(browser);
     console.log(`Found ${links.length} channel pages.`);
-
     const scraped = await scrapeAll(browser, links);
     console.log(`Channels with at least one .m3u8 (before probe): ${scraped.length}`);
 
-    // *** PERFORMANCE: Probe all streams in parallel ***
-    const allStreams = scraped.flatMap(ch => ch.streams.map(s => s.url));
-    const uniqueStreams = [...new Set(allStreams)];
-    console.log(`Probing ${uniqueStreams.length} unique streams in parallel...`);
-    
-    const probeResults = await promiseAllWithConcurrency(
-        50, // Concurrency limit for probing
-        uniqueStreams,
-        async (url) => ({ url, isWorking: await probeM3U8(url) })
-    );
-
-    const workingUrls = new Set(probeResults.filter(r => r.isWorking).map(r => r.url));
-    console.log(`Found ${workingUrls.size} working streams.`);
-    
-    // Filter channels and their streams based on probe results
-    const filtered = scraped.map(ch => ({
-        ...ch,
-        streams: ch.streams.filter(s => workingUrls.has(s.url))
-    })).filter(ch => ch.streams.length > 0);
-
+    // Probe streams (parallel)
+    const allUrls = [...new Set(scraped.flatMap(ch => ch.streams.map(s => s.url)))];
+    console.log(`Probing ${allUrls.length} unique streams in parallel...`);
+    const probe = await promiseAllWithConcurrency(50, allUrls, async (u) => ({ u, ok: await probeM3U8(u) }));
+    const workingSet = new Set(probe.filter(x => x.ok).map(x => x.u));
+    const filtered = scraped.map(ch => ({ ...ch, streams: ch.streams.filter(s => workingSet.has(s.url)) }))
+                            .filter(ch => ch.streams.length > 0);
     console.log(`Channels with at least one WORKING .m3u8: ${filtered.length}`);
 
-    const { nameMap, entries } = await parseAllEpg(EPG_URLS);
+    const { nameMap, entries, programs } = await parseAllEpg(EPG_URLS);
 
+    // Match + records
     const records = [];
     const matchedOnly = [];
+    const unmatched = [];
+
     for (const r of filtered) {
-      const nameTvg = m3u.byNameNorm.get(r.channelNameKey) || null;
-      const { entry, method } = findMatchByName(r.channelName, r.channelNameKey, nameMap, entries);
+      // Prefer exact IDs from M3U or manual mapping
+      const tvgIdFromName = m3u.byNameKey.get(r.channelNameKey) || null;
+      let manualEpg = manual.byNameKey.get(r.channelNameKey) || (tvgIdFromName ? manual.byTvgId.get(tvgIdFromName) : null);
+
+      // Name-based best match
+      const m = findMatchByName(r.channelName, r.channelNameKey, nameMap, entries);
+      const entry = manualEpg ? entries.find(e => e.id === manualEpg) || m.entry : m.entry;
+      const method = manualEpg && entry ? 'manual-map' : m.method;
+      const bestId = (entry && entry.id) || tvgIdFromName || null;
+
       for (const s of r.streams) {
         const urlTvg = m3u.byUrl.get(s.url) || null;
-        const tvg_id = urlTvg || nameTvg || (entry ? entry.id : null);
+        const tvg_id = urlTvg || tvgIdFromName || bestId;
 
         const rec = {
           stream_url: s.url,
           channel_guess: r.channelName,
           tvg_id,
-          epg_channel_id: entry ? entry.id : tvg_id,
+          epg_channel_id: (entry && entry.id) || tvg_id || null,
           epg_display_name: entry ? (entry.names[0] || null) : null,
           working: true,
-          checked_at: new Date().toISOString()
+          checked_at: new Date().toISOString(),
+          channel_name: entry ? (entry.names[0] || r.channelName) : r.channelName
         };
         records.push(rec);
         if (entry) matchedOnly.push({ ...rec, _match_method: method });
+        else unmatched.push({ ...rec, _match_method: 'none' });
       }
     }
 
     console.log(`Matched with EPG: ${matchedOnly.length} stream rows (across ${filtered.length} channels).`);
 
-    await fs.writeFile(path.join('out', 'mx', 'records.json'), JSON.stringify(records, null, 2), 'utf8');
-    await fs.writeFile(path.join('out', 'mx', 'matches.json'), JSON.stringify(matchedOnly, null, 2), 'utf8');
-
-    if (LOG_UNMATCHED) {
-      const matchedUrls = new Set(matchedOnly.map(x => x.stream_url));
-      const unmatched = records.filter(x => !matchedUrls.has(x.stream_url));
-      await fs.writeFile(path.join('out', 'mx', 'unmatched.json'), JSON.stringify(unmatched, null, 2), 'utf8');
-      console.log(`Wrote out/mx/unmatched.json with ${unmatched.length} unmatched rows`);
+    // Suggestions for manual mapping (top-3)
+    const suggestions = [];
+    for (const rec of unmatched) {
+      const sTok = tokensOf(rec.channel_guess);
+      const top = entries.map(e => ({
+        epg_id: e.id,
+        epg_name: e.names[0] || null,
+        score: scorePair(sTok, tokensOf(e.names[0] || e.id))
+      })).sort((a,b)=>b.score-a.score).slice(0,3);
+      suggestions.push({ channel_guess: rec.channel_guess, stream_url: rec.stream_url, candidates: top });
     }
 
+    // Artifacts
+    await fs.writeFile(path.join('out','mx','records.json'), JSON.stringify(records,null,2), 'utf8');
+    await fs.writeFile(path.join('out','mx','matches.json'), JSON.stringify(matchedOnly,null,2), 'utf8');
+    if (LOG_UNMATCHED) await fs.writeFile(path.join('out','mx','unmatched.json'), JSON.stringify(unmatched,null,2), 'utf8');
+    await fs.writeFile(path.join('out','mx','map_suggestions.json'), JSON.stringify(suggestions,null,2), 'utf8');
+
+    // DB writes
     await saveStreams(records);
 
+    // Program handling
     if (INGEST_PROGRAMS) {
+      // sample artifact only; full set goes to DB
       await fs.writeFile(path.join('out','mx','epg_programs_sample.json'),
-        JSON.stringify({ note: 'programs inserted directly to DB in batches; this is just a stub artifact' }, null, 2),
-        'utf8'
-      );
+        JSON.stringify(programs.slice(0,300), null, 2), 'utf8');
+      await savePrograms(programs);
     }
   } finally {
     await browser.close();
