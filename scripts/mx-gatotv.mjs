@@ -1,17 +1,18 @@
 // scripts/mx-gatotv-all.mjs
-// GatoTV full directory crawl → scrape each /canal/... page for today+tomorrow → clamp to 24h → upsert epg_programs
-// No matching to M3U8 here (you'll do joins in SQL). No VPN.
+// Crawl GatoTV directory → visit every /canal/... page → scrape today's + tomorrow's schedule
+// → convert to UTC and clamp to a 24h window → upsert into epg_programs on (channel_id, start_ts).
+// No matching, no VPN, no XMLTV.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 import { DateTime } from 'luxon';
 
-// --- ENV ---
+// ---------- ENV ----------
 const GATOTV_DIR_URL = process.env.GATOTV_DIR_URL || 'https://www.gatotv.com/canales_de_tv';
 const GATOTV_TZ = process.env.GATOTV_TZ || 'America/Mexico_City';
 const PROGRAMS_HOURS_AHEAD = Number(process.env.PROGRAMS_HOURS_AHEAD || '24');
-const GATOTV_MAX_CHANNELS = Number(process.env.GATOTV_MAX_CHANNELS || '0'); // 0 = no cap
+const GATOTV_MAX_CHANNELS = Number(process.env.GATOTV_MAX_CHANNELS || '0'); // 0 = all
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -20,7 +21,7 @@ const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE || 'epg_programs';
 
 const UA = process.env.SCRAPER_UA || 'Mozilla/5.0 (compatible; GatoTV-EPG/1.0)';
 
-// --- helpers ---
+// ---------- HELPERS ----------
 function cleanText(html) {
   return String(html).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -31,7 +32,7 @@ async function fetchHtml(url) {
   return await r.text();
 }
 
-// Extract *all* /canal/... anchors from directory page
+// Extract ALL /canal/... anchors from the directory page (left column list and elsewhere)
 function extractDirectoryChannels(html) {
   const out = [];
   const re = /<a\s+[^>]*href=["'](\/canal\/[^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -48,7 +49,7 @@ function extractDirectoryChannels(html) {
   return out;
 }
 
-// Try to parse a structured row pattern first: (Start)(End)(Title)
+// Try a table-driven parse first: <tr> → <td> cells for start/end/title
 function parseScheduleTableRows(html) {
   const rows = [];
   const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
@@ -61,22 +62,22 @@ function parseScheduleTableRows(html) {
     while ((k = tdRe.exec(row))) tds.push(k[1]);
     if (tds.length < 2) continue;
 
-    // Find first two time-like cells (Hora Inicio / Hora Fin), then a title cell
-    const timeLike = (s) => /\b\d{1,2}:\d{2}\b/.test(cleanText(s));
+    // Find first two time-like cells (Hora Inicio / Hora Fin)
+    const isTime = (s) => /\b\d{1,2}:\d{2}\b/.test(cleanText(s));
     let idxStart = -1, idxEnd = -1;
-    for (let i = 0; i < Math.min(3, tds.length); i++) {
-      if (idxStart === -1 && timeLike(tds[i])) { idxStart = i; continue; }
-      if (idxStart !== -1 && idxEnd === -1 && timeLike(tds[i])) { idxEnd = i; break; }
+    for (let i = 0; i < Math.min(4, tds.length); i++) {
+      if (idxStart === -1 && isTime(tds[i])) { idxStart = i; continue; }
+      if (idxStart !== -1 && idxEnd === -1 && isTime(tds[i])) { idxEnd = i; break; }
     }
     if (idxStart === -1) continue;
 
-    // Title: prefer the next non-empty cell after end time; else the last cell
+    // Title = first non-empty text cell after the end time (or after start if no end)
     let titleIdx = -1;
     for (let i = Math.max(idxEnd, idxStart) + 1; i < tds.length; i++) {
       const txt = cleanText(tds[i]);
       if (txt) { titleIdx = i; break; }
     }
-    if (titleIdx === -1 && tds.length) titleIdx = tds.length - 1;
+    if (titleIdx === -1) titleIdx = tds.length - 1;
 
     const startLocal = cleanText(tds[idxStart] || '');
     const stopLocal = idxEnd !== -1 ? cleanText(tds[idxEnd] || '') : null;
@@ -88,7 +89,7 @@ function parseScheduleTableRows(html) {
   return dedupeRows(rows);
 }
 
-// Fallback heuristic: find "time ... title" patterns anywhere in the HTML
+// Fallback: heuristic pattern "start [- end] ... <tag>Title</tag>"
 function parseScheduleHeuristic(html) {
   const rows = [];
   const cleaned = html
@@ -129,27 +130,25 @@ function parseSchedule(html) {
   return parseScheduleHeuristic(html);
 }
 
-function parseLocalToUTC(dateISO, timeStr, tz) {
+function parseLocalToUTC(localDateISO, timeStr, tz) {
   // Accepts "7:00", "7:00 am", "7:00 p.m.", "19:30"
-  let s = (timeStr || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
+  const s = (timeStr || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
   const m = s.match(/(\d{1,2}):(\d{2})/);
   if (!m) return null;
   let h = +m[1], mi = +m[2];
-  const ampm = /(am|pm)\b/.test(s);
-  const isPM = /pm\b/.test(s);
-  if (ampm) {
+  if (/\b(am|pm)\b/.test(s)) {
+    const isPM = /\bpm\b/.test(s);
     if (isPM && h < 12) h += 12;
     if (!isPM && h === 12) h = 0;
   }
-  const dt = DateTime.fromISO(
-    `${dateISO}T${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}:00`,
+  return DateTime.fromISO(
+    `${localDateISO}T${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}:00`,
     { zone: tz }
-  );
-  return dt.toUTC().toISO();
+  ).toUTC().toISO();
 }
 
 function materializeDay(rows, localISO, tz) {
-  // Convert (start[, stop], title) rows into UTC spans; infer stop from next start or +60m
+  // Turn (start[, stop], title) into UTC spans; infer stop from next start or +60m
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -168,13 +167,12 @@ function materializeDay(rows, localISO, tz) {
 }
 
 async function fetchChannelDay(url, localISO) {
-  // Many GatoTV channel pages accept /YYYY-MM-DD. If not, base page usually shows “today”.
+  // Many GatoTV pages accept /YYYY-MM-DD; if not, base page usually shows “today”
   let u = url;
   if (!/(\/)\d{4}-\d{2}-\d{2}$/.test(url)) u = url.replace(/\/?$/, `/${localISO}`);
   try {
     const html = await fetchHtml(u);
-    const rows = parseSchedule(html);
-    return { url: u, rows };
+    return { url: u, rows: parseSchedule(html) };
   } catch {
     return { url: u, rows: [] };
   }
@@ -190,6 +188,7 @@ function clamp24h(programs, nowUTC, hours) {
     }));
 }
 
+// ---------- DB ----------
 function sb() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     auth: { persistSession: false },
@@ -221,6 +220,7 @@ async function savePrograms(programs) {
   console.log(`Program ingest attempted: ${programs.length}`);
 }
 
+// ---------- MAIN ----------
 async function main() {
   await fs.mkdir('out/mx', { recursive: true });
 
@@ -237,7 +237,7 @@ async function main() {
   );
   console.log(`GatoTV directory channels: ${channels.length}`);
 
-  // 2) Today + tomorrow → clamp to 24h
+  // 2) Today + tomorrow → clamp to 24h window
   const nowUTC = DateTime.utc();
   const localNow = nowUTC.setZone(GATOTV_TZ);
   const todayISO = localNow.toISODate();
@@ -253,7 +253,8 @@ async function main() {
 
     for (const r of clamped) {
       programs.push({
-        channel_id: ch.url,          // use GatoTV URL as ID; you will join via SQL later
+        // Use the GatoTV channel page URL as the channel_id for now (safe for testing & later SQL joins)
+        channel_id: ch.url,
         start_ts: r.start_ts,
         stop_ts: r.stop_ts,
         title: r.title,
@@ -272,10 +273,9 @@ async function main() {
         credits: null,
         premiere: false,
         previously_shown: false,
+        // pack provenance safely into an existing column
         extras: { source: 'gatotv', channel_name: ch.name },
-        ingested_at: DateTime.utc().toISO(),
-        source_epg: 'gatotv',
-        source_url: ch.url
+        ingested_at: DateTime.utc().toISO()
       });
     }
   }
