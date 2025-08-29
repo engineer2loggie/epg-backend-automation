@@ -1,491 +1,305 @@
-name: LATAM-EPG
+// scripts/latam-iptvcat.mjs
+// Crawl iptvcat LATAM pages → follow each /my_list/... page in-browser,
+// extract ALL .m3u8 URLs (plus any direct table .m3u8 links), probe them,
+// pick the best per channel, upsert to streams_latam, and emit rich artifacts.
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 7 * * *'  # daily 07:00 UTC
+import { chromium } from 'playwright';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { createClient } from '@supabase/supabase-js';
+import { DateTime } from 'luxon';
 
-concurrency:
-  group: latam-epg
-  cancel-in-progress: true
+// ---------- ENV ----------
+const START_URL = process.env.IPTVCAT_START_URL || 'https://iptvcat.com/latin_america__7/';
+const MAX_PAGES = Number(process.env.IPTVCAT_MAX_PAGES || '0'); // 0 = all
+const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
+const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '10000');
+const PROBE_CONCURRENCY = Number(process.env.PROBE_CONCURRENCY || '8');
 
-jobs:
-  latam_streams_iptvcat:
-    name: LATAM Streams (iptvcat)
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: bash
-    env:
-      IPTVCAT_START_URL: 'https://iptvcat.com/latin_america__7/'
-      IPTVCAT_MAX_PAGES: '0'          # 0 = crawl all pages found
-      PROBE_TIMEOUT_MS: '10000'       # 10s probe
-      PROBE_CONCURRENCY: '8'
-      HEADLESS: 'true'
-      # DB
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      SUPABASE_SCHEMA: 'public'
-      STREAMS_TABLE: 'streams_latam'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
+const STREAMS_TABLE = process.env.STREAMS_TABLE || 'streams_latam';
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
+// ---------- DB ----------
+function sb() {
+  return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false },
+    db: { schema: SUPABASE_SCHEMA },
+  });
+}
 
-      - name: Install deps
-        run: |
-          set -euo pipefail
-          npm i --no-save playwright @supabase/supabase-js luxon
-          npx playwright install --with-deps chromium
+// ---------- Playwright helpers ----------
+async function newBrowser() {
+  return chromium.launch({
+    headless: HEADLESS,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-gpu',
+    ],
+  });
+}
+async function newPage(browser) {
+  const page = await browser.newPage({
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+  page.setDefaultNavigationTimeout(45000);
+  page.setDefaultTimeout(20000);
+  return page;
+}
+async function withPage(browser, url, fn) {
+  const page = await newPage(browser);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    return await fn(page);
+  } finally {
+    await page.close();
+  }
+}
 
-      - name: Write script (latam-iptvcat.mjs)
-        run: |
-          set -euo pipefail
-          mkdir -p scripts out/latam
-          cat > scripts/latam-iptvcat.mjs <<'EOF'
-          import { chromium } from 'playwright';
-          import fs from 'node:fs/promises';
-          import path from 'node:path';
-          import { createClient } from '@supabase/supabase-js';
-          import { DateTime } from 'luxon';
+// ---------- Crawl pagination ----------
+async function collectPagination(browser) {
+  const urls = await withPage(browser, START_URL, async (page) => {
+    const own = new URL(page.url()).href;
+    const list = new Set([own]);
+    const links = await page.$$eval('a[href]', (as) =>
+      as.map((a) => a.getAttribute('href')).filter(Boolean)
+    );
+    for (const href of links) {
+      try {
+        const url = new URL(href, location.href).href;
+        if (/latin_america__7(\/\d+\/?)?$/.test(url)) list.add(url);
+      } catch {}
+    }
+    return [...list];
+  });
+  return MAX_PAGES > 0 ? urls.slice(0, MAX_PAGES) : urls;
+}
 
-          const START_URL = process.env.IPTVCAT_START_URL || 'https://iptvcat.com/latin_america__7/';
-          const MAX_PAGES = Number(process.env.IPTVCAT_MAX_PAGES || '0');
-          const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
-          const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '10000');
-          const PROBE_CONCURRENCY = Number(process.env.PROBE_CONCURRENCY || '8');
+// ---------- Extract rows from a list page ----------
+async function collectRowsFromPage(browser, url) {
+  return withPage(browser, url, async (page) => {
+    return await page.$$eval('table tbody tr, tr', (rows) => {
+      const out = [];
+      for (const tr of rows) {
+        const tds = [...tr.querySelectorAll('td')];
+        const name = (tds[0]?.innerText || '').trim();
+        const dl = tr.querySelector('a[href*="/my_list/"]');
+        const directM3U8s = [...tr.querySelectorAll('a[href$=".m3u8"]')].map((a) => a.href);
+        if (!name || (!dl && directM3U8s.length === 0)) continue;
 
-          const SUPABASE_URL = process.env.SUPABASE_URL || '';
-          const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-          const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
-          const STREAMS_TABLE = process.env.STREAMS_TABLE || 'streams_latam';
+        const quality =
+          (tds[1]?.innerText || '').trim() ||
+          (tds[2]?.innerText || '').trim() ||
+          '';
+        const country = (tds[tds.length - 1]?.innerText || '').trim();
 
-          function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
+        out.push({
+          channel_name: name,
+          download_url: dl ? dl.href : null,
+          direct_m3u8s: directM3U8s,
+          quality_hint: quality,
+          country_hint: country,
+          source_page: location.href,
+        });
+      }
+      return out;
+    });
+  });
+}
 
-          async function withPage(browser, url, fn){
-            const page = await browser.newPage();
-            try {
-              await page.goto(url, { waitUntil: 'domcontentloaded' });
-              await page.waitForTimeout(400);
-              return await fn(page);
-            } finally { await page.close(); }
-          }
+// ---------- Read a /my_list/... page and pull all URLs ----------
+async function fetchListBodyViaBrowser(browser, url) {
+  return await withPage(browser, url, async (page) => {
+    const sel = await page.$('pre, code, textarea');
+    if (sel) {
+      const txt = await sel.innerText();
+      return (txt || '').trim();
+    }
+    const bodyText = await page.evaluate(() => document.body?.innerText || '');
+    return (bodyText || '').trim();
+  });
+}
 
-          async function collectPagination(browser){
-            const urls = await withPage(browser, START_URL, async (page)=>{
-              const base = new URL(page.url()).origin;
-              const a = await page.$$eval('a[href^="/latin_america__7/"]', els => els.map(e => e.getAttribute('href')));
-              const list = new Set([new URL(page.url()).href]);
-              for (const href of a) {
-                if (!href) continue;
-                try { list.add(new URL(href, base).href); } catch {}
-              }
-              return [...list].filter(u => /latin_america__7(\/\d+\/?)?$/.test(u));
-            });
-            return (MAX_PAGES > 0) ? urls.slice(0, MAX_PAGES) : urls;
-          }
+function extractM3U8s(text) {
+  const out = [];
+  const re = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi;
+  let m;
+  while ((m = re.exec(text))) out.push(m[0]);
+  return [...new Set(out)];
+}
 
-          async function collectRowsFromPage(browser, url){
-            return await withPage(browser, url, async (page)=>{
-              return await page.$$eval('tr', (rows)=>{
-                const out = [];
-                for (const tr of rows){
-                  const a = tr.querySelector('a[href^="https://list.iptvcat.com/my_list/"]');
-                  if (!a) continue;
-                  const tds = [...tr.querySelectorAll('td')];
-                  const name = (tds[0]?.innerText || '').trim();
-                  const quality = (tds[1]?.innerText || '').trim() || (tds[2]?.innerText || '').trim();
-                  const country = (tds[tds.length-1]?.innerText || '').trim();
-                  out.push({ channel_name: name, download_url: a.href, quality_hint: quality, country_hint: country });
-                }
-                return out;
-              });
-            });
-          }
+// ---------- Probe utilities ----------
+function absolutize(base, ref) {
+  try {
+    return new URL(ref, base).href;
+  } catch {
+    return ref;
+  }
+}
+function bestFromMaster(baseUrl, text) {
+  const lines = (text || '').split(/\r?\n/);
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i].trim();
+    if (L.startsWith('#EXT-X-STREAM-INF')) {
+      const attrsRaw = (L.split(':')[1] || '').split(',');
+      const attrs = Object.create(null);
+      for (const kv of attrsRaw) {
+        const [k, v] = kv.split('=');
+        if (!k) continue;
+        attrs[k.trim().toUpperCase()] = (v || '').trim().replace(/^"|"$/g, '');
+      }
+      const bw = Number(String(attrs.BANDWIDTH || '').replace(/[^0-9]/g, '')) || 0;
+      const next = lines[i + 1] ? lines[i + 1].trim() : '';
+      if (next && !next.startsWith('#')) variants.push({ bw, url: absolutize(baseUrl, next) });
+    }
+  }
+  variants.sort((a, b) => b.bw - a.bw);
+  return variants[0]?.url || null;
+}
 
-          async function fetchText(url, headers={}, timeoutMs=PROBE_TIMEOUT_MS){
-            const ac = new AbortController();
-            const to = setTimeout(()=>ac.abort(), timeoutMs);
-            try {
-              const r = await fetch(url, { headers:{ 'user-agent':'Mozilla/5.0', ...headers }, redirect:'follow', signal: ac.signal });
-              if (!r.ok) return null;
-              return await r.text();
-            } catch { return null; } finally { clearTimeout(to); }
-          }
+async function fetchHead(url, signal) {
+  try {
+    const r = await fetch(url, {
+      method: 'HEAD',
+      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/vnd.apple.mpegurl,text/plain,*/*' },
+      redirect: 'follow',
+      signal,
+    });
+    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', finalUrl: r.url };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+async function fetchRange(url, signal) {
+  try {
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'user-agent': 'Mozilla/5.0',
+        accept: 'application/vnd.apple.mpegurl,text/plain,*/*',
+        Range: 'bytes=0-1023',
+      },
+      redirect: 'follow',
+      signal,
+    });
+    const txt = await r.text();
+    return {
+      ok: r.status === 200 || r.status === 206,
+      status: r.status,
+      ct: r.headers.get('content-type') || '',
+      finalUrl: r.url,
+      txt,
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+async function fetchText(url, signal) {
+  try {
+    const r = await fetch(url, {
+      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/vnd.apple.mpegurl,text/plain,*/*' },
+      redirect: 'follow',
+      signal,
+    });
+    const txt = await r.text();
+    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', finalUrl: r.url, txt };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
 
-          function absolutize(base, ref){ try { return new URL(ref, base).href; } catch { return ref; } }
+async function probePlaylist(url) {
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
+  try {
+    // HEAD: accept HLS content-type as a pass
+    let head = await fetchHead(url, ac.signal);
+    if (head.ok && /mpegurl|application\/x-mpegURL/i.test(head.ct)) {
+      return { ok: true, url: head.finalUrl, reason: 'head-hls-ct' };
+    }
 
-          function bestFromMaster(baseUrl, text){
-            const lines = (text||'').split(/\r?\n/);
-            const variants = [];
-            for (let i=0;i<lines.length;i++){
-              const L = lines[i].trim();
-              if (L.startsWith('#EXT-X-STREAM-INF')){
-                const attrs = Object.fromEntries((L.split(':')[1]||'').split(',').map(p=>p.split('=').map(x=>x.trim())));
-                const bw = Number(String(attrs.BANDWIDTH||'').replace(/[^0-9]/g,'')) || 0;
-                const next = lines[i+1] ? lines[i+1].trim() : '';
-                if (next && !next.startsWith('#')) variants.push({ bw, url: absolutize(baseUrl, next) });
-              }
-            }
-            variants.sort((a,b)=>b.bw-a.bw);
-            return variants[0]?.url || null;
-          }
+    // Range GET
+    let part = await fetchRange(url, ac.signal);
+    if (part.ok) {
+      if (/#EXTM3U/.test(part.txt)) {
+        // If master, choose best variant and verify
+        if (/#EXT-X-STREAM-INF/i.test(part.txt)) {
+          const best = bestFromMaster(url, part.txt) || url;
+          const full = await fetchText(best, ac.signal);
+          const ok = full.ok && /#EXTM3U/.test(full.txt);
+          return { ok, url: full.finalUrl || best, reason: ok ? 'master-best' : 'master-best-failed' };
+        }
+        return { ok: true, url, reason: 'media-extm3u' };
+      }
+      if (/mpegurl|application\/x-mpegURL/i.test(part.ct)) {
+        return { ok: true, url: part.finalUrl || url, reason: 'range-hls-ct' };
+      }
+    }
 
-          async function probeOne(downloadUrl){
-            const text = await fetchText(downloadUrl);
-            if (!text) return { ok:false, url: downloadUrl };
-            const isMaster = /#EXT-X-STREAM-INF/i.test(text);
-            let final = downloadUrl;
-            if (isMaster){
-              const best = bestFromMaster(downloadUrl, text);
-              final = best || downloadUrl;
-            }
-            const probe = await fetchText(final, {}, 6000);
-            if (!probe) return { ok:false, url: final };
-            return { ok: /#EXTM3U/.test(probe), url: final };
-          }
+    // Full GET as last resort
+    const full = await fetchText(url, ac.signal);
+    if (full.ok && /#EXTM3U/.test(full.txt)) {
+      if (/#EXT-X-STREAM-INF/i.test(full.txt)) {
+        const best = bestFromMaster(url, full.txt) || url;
+        const full2 = await fetchText(best, ac.signal);
+        const ok = full2.ok && /#EXTM3U/.test(full2.txt);
+        return { ok, url: full2.finalUrl || best, reason: ok ? 'master-best' : 'master-best-failed' };
+      }
+      return { ok: true, url: full.finalUrl || url, reason: 'media-extm3u' };
+    }
+    if (full.ok && /mpegurl|application\/x-mpegURL/i.test(full.ct)) {
+      return { ok: true, url: full.finalUrl || url, reason: 'get-hls-ct' };
+    }
 
-          async function pLimit(n, list, fn){
-            const out = new Array(list.length);
-            let i=0; const workers = Array.from({length:n}, async ()=>{
-              while(i<list.length){ const idx=i++; out[idx] = await fn(list[idx], idx); }
-            });
-            await Promise.all(workers); return out;
-          }
+    return { ok: false, url, reason: 'no-extm3u' };
+  } catch {
+    return { ok: false, url, reason: 'exception' };
+  } finally {
+    clearTimeout(to);
+  }
+}
 
-          async function saveStreams(rows){
-            if (!rows.length){ console.log('No rows to save.'); return; }
-            if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY){ console.log('No Supabase creds; skipping DB upsert'); return; }
-            const client = sb();
-            const BATCH = 500;
-            for (let i=0;i<rows.length;i+=BATCH){
-              const slice = rows.slice(i,i+BATCH);
-              const { error } = await client.from(STREAMS_TABLE).upsert(slice, { onConflict: 'stream_url' });
-              if (error){ console.warn('Upsert error:', error.message); break; }
-            }
-            console.log(`Saved ${rows.length} rows to ${STREAMS_TABLE}`);
-          }
+async function pLimit(n, arr, fn) {
+  const out = new Array(arr.length);
+  let i = 0;
+  const workers = Array.from({ length: n }, async () => {
+    while (i < arr.length) {
+      const idx = i++;
+      out[idx] = await fn(arr[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 
-          async function main(){
-            await fs.mkdir('out/latam', { recursive:true });
-            const browser = await chromium.launch({ headless: HEADLESS });
-            try {
-              const pages = await collectPagination(browser);
-              console.log('Pages to crawl:', pages.length);
-              const allRows = [];
-              for (const url of pages){
-                const rows = await collectRowsFromPage(browser, url);
-                allRows.push(...rows);
-              }
-              // dedupe by download_url
-              const byDl = new Map(); for (const r of allRows){ if (!byDl.has(r.download_url)) byDl.set(r.download_url, r); }
-              const unique = [...byDl.values()];
+function rankByHint(u, q) {
+  const urlScore = /2160|4k|uhd/i.test(u) ? 4 : /1080|fhd/i.test(u) ? 3 : /720|hd/i.test(u) ? 2 : 1;
+  const qualScore = /2160|4k|uhd/i.test(q || '') ? 4 : /1080|fhd/i.test(q || '') ? 3 : /720|hd/i.test(q || '') ? 2 : 1;
+  return urlScore * 10 + qualScore; // favor 4k>1080>720, tie-break by quality_hint
+}
 
-              const probes = await pLimit(PROBE_CONCURRENCY, unique, async (row)=>{
-                const pr = await probeOne(row.download_url);
-                return { ...row, probe_ok: pr.ok, final_url: pr.url };
-              });
-
-              await fs.writeFile(path.join('out','latam','iptvcat_probes.json'), JSON.stringify(probes, null, 2), 'utf8');
-
-              // pick best per channel
-              const rank = (q)=> /1080|FHD|2K/i.test(q||'') ? 3 : /720|HD/i.test(q||'') ? 2 : 1;
-              const byName = new Map();
-              for (const p of probes){
-                const key = (p.channel_name||'').trim().toLowerCase();
-                const candScore = (p.probe_ok?10:0) + rank(p.quality_hint);
-                const cur = byName.get(key);
-                if (!cur || candScore > cur.__score) byName.set(key, { ...p, __score: candScore });
-              }
-              const best = [...byName.values()].filter(x=>x.probe_ok);
-
-              const now = DateTime.utc().toISO();
-              const upserts = best.map(b=>({
-                stream_url: b.final_url,
-                channel_name: b.channel_name,
-                country_hint: b.country_hint || null,
-                quality_hint: b.quality_hint || null,
-                source_page_url: b.download_url,
-                source: 'iptvcat',
-                working: true,
-                checked_at: now,
-                extras: { origin: 'iptvcat', raw_download: b.download_url }
-              }));
-
-              await fs.writeFile(path.join('out','latam','streams_latam.json'), JSON.stringify(upserts, null, 2), 'utf8');
-              await saveStreams(upserts);
-              console.log(`iptvcat ingestion done. Channels kept: ${upserts.length}`);
-            } finally { await browser.close(); }
-          }
-
-          main().catch(e=>{ console.error(e); process.exit(1); });
-          EOF
-
-      - name: Run LATAM Streams ingest
-        run: |
-          set -euo pipefail
-          node scripts/latam-iptvcat.mjs
-
-      - name: Upload artifacts (streams)
-        uses: actions/upload-artifact@v4
-        with:
-          name: latam-streams
-          path: |
-            out/latam/iptvcat_probes.json
-            out/latam/streams_latam.json
-          if-no-files-found: warn
-
-  gatotv_epg_24h:
-    name: GatoTV EPG (24h, CSS-first)
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    needs: [latam_streams_iptvcat]
-    defaults:
-      run:
-        shell: bash
-    env:
-      GATOTV_DIR_URL: 'https://www.gatotv.com/canales_de_tv'
-      GATOTV_TZ: 'America/Mexico_City'
-      PROGRAMS_HOURS_AHEAD: '24'
-      HEADLESS: 'true'
-      PER_PAGE_DELAY_MS: '150'
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      SUPABASE_SCHEMA: 'public'
-      PROGRAMS_TABLE: 'epg_programs'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install deps
-        run: |
-          set -euo pipefail
-          npm i --no-save playwright @supabase/supabase-js luxon
-          npx playwright install --with-deps chromium
-
-      - name: Write script (gatotv-epg-24h.mjs)
-        run: |
-          set -euo pipefail
-          mkdir -p scripts out/mx
-          cat > scripts/gatotv-epg-24h.mjs <<'EOF'
-          import { chromium } from 'playwright';
-          import fs from 'node:fs/promises';
-          import path from 'node:path';
-          import { createClient } from '@supabase/supabase-js';
-          import { DateTime } from 'luxon';
-
-          const DIR_URL = process.env.GATOTV_DIR_URL || 'https://www.gatotv.com/canales_de_tv';
-          const TZ = process.env.GATOTV_TZ || 'America/Mexico_City';
-          const HOURS = Number(process.env.PROGRAMS_HOURS_AHEAD || '24');
-          const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
-          const PER_PAGE_DELAY_MS = Number(process.env.PER_PAGE_DELAY_MS || '150');
-
-          const SUPABASE_URL = process.env.SUPABASE_URL || '';
-          const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-          const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
-          const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE || 'epg_programs';
-
-          function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
-
-          async function savePrograms(rows){
-            if (!rows.length) return;
-            if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY){ console.log('No Supabase creds; skipping DB upsert'); return; }
-            const client = sb(); const BATCH=500;
-            for (let i=0;i<rows.length;i+=BATCH){
-              const slice = rows.slice(i,i+BATCH);
-              let { error } = await client.from(PROGRAMS_TABLE).upsert(slice, { onConflict: 'channel_id, start_ts' });
-              if (error && /no unique|no exclusion/i.test(error.message||'')) ({ error } = await client.from(PROGRAMS_TABLE).insert(slice));
-              if (error){ console.warn('Programs batch failed:', error.message); break; }
-            }
-            console.log(`Program ingest attempted: ${rows.length}`);
-          }
-
-          async function getChannelLinks(page){
-            await page.goto(DIR_URL, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(500);
-            const links = await page.$$eval('a[href^="/canal/"]', els => {
-              const seen = new Set(); const out = [];
-              for (const a of els){
-                const href = a.getAttribute('href'); if (!href) continue;
-                const url = new URL(href, location.href).href;
-                const name = (a.textContent || '').trim();
-                if (!name || seen.has(url)) continue;
-                seen.add(url); out.push({ name, url });
-              }
-              return out;
-            });
-            return links;
-          }
-
-          async function scrapeSchedule(page){
-            // Table-first: look for headers 'Hora Inicio' / 'Hora Fin' / 'Programa'
-            const rows = [];
-            const tables = await page.$$('table');
-            for (const tbl of tables){
-              const thTexts = await tbl.$$eval('th', ths => ths.map(th => th.innerText.trim().toLowerCase()));
-              const idxStart = thTexts.findIndex(t => /hora\\s*inicio/.test(t));
-              const idxEnd   = thTexts.findIndex(t => /hora\\s*fin/.test(t));
-              const idxProg  = thTexts.findIndex(t => /programa/.test(t));
-              if (idxStart === -1 || idxProg === -1) continue;
-              const trs = await tbl.$$('tbody tr, tr');
-              for (const tr of trs){
-                const tds = await tr.$$eval('td', tds => tds.map(td => td.innerText.trim()));
-                if (!tds.length) continue;
-                const start = tds[idxStart] || '';
-                const stop  = idxEnd !== -1 ? (tds[idxEnd] || '') : '';
-                const title = tds[idxProg] || '';
-                if (start && title) rows.push({ startLocal: start, stopLocal: stop || null, title });
-              }
-            }
-            if (rows.length) return rows;
-
-            // Fallback heuristic regex on page content
-            const html = await page.content();
-            const cleaned = html.replace(/\r|\n/g,' ').replace(/<\s*br\s*\/?>/gi,' ').replace(/\s+/g,' ');
-            const rx = /(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)\s*-?\s*(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)?[^>]*?<[^>]*?>([^<]{2,160})/gi;
-            const seen = new Set(); let m; const out = [];
-            while ((m = rx.exec(cleaned))) {
-              const start = (m[1]||'').trim();
-              const stop  = (m[2]||'').trim() || null;
-              const title = (m[3]||'').trim();
-              const key = `${start}|${stop}|${title}`;
-              if (!start || !title || seen.has(key)) continue;
-              seen.add(key); out.push({ startLocal: start, stopLocal: stop, title });
-            }
-            return out;
-          }
-
-          function localToUTC(localDateISO, timeStr, tz){
-            const s = (timeStr||'').toLowerCase().replace(/\./g,'').replace(/\s+/g,' ');
-            const m = s.match(/(\d{1,2}):(\d{2})/);
-            if (!m) return null;
-            let h = +m[1], mi = +m[2];
-            if (/\b(am|pm)\b/.test(s)){
-              const isPM = /\bpm\b/.test(s);
-              if (isPM && h < 12) h += 12;
-              if (!isPM && h === 12) h = 0;
-            }
-            return DateTime.fromISO(`${localDateISO}T${String(h).padStart(2,'0')}:${String(mi).padStart(2,'0')}:00`, { zone: tz }).toUTC().toISO();
-          }
-
-          function clamp24(programs, hours){
-            const nowUTC = DateTime.utc();
-            const endUTC = nowUTC.plus({ hours });
-            return programs.filter(p => DateTime.fromISO(p.start_ts) < endUTC)
-                           .map(p => ({ ...p, stop_ts: DateTime.fromISO(p.stop_ts) > endUTC ? endUTC.toISO() : p.stop_ts }));
-          }
-
-          async function main(){
-            await fs.mkdir('out/mx', { recursive:true });
-            const browser = await chromium.launch({ headless: HEADLESS });
-            const page = await browser.newPage();
-            try{
-              const links = await getChannelLinks(page);
-              await fs.writeFile(path.join('out','mx','gatotv_directory.json'), JSON.stringify(links, null, 2), 'utf8');
-              console.log('GatoTV links:', links.length);
-
-              const nowUTC = DateTime.utc();
-              const localNow = nowUTC.setZone(TZ);
-              const todayISO = localNow.toISODate();
-              const tomorrowISO = localNow.plus({ days: 1 }).toISODate();
-
-              const results = [];
-              for (const ch of links){
-                // today
-                const urlToday = /\/\d{4}-\d{2}-\d{2}$/.test(ch.url) ? ch.url : ch.url.replace(/\/?$/, `/${todayISO}`);
-                await page.goto(urlToday, { waitUntil: 'domcontentloaded' });
-                await page.waitForTimeout(200);
-                const rows1 = await scrapeSchedule(page);
-
-                // tomorrow
-                const urlTomorrow = /\/\d{4}-\d{2}-\d{2}$/.test(ch.url) ? ch.url : ch.url.replace(/\/?$/, `/${tomorrowISO}`);
-                await page.goto(urlTomorrow, { waitUntil: 'domcontentloaded' });
-                await page.waitForTimeout(200);
-                const rows2 = await scrapeSchedule(page);
-
-                const combined = [...rows1, ...rows2];
-                const spans = [];
-                for (let i=0;i<combined.length;i++){
-                  const r = combined[i];
-                  const guessDate = /\b(am|pm)\b/i.test(r.startLocal) ? todayISO : (r.startLocal < '06:00' ? tomorrowISO : todayISO);
-                  const start_ts = localToUTC(guessDate, r.startLocal, TZ);
-                  if (!start_ts) continue;
-                  let stop_ts = null;
-                  if (r.stopLocal){
-                    const sd = /\b(am|pm)\b/i.test(r.stopLocal) ? todayISO : (r.stopLocal < '06:00' ? tomorrowISO : todayISO);
-                    stop_ts = localToUTC(sd, r.stopLocal, TZ);
-                  } else if (combined[i+1]?.startLocal){
-                    const nx = combined[i+1].startLocal;
-                    const nd = /\b(am|pm)\b/i.test(nx) ? todayISO : (nx < '06:00' ? tomorrowISO : todayISO);
-                    stop_ts = localToUTC(nd, nx, TZ);
-                  }
-                  if (!stop_ts) stop_ts = DateTime.fromISO(start_ts).plus({ minutes: 60 }).toISO();
-                  if (DateTime.fromISO(stop_ts) <= DateTime.fromISO(start_ts)) stop_ts = DateTime.fromISO(start_ts).plus({ minutes: 30 }).toISO();
-                  spans.push({ title: r.title, start_ts, stop_ts });
-                }
-
-                const clamped = clamp24(spans, Number(process.env.PROGRAMS_HOURS_AHEAD || '24'));
-                for (const p of clamped){
-                  results.push({
-                    channel_id: ch.url,
-                    start_ts: p.start_ts,
-                    stop_ts: p.stop_ts,
-                    title: p.title,
-                    sub_title: null,
-                    summary: null,
-                    categories: [],
-                    program_url: null,
-                    episode_num_xmltv: null,
-                    icon_url: null,
-                    rating: null,
-                    star_rating: null,
-                    season: null,
-                    episode: null,
-                    language: 'es',
-                    orig_language: 'es',
-                    credits: null,
-                    premiere: false,
-                    previously_shown: false,
-                    extras: { source: 'gatotv', channel_name_raw: ch.name },
-                    ingested_at: DateTime.utc().toISO(),
-                    source_epg: 'gatotv',
-                    source_url: ch.url
-                  });
-                }
-                await page.waitForTimeout(PER_PAGE_DELAY_MS);
-              }
-
-              await fs.writeFile(path.join('out','mx','epg_programs_sample.json'), JSON.stringify(results.slice(0,200), null, 2), 'utf8');
-              await savePrograms(results);
-              console.log(`GatoTV 24h ingest complete. Channels scraped: ${links.length}, programs: ${results.length}`);
-            } finally { await browser.close(); }
-          }
-
-          main().catch(e=>{ console.error(e); process.exit(1); });
-          EOF
-
-      - name: Run GatoTV EPG 24h
-        run: |
-          set -euo pipefail
-          node scripts/gatotv-epg-24h.mjs
-
-      - name: Upload artifacts (EPG)
-        uses: actions/upload-artifact@v4
-        with:
-          name: gatotv-epg-24h
-          path: |
-            out/mx/gatotv_directory.json
-            out/mx/epg_programs_sample.json
-          if-no-files-found: warn
+// ---------- Save ----------
+async function saveStreams(rows) {
+  if (!rows.length) {
+    console.log('No rows to save.');
+    return;
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.log('No Supabase creds; skipping DB upsert');
+    return;
+  }
+  const client = sb();
+  const BATCH = 500;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const slice = rows.slice(i, i + BATCH);
+    const { error } = await client.from(STREAMS_TABLE).upsert(slice, { onConflict: 'stream_url' });
+    if (error) {
