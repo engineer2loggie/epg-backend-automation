@@ -1,17 +1,13 @@
 // scripts/latam-iptvcat.mjs
-// Crawl iptvcat LATAM pages → follow each /my_list/... page in-browser,
-// extract ALL .m3u8 URLs (plus any direct table .m3u8 links), probe them,
-// pick the best per channel, upsert to streams_latam, and emit rich artifacts.
-
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 import { DateTime } from 'luxon';
 
-// ---------- ENV ----------
+// ENV
 const START_URL = process.env.IPTVCAT_START_URL || 'https://iptvcat.com/latin_america__7/';
-const MAX_PAGES = Number(process.env.IPTVCAT_MAX_PAGES || '0'); // 0 = all
+const MAX_PAGES = Number(process.env.IPTVCAT_MAX_PAGES || '0');
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
 const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '10000');
 const PROBE_CONCURRENCY = Number(process.env.PROBE_CONCURRENCY || '8');
@@ -21,7 +17,7 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
 const STREAMS_TABLE = process.env.STREAMS_TABLE || 'streams_latam';
 
-// ---------- DB ----------
+// Supabase
 function sb() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     auth: { persistSession: false },
@@ -29,15 +25,11 @@ function sb() {
   });
 }
 
-// ---------- Playwright helpers ----------
+// Playwright helpers
 async function newBrowser() {
   return chromium.launch({
     headless: HEADLESS,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-gpu',
-    ],
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
   });
 }
 async function newPage(browser) {
@@ -57,33 +49,34 @@ async function withPage(browser, url, fn) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(500);
     return await fn(page);
   } finally {
     await page.close();
   }
 }
 
-// ---------- Crawl pagination ----------
+// Crawl pagination (kept simple)
 async function collectPagination(browser) {
   const urls = await withPage(browser, START_URL, async (page) => {
     const own = new URL(page.url()).href;
-    const list = new Set([own]);
+    const set = new Set([own]);
     const links = await page.$$eval('a[href]', (as) =>
       as.map((a) => a.getAttribute('href')).filter(Boolean)
     );
     for (const href of links) {
       try {
-        const url = new URL(href, location.href).href;
-        if (/latin_america__7(\/\d+\/?)?$/.test(url)) list.add(url);
+        const u = new URL(href, location.href).href;
+        // Accept current page and numbered sub-pages like /latin_america__7/2/
+        if (/latin_america__7(\/\d+\/?)?$/i.test(u)) set.add(u);
       } catch {}
     }
-    return [...list];
+    return [...set];
   });
   return MAX_PAGES > 0 ? urls.slice(0, MAX_PAGES) : urls;
 }
 
-// ---------- Extract rows from a list page ----------
+// Extract rows from a listing page
 async function collectRowsFromPage(browser, url) {
   return withPage(browser, url, async (page) => {
     return await page.$$eval('table tbody tr, tr', (rows) => {
@@ -92,19 +85,14 @@ async function collectRowsFromPage(browser, url) {
         const tds = [...tr.querySelectorAll('td')];
         const name = (tds[0]?.innerText || '').trim();
         const dl = tr.querySelector('a[href*="/my_list/"]');
-        const directM3U8s = [...tr.querySelectorAll('a[href$=".m3u8"]')].map((a) => a.href);
-        if (!name || (!dl && directM3U8s.length === 0)) continue;
-
-        const quality =
-          (tds[1]?.innerText || '').trim() ||
-          (tds[2]?.innerText || '').trim() ||
-          '';
+        const direct = [...tr.querySelectorAll('a[href$=".m3u8"]')].map((a) => a.href);
+        if (!name || (!dl && direct.length === 0)) continue;
+        const quality = (tds[1]?.innerText || tds[2]?.innerText || '').trim();
         const country = (tds[tds.length - 1]?.innerText || '').trim();
-
         out.push({
           channel_name: name,
           download_url: dl ? dl.href : null,
-          direct_m3u8s: directM3U8s,
+          direct_m3u8s: direct,
           quality_hint: quality,
           country_hint: country,
           source_page: location.href,
@@ -115,17 +103,28 @@ async function collectRowsFromPage(browser, url) {
   });
 }
 
-// ---------- Read a /my_list/... page and pull all URLs ----------
-async function fetchListBodyViaBrowser(browser, url) {
-  return await withPage(browser, url, async (page) => {
-    const sel = await page.$('pre, code, textarea');
-    if (sel) {
-      const txt = await sel.innerText();
-      return (txt || '').trim();
+// ----- NEW: fetch list bodies without navigating (avoids download error) -----
+async function fetchListBody(url, referer) {
+  try {
+    const r = await fetch(url, {
+      redirect: 'follow',
+      headers: {
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+        accept: 'text/plain,*/*',
+        referer: referer || 'https://iptvcat.com/',
+      },
+    });
+    if (!r.ok) return '';
+    const ct = r.headers.get('content-type') || '';
+    // Both text/plain and application/x-mpegURL etc are fine
+    if (!/text|mpegurl|application\/x-mpegurl/i.test(ct)) {
+      // still try to read as text; if it fails, return empty
     }
-    const bodyText = await page.evaluate(() => document.body?.innerText || '');
-    return (bodyText || '').trim();
-  });
+    return await r.text();
+  } catch {
+    return '';
+  }
 }
 
 function extractM3U8s(text) {
@@ -136,138 +135,72 @@ function extractM3U8s(text) {
   return [...new Set(out)];
 }
 
-// ---------- Probe utilities ----------
-function absolutize(base, ref) {
-  try {
-    return new URL(ref, base).href;
-  } catch {
-    return ref;
-  }
-}
-function bestFromMaster(baseUrl, text) {
-  const lines = (text || '').split(/\r?\n/);
-  const variants = [];
+// Parse master playlist to pick best variant
+function bestFromMaster(baseUrl, txt) {
+  const lines = (txt || '').split(/\r?\n/);
+  const vars = [];
   for (let i = 0; i < lines.length; i++) {
     const L = lines[i].trim();
-    if (L.startsWith('#EXT-X-STREAM-INF')) {
-      const attrsRaw = (L.split(':')[1] || '').split(',');
-      const attrs = Object.create(null);
-      for (const kv of attrsRaw) {
-        const [k, v] = kv.split('=');
-        if (!k) continue;
-        attrs[k.trim().toUpperCase()] = (v || '').trim().replace(/^"|"$/g, '');
+    if (!L.startsWith('#EXT-X-STREAM-INF')) continue;
+    const attrs = (L.split(':')[1] || '')
+      .split(',')
+      .reduce((a, p) => {
+        const [k, v] = (p || '').split('=');
+        if (k) a[k.trim().toUpperCase()] = (v || '').trim().replace(/^"|"$/g, '');
+        return a;
+      }, {});
+    const bw = Number(String(attrs.BANDWIDTH || '').replace(/[^0-9]/g, '')) || 0;
+    const next = lines[i + 1]?.trim() || '';
+    if (next && !next.startsWith('#')) {
+      try {
+        vars.push({ bw, url: new URL(next, baseUrl).href });
+      } catch {
+        vars.push({ bw, url: next });
       }
-      const bw = Number(String(attrs.BANDWIDTH || '').replace(/[^0-9]/g, '')) || 0;
-      const next = lines[i + 1] ? lines[i + 1].trim() : '';
-      if (next && !next.startsWith('#')) variants.push({ bw, url: absolutize(baseUrl, next) });
     }
   }
-  variants.sort((a, b) => b.bw - a.bw);
-  return variants[0]?.url || null;
+  vars.sort((a, b) => b.bw - a.bw);
+  return vars[0]?.url || null;
 }
 
-async function fetchHead(url, signal) {
+// Probe a candidate URL
+async function fetchText(url, signal) {
   try {
     const r = await fetch(url, {
-      method: 'HEAD',
-      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/vnd.apple.mpegurl,text/plain,*/*' },
-      redirect: 'follow',
-      signal,
-    });
-    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', finalUrl: r.url };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-}
-async function fetchRange(url, signal) {
-  try {
-    const r = await fetch(url, {
-      method: 'GET',
       headers: {
         'user-agent': 'Mozilla/5.0',
         accept: 'application/vnd.apple.mpegurl,text/plain,*/*',
-        Range: 'bytes=0-1023',
       },
       redirect: 'follow',
       signal,
     });
-    const txt = await r.text();
-    return {
-      ok: r.status === 200 || r.status === 206,
-      status: r.status,
-      ct: r.headers.get('content-type') || '',
-      finalUrl: r.url,
-      txt,
-    };
+    const t = await r.text();
+    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', url: r.url, txt: t };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
 }
-async function fetchText(url, signal) {
-  try {
-    const r = await fetch(url, {
-      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/vnd.apple.mpegurl,text/plain,*/*' },
-      redirect: 'follow',
-      signal,
-    });
-    const txt = await r.text();
-    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', finalUrl: r.url, txt };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-}
-
 async function probePlaylist(url) {
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
   try {
-    // HEAD: accept HLS content-type as a pass
-    let head = await fetchHead(url, ac.signal);
-    if (head.ok && /mpegurl|application\/x-mpegURL/i.test(head.ct)) {
-      return { ok: true, url: head.finalUrl, reason: 'head-hls-ct' };
-    }
-
-    // Range GET
-    let part = await fetchRange(url, ac.signal);
-    if (part.ok) {
-      if (/#EXTM3U/.test(part.txt)) {
-        // If master, choose best variant and verify
-        if (/#EXT-X-STREAM-INF/i.test(part.txt)) {
-          const best = bestFromMaster(url, part.txt) || url;
-          const full = await fetchText(best, ac.signal);
-          const ok = full.ok && /#EXTM3U/.test(full.txt);
-          return { ok, url: full.finalUrl || best, reason: ok ? 'master-best' : 'master-best-failed' };
-        }
-        return { ok: true, url, reason: 'media-extm3u' };
+    let r = await fetchText(url, ac.signal);
+    if (r.ok && /#EXTM3U/.test(r.txt)) {
+      if (/#EXT-X-STREAM-INF/i.test(r.txt)) {
+        const best = bestFromMaster(url, r.txt) || url;
+        const r2 = await fetchText(best, ac.signal);
+        return { ok: r2.ok && /#EXTM3U/.test(r2.txt), url: r2.url || best, reason: 'master-best' };
       }
-      if (/mpegurl|application\/x-mpegURL/i.test(part.ct)) {
-        return { ok: true, url: part.finalUrl || url, reason: 'range-hls-ct' };
-      }
+      return { ok: true, url: r.url || url, reason: 'media-extm3u' };
     }
-
-    // Full GET as last resort
-    const full = await fetchText(url, ac.signal);
-    if (full.ok && /#EXTM3U/.test(full.txt)) {
-      if (/#EXT-X-STREAM-INF/i.test(full.txt)) {
-        const best = bestFromMaster(url, full.txt) || url;
-        const full2 = await fetchText(best, ac.signal);
-        const ok = full2.ok && /#EXTM3U/.test(full2.txt);
-        return { ok, url: full2.finalUrl || best, reason: ok ? 'master-best' : 'master-best-failed' };
-      }
-      return { ok: true, url: full.finalUrl || url, reason: 'media-extm3u' };
-    }
-    if (full.ok && /mpegurl|application\/x-mpegURL/i.test(full.ct)) {
-      return { ok: true, url: full.finalUrl || url, reason: 'get-hls-ct' };
-    }
-
+    if (r.ok && /mpegurl|application\/x-mpegURL/i.test(r.ct)) return { ok: true, url: r.url || url, reason: 'ct-hls' };
     return { ok: false, url, reason: 'no-extm3u' };
-  } catch {
-    return { ok: false, url, reason: 'exception' };
   } finally {
     clearTimeout(to);
   }
 }
 
+// Concurrency
 async function pLimit(n, arr, fn) {
   const out = new Array(arr.length);
   let i = 0;
@@ -281,20 +214,27 @@ async function pLimit(n, arr, fn) {
   return out;
 }
 
+// Rank
 function rankByHint(u, q) {
   const urlScore = /2160|4k|uhd/i.test(u) ? 4 : /1080|fhd/i.test(u) ? 3 : /720|hd/i.test(u) ? 2 : 1;
-  const qualScore = /2160|4k|uhd/i.test(q || '') ? 4 : /1080|fhd/i.test(q || '') ? 3 : /720|hd/i.test(q || '') ? 2 : 1;
-  return urlScore * 10 + qualScore; // favor 4k>1080>720, tie-break by quality_hint
+  const qual = /2160|4k|uhd/i.test(q || '')
+    ? 4
+    : /1080|fhd/i.test(q || '')
+    ? 3
+    : /720|hd/i.test(q || '')
+    ? 2
+    : 1;
+  return urlScore * 10 + qual;
 }
 
-// ---------- Save ----------
+// Save to Supabase
 async function saveStreams(rows) {
   if (!rows.length) {
     console.log('No rows to save.');
     return;
   }
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.log('No Supabase creds; skipping DB upsert');
+    console.log('No Supabase creds; skip');
     return;
   }
   const client = sb();
@@ -310,57 +250,55 @@ async function saveStreams(rows) {
   console.log(`Saved ${rows.length} rows to ${STREAMS_TABLE}`);
 }
 
-// ---------- MAIN ----------
 async function main() {
   await fs.mkdir('out/latam', { recursive: true });
   const browser = await newBrowser();
-
   try {
     const pages = await collectPagination(browser);
     console.log('Pages to crawl:', pages.length);
     await fs.writeFile(path.join('out', 'latam', 'pages.json'), JSON.stringify(pages, null, 2), 'utf8');
 
-    const allRows = [];
+    const all = [];
     for (const url of pages) {
       const rows = await collectRowsFromPage(browser, url);
-      allRows.push(...rows);
+      all.push(...rows);
     }
-    await fs.writeFile(path.join('out', 'latam', 'rows_raw.json'), JSON.stringify(allRows, null, 2), 'utf8');
+    await fs.writeFile(path.join('out', 'latam', 'rows_raw.json'), JSON.stringify(all, null, 2), 'utf8');
 
-    // Dedup by download_url + collect direct .m3u8 links immediately
-    const byDl = new Map();
-    for (const r of allRows) {
+    // De-dupe by unique download url or direct set
+    const map = new Map();
+    for (const r of all) {
       const key = r.download_url || `direct:${r.channel_name}:${(r.direct_m3u8s || []).join('|')}`;
-      if (!byDl.has(key)) byDl.set(key, r);
+      if (!map.has(key)) map.set(key, r);
     }
-    const unique = [...byDl.values()];
+    const unique = [...map.values()];
 
-    // Expand: for each my_list, fetch/list all m3u8s
-    const listBlobs = [];
+    // Expand: fetch the "my_list" text via fetch (NOT Playwright navigation)
+    const expanded = [];
     for (const row of unique) {
       let urls = [...(row.direct_m3u8s || [])];
       if (row.download_url) {
-        const body = await fetchListBodyViaBrowser(browser, row.download_url);
-        const found = extractM3U8s(body);
-        urls.push(...found);
+        const body = await fetchListBody(row.download_url, row.source_page);
+        urls.push(...extractM3U8s(body));
       }
       urls = [...new Set(urls)];
-      listBlobs.push({ ...row, m3u8s: urls });
-    }
-    await fs.writeFile(path.join('out', 'latam', 'iptvcat_lists.json'), JSON.stringify(listBlobs, null, 2), 'utf8');
-
-    // Probe all candidates
-    const probeTargets = [];
-    for (const L of listBlobs) {
-      for (const u of L.m3u8s) probeTargets.push({ row: L, url: u });
+      expanded.push({ ...row, m3u8s: urls });
     }
     await fs.writeFile(
-      path.join('out', 'latam', 'probe_targets_count.json'),
-      JSON.stringify({ targets: probeTargets.length }, null, 2),
+      path.join('out', 'latam', 'iptvcat_lists.json'),
+      JSON.stringify(expanded, null, 2),
       'utf8'
     );
 
-    const probed = await pLimit(PROBE_CONCURRENCY, probeTargets, async (t) => {
+    const targets = [];
+    for (const L of expanded) for (const u of L.m3u8s) targets.push({ row: L, url: u });
+    await fs.writeFile(
+      path.join('out', 'latam', 'probe_targets.json'),
+      JSON.stringify({ count: targets.length }, null, 2),
+      'utf8'
+    );
+
+    const probed = await pLimit(PROBE_CONCURRENCY, targets, async (t) => {
       const pr = await probePlaylist(t.url);
       return {
         channel_name: t.row.channel_name,
@@ -373,16 +311,20 @@ async function main() {
         reason: pr.reason,
       };
     });
-    await fs.writeFile(path.join('out', 'latam', 'iptvcat_probes.json'), JSON.stringify(probed, null, 2), 'utf8');
+    await fs.writeFile(
+      path.join('out', 'latam', 'iptvcat_probes.json'),
+      JSON.stringify(probed, null, 2),
+      'utf8'
+    );
 
-    // Pick best working candidate per channel
+    // Pick best per channel
     const byName = new Map();
     for (const p of probed) {
       if (!p.ok) continue;
       const key = p.channel_name.trim().toLowerCase();
-      const candScore = rankByHint(p.candidate_url, p.quality_hint);
+      const score = rankByHint(p.candidate_url, p.quality_hint);
       const cur = byName.get(key);
-      if (!cur || candScore > cur.__score) byName.set(key, { ...p, __score: candScore });
+      if (!cur || score > cur.__score) byName.set(key, { ...p, __score: score });
     }
     const best = [...byName.values()];
 
@@ -396,10 +338,14 @@ async function main() {
       source: 'iptvcat',
       working: true,
       checked_at: now,
-      extras: { origin: 'iptvcat', probe_reason: b.reason },
+      extras: { origin: 'iptvcat', reason: b.reason },
     }));
+    await fs.writeFile(
+      path.join('out', 'latam', 'streams_latam.json'),
+      JSON.stringify(upserts, null, 2),
+      'utf8'
+    );
 
-    await fs.writeFile(path.join('out', 'latam', 'streams_latam.json'), JSON.stringify(upserts, null, 2), 'utf8');
     await saveStreams(upserts);
     console.log(`iptvcat ingestion done. Channels kept: ${upserts.length}`);
   } finally {
