@@ -1,10 +1,11 @@
 // scripts/mx-gatotv-all.mjs
-// GatoTV-only EPG scraper (24h window, no XMLTV, no matching here).
+// GatoTV-only EPG scraper (24h window, no XMLTV).
 // - Opens directory page
 // - Iterates each /canal/... link (sequentially)
-// - Opens channel page (today) and a dated page for tomorrow (if available)
+// - Opens channel page (today) + dated page for tomorrow (if available)
 // - Scrapes table with headers like "Hora Inicio / Hora Fin / Programa"
 // - Converts to UTC, clamps to 24h from now, upserts into epg_programs on (channel_id, start_ts)
+// - EXTRAS now includes: channel_name_normalized, country, country_normalized
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -30,6 +31,28 @@ const PROGRAMS_TABLE       = process.env.PROGRAMS_TABLE || 'epg_programs';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const norm  = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const lower = (s) => norm(s).toLowerCase();
+
+// diacritic strip for normalization
+function stripAccents(s) {
+  return String(s || '').normalize('NFD').replace(/\p{Diacritic}+/gu, '');
+}
+
+// extract trailing country and normalized base channel name from something like:
+// "Canal A&E (Perú)" → { base: "Canal A&E", country: "Perú", base_norm: "canal a&e", country_norm: "peru" }
+// If no trailing "(...)" exists, country fields are null and base_norm normalizes whole string.
+function extractNameParts(name) {
+  const raw = norm(name);
+  const m = raw.match(/\(([^)]*)\)\s*$/);
+  let base = raw;
+  let country = null;
+  if (m && m[1]) {
+    country = norm(m[1]);
+    base = norm(raw.replace(/\(([^)]*)\)\s*$/, ''));
+  }
+  const base_norm    = lower(stripAccents(base));
+  const country_norm = country ? lower(stripAccents(country)) : null;
+  return { base, country, base_norm, country_norm };
+}
 
 function parseTimeLocalToUTC(localDateISO, timeStr, tz) {
   // Accept: "07:00", "7:00", "07:00 hrs", "7:00 h", "7:00 am", "19:30"
@@ -230,18 +253,21 @@ async function main() {
     console.log(`GatoTV directory channels: ${channels.length}`);
 
     // 2) Build 24h window
-    const nowUTC    = DateTime.utc();
-    const localNow  = nowUTC.setZone(GATOTV_TZ);
-    const todayISO  = localNow.toISODate();
+    const nowUTC      = DateTime.utc();
+    const localNow    = nowUTC.setZone(GATOTV_TZ);
+    const todayISO    = localNow.toISODate();
     const tomorrowISO = localNow.plus({ days: 1 }).toISODate();
 
     const programs = [];
 
     // 3) Sequential: open URL → scrape today → optionally scrape tomorrow → return → repeat
     for (const ch of channels) {
+      // Parse name parts for extras (channel_name_normalized + country fields)
+      const parts = extractNameParts(ch.name);
+
       // Base page (today)
       const rowsToday = await scrapeChannelTable(page, ch.url);
-      let a1 = materializeDay(rowsToday, todayISO, GATOTV_TZ);
+      const a1 = materializeDay(rowsToday, todayISO, GATOTV_TZ);
 
       // If not enough coverage, try dated tomorrow
       const { rows: rowsTomorrow } = await fetchChannelDay(page, ch.url, tomorrowISO);
@@ -279,7 +305,14 @@ async function main() {
           credits: null,
           premiere: false,
           previously_shown: false,
-          extras: { source: 'gatotv', channel_name: ch.name },
+          // >>> NEW: richer extras with normalized name + country <<<
+          extras: {
+            source: 'gatotv',
+            channel_name: ch.name,
+            channel_name_normalized: parts.base_norm,  // e.g., "canal a&e"
+            country: parts.country,                    // e.g., "Perú"
+            country_normalized: parts.country_norm     // e.g., "peru"
+          },
           ingested_at: DateTime.utc().toISO(),
           source_epg: 'gatotv',
           source_url: ch.url
