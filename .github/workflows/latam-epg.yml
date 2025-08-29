@@ -1,17 +1,62 @@
-// scripts/latam-iptvcat.mjs
-// Crawl iptvcat LATAM pages → follow each /my_list/... page in-browser,
-// extract ALL .m3u8 URLs (plus any direct table .m3u8 links), probe them,
-// pick the best per channel, upsert to streams_latam, and emit rich artifacts.
+name: LATAM Streams + GatoTV EPG
 
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 7 * * *" # daily 07:00 UTC
+
+concurrency:
+  group: latam-epg
+  cancel-in-progress: true
+
+jobs:
+  latam-streams-iptvcat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      IPTVCAT_START_URL: "https://iptvcat.com/latin_america__7/"
+      IPTVCAT_MAX_PAGES: "0"           # 0 = crawl all pages found
+      PROBE_TIMEOUT_MS: "10000"
+      PROBE_CONCURRENCY: "8"
+      HEADLESS: "true"
+      # DB
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      SUPABASE_SCHEMA: "public"
+      STREAMS_TABLE: "streams_latam"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Deps (Playwright + libs)
+        run: |
+          set -euo pipefail
+          npm i --no-save playwright @supabase/supabase-js luxon
+          npx playwright install --with-deps chromium
+
+      - name: Write iptvcat crawler
+        run: |
+          set -euo pipefail
+          mkdir -p scripts out/latam
+          cat > scripts/latam-iptvcat.mjs <<'EOF'
+// scripts/latam-iptvcat.mjs
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 import { DateTime } from 'luxon';
 
-// ---------- ENV ----------
 const START_URL = process.env.IPTVCAT_START_URL || 'https://iptvcat.com/latin_america__7/';
-const MAX_PAGES = Number(process.env.IPTVCAT_MAX_PAGES || '0'); // 0 = all
+const MAX_PAGES = Number(process.env.IPTVCAT_MAX_PAGES || '0');
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
 const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || '10000');
 const PROBE_CONCURRENCY = Number(process.env.PROBE_CONCURRENCY || '8');
@@ -21,285 +66,410 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
 const STREAMS_TABLE = process.env.STREAMS_TABLE || 'streams_latam';
 
-// ---------- DB ----------
-function sb() {
-  return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-    auth: { persistSession: false },
-    db: { schema: SUPABASE_SCHEMA },
-  });
-}
+function sb(){return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY,{auth:{persistSession:false},db:{schema:SUPABASE_SCHEMA}});}
 
-// ---------- Playwright helpers ----------
-async function newBrowser() {
-  return chromium.launch({
-    headless: HEADLESS,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-gpu',
-    ],
-  });
-}
-async function newPage(browser) {
-  const page = await browser.newPage({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  });
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
+async function newBrowser(){return chromium.launch({headless:HEADLESS,args:['--disable-blink-features=AutomationControlled','--no-sandbox']});}
+async function newPage(browser){
+  const page = await browser.newPage({ userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' });
+  await page.addInitScript(()=>{ Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); });
   page.setDefaultNavigationTimeout(45000);
   page.setDefaultTimeout(20000);
   return page;
 }
-async function withPage(browser, url, fn) {
-  const page = await newPage(browser);
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(900);
-    return await fn(page);
-  } finally {
-    await page.close();
-  }
+async function withPage(browser,url,fn){
+  const page=await newPage(browser);
+  try{ await page.goto(url,{waitUntil:'domcontentloaded'}); await page.waitForLoadState('networkidle',{timeout:15000}).catch(()=>{}); await page.waitForTimeout(500); return await fn(page); }
+  finally{ await page.close(); }
 }
 
-// ---------- Crawl pagination ----------
-async function collectPagination(browser) {
-  const urls = await withPage(browser, START_URL, async (page) => {
+async function collectPagination(browser){
+  const urls = await withPage(browser, START_URL, async (page)=>{
     const own = new URL(page.url()).href;
-    const list = new Set([own]);
-    const links = await page.$$eval('a[href]', (as) =>
-      as.map((a) => a.getAttribute('href')).filter(Boolean)
-    );
-    for (const href of links) {
-      try {
-        const url = new URL(href, location.href).href;
-        if (/latin_america__7(\/\d+\/?)?$/.test(url)) list.add(url);
-      } catch {}
+    const set = new Set([own]);
+    const links = await page.$$eval('a[href]', as => as.map(a=>a.getAttribute('href')).filter(Boolean));
+    for(const href of links){
+      try{ const u=new URL(href, location.href).href; if(/latin_america__7(\/\d+\/?)?$/.test(u)) set.add(u);}catch{}
     }
-    return [...list];
+    return [...set];
   });
-  return MAX_PAGES > 0 ? urls.slice(0, MAX_PAGES) : urls;
+  return MAX_PAGES>0 ? urls.slice(0,MAX_PAGES) : urls;
 }
 
-// ---------- Extract rows from a list page ----------
-async function collectRowsFromPage(browser, url) {
-  return withPage(browser, url, async (page) => {
-    return await page.$$eval('table tbody tr, tr', (rows) => {
-      const out = [];
-      for (const tr of rows) {
-        const tds = [...tr.querySelectorAll('td')];
-        const name = (tds[0]?.innerText || '').trim();
-        const dl = tr.querySelector('a[href*="/my_list/"]');
-        const directM3U8s = [...tr.querySelectorAll('a[href$=".m3u8"]')].map((a) => a.href);
-        if (!name || (!dl && directM3U8s.length === 0)) continue;
-
-        const quality =
-          (tds[1]?.innerText || '').trim() ||
-          (tds[2]?.innerText || '').trim() ||
-          '';
-        const country = (tds[tds.length - 1]?.innerText || '').trim();
-
-        out.push({
-          channel_name: name,
-          download_url: dl ? dl.href : null,
-          direct_m3u8s: directM3U8s,
-          quality_hint: quality,
-          country_hint: country,
-          source_page: location.href,
-        });
+async function collectRowsFromPage(browser, url){
+  return withPage(browser, url, async page=>{
+    return await page.$$eval('table tbody tr, tr', rows=>{
+      const out=[];
+      for(const tr of rows){
+        const tds=[...tr.querySelectorAll('td')];
+        const name=(tds[0]?.innerText||'').trim();
+        const dl=tr.querySelector('a[href*="/my_list/"]');
+        const direct=[...tr.querySelectorAll('a[href$=".m3u8"]')].map(a=>a.href);
+        if(!name || (!dl && direct.length===0)) continue;
+        const quality=(tds[1]?.innerText||tds[2]?.innerText||'').trim();
+        const country=(tds[tds.length-1]?.innerText||'').trim();
+        out.push({ channel_name:name, download_url:dl?dl.href:null, direct_m3u8s:direct, quality_hint:quality, country_hint:country, source_page:location.href });
       }
       return out;
     });
   });
 }
 
-// ---------- Read a /my_list/... page and pull all URLs ----------
-async function fetchListBodyViaBrowser(browser, url) {
-  return await withPage(browser, url, async (page) => {
+async function fetchListBodyViaBrowser(browser, url){
+  return await withPage(browser, url, async page=>{
     const sel = await page.$('pre, code, textarea');
-    if (sel) {
-      const txt = await sel.innerText();
-      return (txt || '').trim();
-    }
-    const bodyText = await page.evaluate(() => document.body?.innerText || '');
-    return (bodyText || '').trim();
+    if (sel) return (await sel.innerText()||'').trim();
+    const txt = await page.evaluate(()=>document.body?.innerText||'');
+    return (txt||'').trim();
   });
 }
+function extractM3U8s(text){ const out=[]; const re=/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi; let m; while((m=re.exec(text))) out.push(m[0]); return [...new Set(out)]; }
 
-function extractM3U8s(text) {
-  const out = [];
-  const re = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi;
-  let m;
-  while ((m = re.exec(text))) out.push(m[0]);
-  return [...new Set(out)];
-}
-
-// ---------- Probe utilities ----------
-function absolutize(base, ref) {
-  try {
-    return new URL(ref, base).href;
-  } catch {
-    return ref;
+function bestFromMaster(baseUrl, txt){
+  const lines=(txt||'').split(/\r?\n/); const vars=[];
+  for(let i=0;i<lines.length;i++){
+    const L=lines[i].trim(); if(!L.startsWith('#EXT-X-STREAM-INF')) continue;
+    const attrs=(L.split(':')[1]||'').split(',').reduce((a,p)=>{const[k,v]=(p||'').split('='); if(k) a[k.trim().toUpperCase()]=(v||'').trim().replace(/^"|"$/g,''); return a;},{});
+    const bw=Number(String(attrs.BANDWIDTH||'').replace(/[^0-9]/g,''))||0;
+    const next=lines[i+1]?.trim()||''; if(next && !next.startsWith('#')){ try{ vars.push({bw, url:new URL(next, baseUrl).href}); }catch{ vars.push({bw, url:next}); } }
   }
+  vars.sort((a,b)=>b.bw-a.bw);
+  return vars[0]?.url||null;
 }
-function bestFromMaster(baseUrl, text) {
-  const lines = (text || '').split(/\r?\n/);
-  const variants = [];
-  for (let i = 0; i < lines.length; i++) {
-    const L = lines[i].trim();
-    if (L.startsWith('#EXT-X-STREAM-INF')) {
-      const attrsRaw = (L.split(':')[1] || '').split(',');
-      const attrs = Object.create(null);
-      for (const kv of attrsRaw) {
-        const [k, v] = kv.split('=');
-        if (!k) continue;
-        attrs[k.trim().toUpperCase()] = (v || '').trim().replace(/^"|"$/g, '');
-      }
-      const bw = Number(String(attrs.BANDWIDTH || '').replace(/[^0-9]/g, '')) || 0;
-      const next = lines[i + 1] ? lines[i + 1].trim() : '';
-      if (next && !next.startsWith('#')) variants.push({ bw, url: absolutize(baseUrl, next) });
+async function fetchText(url, signal){
+  try{ const r=await fetch(url,{headers:{'user-agent':'Mozilla/5.0','accept':'application/vnd.apple.mpegurl,text/plain,*/*'},redirect:'follow',signal}); const t=await r.text(); return {ok:r.ok,status:r.status,ct:r.headers.get('content-type')||'',url:r.url,txt:t}; }catch(e){ return {ok:false,error:String(e)}; }
+}
+async function probePlaylist(url){
+  const ac=new AbortController(); const to=setTimeout(()=>ac.abort(), PROBE_TIMEOUT_MS);
+  try{
+    let r=await fetchText(url, ac.signal);
+    if(r.ok && /#EXTM3U/.test(r.txt)){
+      if(/#EXT-X-STREAM-INF/i.test(r.txt)){ const best=bestFromMaster(url, r.txt)||url; const r2=await fetchText(best, ac.signal); return { ok:r2.ok && /#EXTM3U/.test(r2.txt), url:r2.url||best, reason:'master-best' }; }
+      return { ok:true, url:r.url||url, reason:'media-extm3u' };
     }
-  }
-  variants.sort((a, b) => b.bw - a.bw);
-  return variants[0]?.url || null;
+    if(r.ok && /mpegurl|application\/x-mpegURL/i.test(r.ct)) return { ok:true, url:r.url||url, reason:'ct-hls' };
+    return { ok:false, url, reason:'no-extm3u' };
+  } finally{ clearTimeout(to); }
+}
+async function pLimit(n, arr, fn){ const out=new Array(arr.length); let i=0; const workers=Array.from({length:n}, async()=>{ while(i<arr.length){ const idx=i++; out[idx]=await fn(arr[idx], idx); } }); await Promise.all(workers); return out; }
+function rankByHint(u,q){ const urlScore=/2160|4k|uhd/i.test(u)?4:/1080|fhd/i.test(u)?3:/720|hd/i.test(u)?2:1; const qual=/2160|4k|uhd/i.test(q||'')?4:/1080|fhd/i.test(q||'')?3:/720|hd/i.test(q||'')?2:1; return urlScore*10+qual; }
+
+async function saveStreams(rows){
+  if(!rows.length){ console.log('No rows to save.'); return; }
+  if(!SUPABASE_URL||!SUPABASE_SERVICE_KEY){ console.log('No Supabase creds; skip'); return; }
+  const client=sb(); const BATCH=500;
+  for(let i=0;i<rows.length;i+=BATCH){ const slice=rows.slice(i,i+BATCH); const {error}=await client.from(STREAMS_TABLE).upsert(slice,{onConflict:'stream_url'}); if(error){ console.warn('Upsert error:', error.message); break; } }
+  console.log(`Saved ${rows.length} rows to ${STREAMS_TABLE}`);
 }
 
-async function fetchHead(url, signal) {
-  try {
-    const r = await fetch(url, {
-      method: 'HEAD',
-      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/vnd.apple.mpegurl,text/plain,*/*' },
-      redirect: 'follow',
-      signal,
+async function main(){
+  await fs.mkdir('out/latam',{recursive:true});
+  const browser=await newBrowser();
+  try{
+    const pages=await collectPagination(browser);
+    console.log('Pages to crawl:', pages.length);
+    await fs.writeFile(path.join('out','latam','pages.json'), JSON.stringify(pages,null,2),'utf8');
+
+    const all=[];
+    for(const url of pages){ const rows=await collectRowsFromPage(browser, url); all.push(...rows); }
+    await fs.writeFile(path.join('out','latam','rows_raw.json'), JSON.stringify(all,null,2),'utf8');
+
+    const map=new Map();
+    for(const r of all){ const key=r.download_url || `direct:${r.channel_name}:${(r.direct_m3u8s||[]).join('|')}`; if(!map.has(key)) map.set(key, r); }
+    const unique=[...map.values()];
+
+    const expanded=[];
+    for(const row of unique){
+      let urls=[...(row.direct_m3u8s||[])];
+      if(row.download_url){
+        const body=await fetchListBodyViaBrowser(browser, row.download_url);
+        urls.push(...extractM3U8s(body));
+      }
+      urls=[...new Set(urls)];
+      expanded.push({ ...row, m3u8s: urls });
+    }
+    await fs.writeFile(path.join('out','latam','iptvcat_lists.json'), JSON.stringify(expanded,null,2),'utf8');
+
+    const targets=[];
+    for(const L of expanded) for(const u of L.m3u8s) targets.push({row:L,url:u});
+    await fs.writeFile(path.join('out','latam','probe_targets.json'), JSON.stringify({count:targets.length},null,2),'utf8');
+
+    const probed=await pLimit(PROBE_CONCURRENCY, targets, async t=>{
+      const pr=await probePlaylist(t.url);
+      return { channel_name:t.row.channel_name, country_hint:t.row.country_hint, quality_hint:t.row.quality_hint, source_page_url:t.row.source_page, download_url:t.row.download_url, candidate_url:pr.url, ok:pr.ok, reason:pr.reason };
     });
-    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', finalUrl: r.url };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
+    await fs.writeFile(path.join('out','latam','iptvcat_probes.json'), JSON.stringify(probed,null,2),'utf8');
+
+    const byName=new Map();
+    for(const p of probed){ if(!p.ok) continue; const key=p.channel_name.trim().toLowerCase(); const score=rankByHint(p.candidate_url, p.quality_hint); const cur=byName.get(key); if(!cur || score>cur.__score) byName.set(key,{...p,__score:score}); }
+    const best=[...byName.values()];
+
+    const now=DateTime.utc().toISO();
+    const upserts=best.map(b=>({ stream_url:b.candidate_url, channel_name:b.channel_name, country_hint:b.country_hint||null, quality_hint:b.quality_hint||null, source_page_url:b.download_url||b.source_page_url||null, source:'iptvcat', working:true, checked_at:now, extras:{origin:'iptvcat', reason:b.reason} }));
+    await fs.writeFile(path.join('out','latam','streams_latam.json'), JSON.stringify(upserts,null,2),'utf8');
+
+    await saveStreams(upserts);
+    console.log(`iptvcat ingestion done. Channels kept: ${upserts.length}`);
+  } finally { await browser.close(); }
 }
-async function fetchRange(url, signal) {
-  try {
-    const r = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'user-agent': 'Mozilla/5.0',
-        accept: 'application/vnd.apple.mpegurl,text/plain,*/*',
-        Range: 'bytes=0-1023',
-      },
-      redirect: 'follow',
-      signal,
+main().catch(e=>{ console.error(e); process.exit(1); });
+EOF
+
+      - name: Run iptvcat crawler
+        run: |
+          set -euo pipefail
+          node scripts/latam-iptvcat.mjs
+
+      - name: Upload iptvcat artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: latam-streams
+          path: |
+            out/latam/pages.json
+            out/latam/rows_raw.json
+            out/latam/iptvcat_lists.json
+            out/latam/iptvcat_probes.json
+            out/latam/streams_latam.json
+          if-no-files-found: warn
+
+  gatotv-epg-24h:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      GATOTV_DIR_URL: "https://www.gatotv.com/canales_de_tv"
+      GATOTV_TZ: "America/Mexico_City"
+      PROGRAMS_HOURS_AHEAD: "24"
+      GATOTV_MAX_CHANNELS: "0"        # 0 = crawl all channels
+      HEADLESS: "true"
+      # DB
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      SUPABASE_SCHEMA: "public"
+      PROGRAMS_TABLE: "epg_programs"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Deps (Playwright + cheerio + libs)
+        run: |
+          set -euo pipefail
+          npm i --no-save playwright @supabase/supabase-js luxon cheerio
+          npx playwright install --with-deps chromium
+
+      - name: Write GatoTV EPG scraper (24h)
+        run: |
+          set -euo pipefail
+          mkdir -p scripts out/mx
+          cat > scripts/mx-gatotv-all.mjs <<'EOF'
+// scripts/mx-gatotv-all.mjs
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { createClient } from '@supabase/supabase-js';
+import { DateTime } from 'luxon';
+import * as cheerio from 'cheerio';
+import { chromium } from 'playwright';
+
+const DIR_URL = process.env.GATOTV_DIR_URL || 'https://www.gatotv.com/canales_de_tv';
+const GATOTV_TZ = process.env.GATOTV_TZ || 'America/Mexico_City';
+const HOURS = Number(process.env.PROGRAMS_HOURS_AHEAD || '24');
+const MAX_CH = Number(process.env.GATOTV_MAX_CHANNELS || '0');
+const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
+
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
+const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE || 'epg_programs';
+
+function sb(){ return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth:{persistSession:false}, db:{schema:SUPABASE_SCHEMA} }); }
+
+async function fetchHtml(url){
+  const r = await fetch(url, { headers:{'user-agent':'Mozilla/5.0'} });
+  if(!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+  return await r.text();
+}
+
+async function collectChannelLinks(){
+  // Use Playwright to reliably select anchors with href starting /canal/
+  const browser = await chromium.launch({ headless: HEADLESS, args:['--no-sandbox'] });
+  const page = await browser.newPage();
+  try{
+    await page.goto(DIR_URL, { waitUntil:'domcontentloaded' });
+    await page.waitForTimeout(600);
+    const list = await page.$$eval('a[href^="/canal/"]', as =>
+      Array.from(new Set(as.map(a => [a.href, (a.textContent||'').replace(/\s+/g,' ').trim()]).map(([u,n])=>JSON.stringify({url:u,name:n})))).map(s=>JSON.parse(s))
+    );
+    return list.map(it => ({ url: new URL(it.url, location.href).href, name: it.name })).filter(x => x.name && x.url);
+  } finally { await page.close(); await browser.close(); }
+}
+
+function parseScheduleTable(html){
+  const $ = cheerio.load(html);
+  const rowsOut = [];
+  $('table').each((_,table)=>{
+    $(table).find('tr').each((__, tr)=>{
+      const tds = $(tr).find('td').toArray().map(td => $(td).text().replace(/\s+/g,' ').trim()).filter(Boolean);
+      if (tds.length < 2) return;
+      // find first two time-like cells
+      const timeRe = /\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?/i;
+      let idxS=-1, idxE=-1;
+      for(let i=0;i<Math.min(tds.length,5);i++){
+        if(idxS===-1 && timeRe.test(tds[i])) { idxS=i; continue; }
+        if(idxS!==-1 && idxE===-1 && timeRe.test(tds[i])) { idxE=i; break; }
+      }
+      if(idxS===-1) return;
+      let titleIdx = -1;
+      for(let i=Math.max(idxE, idxS)+1;i<tds.length;i++){ if(tds[i]){ titleIdx=i; break; } }
+      if(titleIdx===-1) titleIdx = tds.length-1;
+      const startLocal = tds[idxS];
+      const stopLocal = idxE!==-1 ? tds[idxE] : null;
+      const title = tds[titleIdx];
+      if(!startLocal || !title) return;
+      rowsOut.push({ startLocal, stopLocal, title });
     });
-    const txt = await r.text();
-    return {
-      ok: r.status === 200 || r.status === 206,
-      status: r.status,
-      ct: r.headers.get('content-type') || '',
-      finalUrl: r.url,
-      txt,
-    };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-}
-async function fetchText(url, signal) {
-  try {
-    const r = await fetch(url, {
-      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/vnd.apple.mpegurl,text/plain,*/*' },
-      redirect: 'follow',
-      signal,
-    });
-    const txt = await r.text();
-    return { ok: r.ok, status: r.status, ct: r.headers.get('content-type') || '', finalUrl: r.url, txt };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-}
-
-async function probePlaylist(url) {
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
-  try {
-    // HEAD: accept HLS content-type as a pass
-    let head = await fetchHead(url, ac.signal);
-    if (head.ok && /mpegurl|application\/x-mpegURL/i.test(head.ct)) {
-      return { ok: true, url: head.finalUrl, reason: 'head-hls-ct' };
-    }
-
-    // Range GET
-    let part = await fetchRange(url, ac.signal);
-    if (part.ok) {
-      if (/#EXTM3U/.test(part.txt)) {
-        // If master, choose best variant and verify
-        if (/#EXT-X-STREAM-INF/i.test(part.txt)) {
-          const best = bestFromMaster(url, part.txt) || url;
-          const full = await fetchText(best, ac.signal);
-          const ok = full.ok && /#EXTM3U/.test(full.txt);
-          return { ok, url: full.finalUrl || best, reason: ok ? 'master-best' : 'master-best-failed' };
-        }
-        return { ok: true, url, reason: 'media-extm3u' };
-      }
-      if (/mpegurl|application\/x-mpegURL/i.test(part.ct)) {
-        return { ok: true, url: part.finalUrl || url, reason: 'range-hls-ct' };
-      }
-    }
-
-    // Full GET as last resort
-    const full = await fetchText(url, ac.signal);
-    if (full.ok && /#EXTM3U/.test(full.txt)) {
-      if (/#EXT-X-STREAM-INF/i.test(full.txt)) {
-        const best = bestFromMaster(url, full.txt) || url;
-        const full2 = await fetchText(best, ac.signal);
-        const ok = full2.ok && /#EXTM3U/.test(full2.txt);
-        return { ok, url: full2.finalUrl || best, reason: ok ? 'master-best' : 'master-best-failed' };
-      }
-      return { ok: true, url: full.finalUrl || url, reason: 'media-extm3u' };
-    }
-    if (full.ok && /mpegurl|application\/x-mpegURL/i.test(full.ct)) {
-      return { ok: true, url: full.finalUrl || url, reason: 'get-hls-ct' };
-    }
-
-    return { ok: false, url, reason: 'no-extm3u' };
-  } catch {
-    return { ok: false, url, reason: 'exception' };
-  } finally {
-    clearTimeout(to);
-  }
-}
-
-async function pLimit(n, arr, fn) {
-  const out = new Array(arr.length);
-  let i = 0;
-  const workers = Array.from({ length: n }, async () => {
-    while (i < arr.length) {
-      const idx = i++;
-      out[idx] = await fn(arr[idx], idx);
-    }
   });
-  await Promise.all(workers);
+  // dedupe
+  const seen=new Set(); const out=[];
+  for(const r of rowsOut){ const k=`${r.startLocal}|${r.stopLocal||''}|${r.title}`; if(seen.has(k)) continue; seen.add(k); out.push(r); }
   return out;
 }
 
-function rankByHint(u, q) {
-  const urlScore = /2160|4k|uhd/i.test(u) ? 4 : /1080|fhd/i.test(u) ? 3 : /720|hd/i.test(u) ? 2 : 1;
-  const qualScore = /2160|4k|uhd/i.test(q || '') ? 4 : /1080|fhd/i.test(q || '') ? 3 : /720|hd/i.test(q || '') ? 2 : 1;
-  return urlScore * 10 + qualScore; // favor 4k>1080>720, tie-break by quality_hint
+function parseScheduleHeuristic(html){
+  const rows = [];
+  const cleaned = html.replace(/\r|\n/g,' ').replace(/<\s*br\s*\/?>/gi,' ').replace(/\s+/g,' ');
+  const rx = /(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)\s*-?\s*(\b\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)?[^>]*?<[^>]*?>([^<]{2,200})/gi;
+  let m; const seen=new Set();
+  while((m=rx.exec(cleaned))){
+    const start=(m[1]||'').trim(); const stop=(m[2]||'').trim()||null; const title=(m[3]||'').trim();
+    const key=`${start}|${stop||''}|${title}`; if(!start||!title||seen.has(key)) continue;
+    seen.add(key); rows.push({ startLocal:start, stopLocal:stop, title });
+  }
+  return rows;
 }
 
-// ---------- Save ----------
-async function saveStreams(rows) {
-  if (!rows.length) {
-    console.log('No rows to save.');
-    return;
+function parseLocalToUTC(localDateISO, timeStr, tz){
+  const s=(timeStr||'').toLowerCase().replace(/\./g,'').replace(/\s+/g,' ');
+  const m=s.match(/(\d{1,2}):(\d{2})/); if(!m) return null;
+  let h=+m[1], mi=+m[2];
+  if(/\b(am|pm)\b/.test(s)){ const pm=/\bpm\b/.test(s); if(pm && h<12) h+=12; if(!pm && h===12) h=0; }
+  return DateTime.fromISO(`${localDateISO}T${String(h).padStart(2,'0')}:${String(mi).padStart(2,'0')}:00`,{zone:tz}).toUTC().toISO();
+}
+
+function materializeDay(rows, localISO, tz){
+  const out=[];
+  for(let i=0;i<rows.length;i++){
+    const r=rows[i];
+    const start=parseLocalToUTC(localISO, r.startLocal, tz);
+    if(!start) continue;
+    let stop=null;
+    if(r.stopLocal) stop=parseLocalToUTC(localISO, r.stopLocal, tz);
+    else if (rows[i+1]?.startLocal) stop=parseLocalToUTC(localISO, rows[i+1].startLocal, tz);
+    if(!stop) stop=DateTime.fromISO(start).plus({minutes:60}).toISO();
+    if(DateTime.fromISO(stop) <= DateTime.fromISO(start)) stop=DateTime.fromISO(start).plus({minutes:30}).toISO();
+    out.push({ title:r.title, start_ts:start, stop_ts:stop });
   }
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.log('No Supabase creds; skipping DB upsert');
-    return;
+  return out;
+}
+
+async function fetchChannelDay(url, localISO){
+  let u = url; if(!/\/\d{4}-\d{2}-\d{2}$/.test(url)) u = url.replace(/\/?$/, `/${localISO}`);
+  try{ const html=await fetchHtml(u); const table=parseScheduleTable(html); const rows = table.length ? table : parseScheduleHeuristic(html); return { url:u, rows }; }
+  catch{ return { url:u, rows:[] }; }
+}
+
+function clamp24h(programs, nowUTC, hours){
+  const end=nowUTC.plus({hours});
+  return programs.filter(p=>DateTime.fromISO(p.start_ts) < end)
+                 .map(p=>({ ...p, stop_ts: DateTime.fromISO(p.stop_ts) > end ? end.toISO() : p.stop_ts }));
+}
+
+async function savePrograms(programs){
+  if(!programs.length) return;
+  if(!SUPABASE_URL||!SUPABASE_SERVICE_KEY){ console.log('No Supabase creds; skip'); return; }
+  const client=sb(); const BATCH=500;
+  for(let i=0;i<programs.length;i+=BATCH){
+    const slice=programs.slice(i,i+BATCH);
+    let { error } = await client.from(PROGRAMS_TABLE).upsert(slice, { onConflict:'channel_id, start_ts' });
+    if(error && /no unique|no exclusion/i.test(error.message||'')) ({ error } = await client.from(PROGRAMS_TABLE).insert(slice));
+    if(error){ console.warn(`Programs batch failed: ${error.message}`); break; }
   }
-  const client = sb();
-  const BATCH = 500;
-  for (let i = 0; i < rows.length; i += BATCH) {
-    const slice = rows.slice(i, i + BATCH);
-    const { error } = await client.from(STREAMS_TABLE).upsert(slice, { onConflict: 'stream_url' });
-    if (error) {
+  console.log(`Program ingest attempted: ${programs.length}`);
+}
+
+async function main(){
+  await fs.mkdir('out/mx',{recursive:true});
+
+  // 1) directory crawl (CSS selector)
+  const links = await collectChannelLinks();
+  const channels = MAX_CH>0 ? links.slice(0,MAX_CH) : links;
+  await fs.writeFile(path.join('out','mx','gatotv_directory.json'), JSON.stringify(channels,null,2),'utf8');
+  console.log(`GatoTV channels discovered: ${channels.length}`);
+
+  // 2) scrape today+tomorrow; clamp to 24h
+  const nowUTC = DateTime.utc();
+  const localNow = nowUTC.setZone(GATOTV_TZ);
+  const todayISO = localNow.toISODate();
+  const tomorrowISO = localNow.plus({days:1}).toISODate();
+
+  const programs=[];
+  for(const ch of channels){
+    const d1 = await fetchChannelDay(ch.url, todayISO);
+    const d2 = await fetchChannelDay(ch.url, tomorrowISO);
+    const a1 = materializeDay(d1.rows, todayISO, GATOTV_TZ);
+    const a2 = materializeDay(d2.rows, tomorrowISO, GATOTV_TZ);
+    const clamped = clamp24h(a1.concat(a2), nowUTC, HOURS);
+    for(const r of clamped){
+      programs.push({
+        channel_id: ch.url,      // keep GatoTV URL as ID (matching happens later in SQL)
+        start_ts: r.start_ts,
+        stop_ts: r.stop_ts,
+        title: r.title,
+        sub_title: null,
+        summary: null,
+        categories: [],
+        program_url: null,
+        episode_num_xmltv: null,
+        icon_url: null,
+        rating: null,
+        star_rating: null,
+        season: null,
+        episode: null,
+        language: 'es',
+        orig_language: 'es',
+        credits: null,
+        premiere: false,
+        previously_shown: false,
+        extras: { source: 'gatotv', channel_name: ch.name },
+        ingested_at: DateTime.utc().toISO()
+      });
+    }
+  }
+
+  await fs.writeFile(path.join('out','mx','epg_programs_sample.json'), JSON.stringify(programs.slice(0,200),null,2),'utf8');
+  await savePrograms(programs);
+  console.log(`GatoTV 24h ingest complete. Channels scraped: ${channels.length}, programs: ${programs.length}`);
+}
+
+main().catch(e=>{ console.error(e); process.exit(1); });
+EOF
+
+      - name: Run GatoTV EPG scraper (24h)
+        run: |
+          set -euo pipefail
+          node scripts/mx-gatotv-all.mjs
+
+      - name: Upload GatoTV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatotv-epg
+          path: |
+            out/mx/gatotv_directory.json
+            out/mx/epg_programs_sample.json
+          if-no-files-found: warn
