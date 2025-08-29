@@ -1,0 +1,73 @@
+name: LATAM-EPG
+let stop_ts = null;
+if (r.stopLocal){
+const stopDate = /\b(am|pm)\b/i.test(r.stopLocal) ? todayISO : (r.stopLocal < '06:00' ? tomorrowISO : todayISO);
+stop_ts = localToUTC(stopDate, r.stopLocal);
+} else if (combined[i+1]?.startLocal){
+const nx = combined[i+1].startLocal;
+const nxDate = /\b(am|pm)\b/i.test(nx) ? todayISO : (nx < '06:00' ? tomorrowISO : todayISO);
+stop_ts = localToUTC(nxDate, nx);
+}
+if (!stop_ts) stop_ts = DateTime.fromISO(start_ts).plus({ minutes: 60 }).toISO();
+if (DateTime.fromISO(stop_ts) <= DateTime.fromISO(start_ts)) stop_ts = DateTime.fromISO(start_ts).plus({ minutes: 30 }).toISO();
+spans.push({ title: r.title, start_ts, stop_ts });
+}
+
+
+const clamped = clamp24(spans);
+for (const p of clamped){
+results.push({
+channel_id: ch.url, // use GatoTV URL as stable id for now
+start_ts: p.start_ts,
+stop_ts: p.stop_ts,
+title: p.title,
+sub_title: null,
+summary: null,
+categories: [],
+program_url: null,
+episode_num_xmltv: null,
+icon_url: null,
+rating: null,
+star_rating: null,
+season: null,
+episode: null,
+language: 'es',
+orig_language: 'es',
+credits: null,
+premiere: false,
+previously_shown: false,
+extras: { source: 'gatotv', channel_name_raw: ch.name },
+ingested_at: DateTime.utc().toISO(),
+source_epg: 'gatotv',
+source_url: ch.url
+});
+}
+await page.waitForTimeout(PER_PAGE_DELAY_MS);
+}
+
+
+await fs.writeFile(path.join('out','mx','epg_programs_sample.json'), JSON.stringify(results.slice(0,200), null, 2), 'utf8');
+await savePrograms(results);
+console.log(`GatoTV 24h ingest complete. Channels scraped: ${links.length}, programs: ${results.length}`);
+} finally { await browser.close(); }
+}
+
+
+main().catch(e=>{ console.error(e); process.exit(1); });
+EOF
+
+
+- name: Run GatoTV EPG 24h
+run: |
+set -euo pipefail
+node scripts/gatotv-epg-24h.mjs
+
+
+- name: Upload artifacts (EPG)
+uses: actions/upload-artifact@v4
+with:
+name: gatotv-epg-24h
+path: |
+out/mx/gatotv_directory.json
+out/mx/epg_programs_sample.json
+if-no-files-found: warn
