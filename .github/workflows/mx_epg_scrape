@@ -1,0 +1,63 @@
+name: Start MX-EPG-SCRAPE (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      INPUT_MODE:
+        description: "supabase or csv"
+        required: false
+        default: "supabase"
+      CSV_PATH:
+        description: "Path to CSV when INPUT_MODE=csv"
+        required: false
+        default: "manual_tv_input.csv"
+      LOCAL_TZ:
+        description: "IANA timezone used to interpret local schedule times"
+        required: false
+        default: "America/Mexico_City"
+      HOURS_AHEAD:
+        description: "How many hours ahead to scrape"
+        required: false
+        default: "36"
+
+concurrency:
+  group: mx-epg-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INPUT_MODE: ${{ github.event.inputs.INPUT_MODE }}
+          CSV_PATH: ${{ github.event.inputs.CSV_PATH }}
+          LOCAL_TZ: ${{ github.event.inputs.LOCAL_TZ }}
+          HOURS_AHEAD: ${{ github.event.inputs.HOURS_AHEAD }}
+        run: |
+          python scripts/scrape_mx_epg.py
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-epg-scrape-logs
+          path: |
+            **/*.log
