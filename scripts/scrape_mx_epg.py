@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 
 import pytz
 from supabase import create_client, Client
-from playwright.async_api import async_playwright
 
 from .parsers import ALL_PARSERS
 from .parsers.base import Programme
@@ -27,8 +26,6 @@ SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "4"))
 
 # Purge window so corrected rows replace stale ones (e.g., after timezone/title fix)
 PURGE_HOURS_BACK = int(os.getenv("PURGE_HOURS_BACK", "24"))
-
-# Optional: disable purge entirely for testing (set to "1")
 DRY_RUN_PURGE = os.getenv("DRY_RUN_PURGE", "0") == "1"
 
 # -------------------- Utilities --------------------
@@ -105,47 +102,31 @@ def pick_parser(url: str):
             return p
     return None
 
-async def scrape_one(url: str, context, *, tzname: str, hours_ahead: int) -> List[Programme]:
+async def scrape_one(url: str, *, tzname: str, hours_ahead: int) -> List[Programme]:
     """
-    Let each parser decide whether to use the page (Playwright) or do httpx on its own.
-    We hand it 'page' from the shared context when needed.
+    Both supported sources (GatoTV, OnTVTonight) are static HTTP fetches.
+    No Playwright/browser is used here. 'page' is always None.
     """
     parser = pick_parser(url)
     if not parser:
         return []
-    # Only open a page if the parser will actually use it (dom/JS sites).
-    # Heuristic by domain: OnTVTonight & GatoTV are static (no page needed).
-    host = urlparse(url).netloc.lower()
-    needs_page = not (host.endswith("ontvtonight.com") or host.endswith("gatotv.com"))
-
-    page = await context.new_page() if needs_page else None
     try:
-        progs = await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=page)
+        progs = await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=None)
         return progs or []
     except Exception as e:
         print(f"[warn] failed to parse {url}: {e}")
         return []
-    finally:
-        if page:
-            await page.close()
 
 async def scrape_all(urls: List[str]) -> Dict[str, List[Programme]]:
     results: Dict[str, List[Programme]] = {}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(ignore_https_errors=True)
+    sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
 
-        sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
+    async def task(u: str):
+        async with sem:
+            progs = await scrape_one(u, tzname=LOCAL_TZ, hours_ahead=HOURS_AHEAD)
+            results[u] = progs  # even if empty; we log it
 
-        async def task(u: str):
-            async with sem:
-                progs = await scrape_one(u, context, tzname=LOCAL_TZ, hours_ahead=HOURS_AHEAD)
-                results[u] = progs  # even if empty; we'll log it
-
-        await asyncio.gather(*(task(u) for u in urls))
-
-        await context.close()
-        await browser.close()
+    await asyncio.gather(*(task(u) for u in urls))
     return results
 
 def to_rows(programs_by_url: Dict[str, List[Programme]]):
@@ -185,25 +166,26 @@ async def main():
     else:
         urls = await read_links_from_supabase(supabase)
 
-    # Filter to domains actually supported by registered parsers
+    # Filter to domains supported by registered parsers
     supported_hosts = tuple([d for parser in ALL_PARSERS for d in parser.domains])
+    print("[parsers] active:", ", ".join(type(p).__name__ for p in ALL_PARSERS))
+    print("[parsers] hosts:", ", ".join(supported_hosts))
+
     urls = [u for u in urls if any(urlparse(u).netloc.lower().endswith(h) for h in supported_hosts)]
     urls = _dedupe_keep_order(urls)
 
-    # 1) Scrape everything first
+    # 1) Scrape first
     programs_by_url = await scrape_all(urls)
 
-    # Log per-URL results so you can see which ones produced rows
-    total = 0
+    # Per-URL parse summary
     empty = []
     for u, progs in programs_by_url.items():
         n = len(progs)
-        total += n
         print(f"[parsed] {n:3d} × {u}")
         if n == 0:
             empty.append(u)
 
-    # 2) Purge ONLY sources that produced results (safer)
+    # 2) Purge ONLY sources that produced rows (safer)
     if not DRY_RUN_PURGE:
         nonempty_sources = [u for u, progs in programs_by_url.items() if progs]
         if nonempty_sources:
