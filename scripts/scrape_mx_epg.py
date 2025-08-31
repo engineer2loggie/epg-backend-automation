@@ -9,8 +9,8 @@ from supabase import create_client, Client
 from playwright.async_api import async_playwright
 import httpx
 
-from parsers import ALL_PARSERS
-from parsers.base import Programme
+from .parsers import ALL_PARSERS
+from .parsers.base import Programme
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
