@@ -28,6 +28,9 @@ SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "4"))
 # Purge window so corrected rows replace stale ones (e.g., after timezone/title fix)
 PURGE_HOURS_BACK = int(os.getenv("PURGE_HOURS_BACK", "24"))
 
+# Optional: disable purge entirely for testing (set to "1")
+DRY_RUN_PURGE = os.getenv("DRY_RUN_PURGE", "0") == "1"
+
 # -------------------- Utilities --------------------
 def get_supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -117,7 +120,8 @@ async def scrape_one(url: str, context, *, tzname: str, hours_ahead: int) -> Lis
 
     page = await context.new_page() if needs_page else None
     try:
-        return await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=page)
+        progs = await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=page)
+        return progs or []
     except Exception as e:
         print(f"[warn] failed to parse {url}: {e}")
         return []
@@ -136,8 +140,7 @@ async def scrape_all(urls: List[str]) -> Dict[str, List[Programme]]:
         async def task(u: str):
             async with sem:
                 progs = await scrape_one(u, context, tzname=LOCAL_TZ, hours_ahead=HOURS_AHEAD)
-                if progs:
-                    results[u] = progs
+                results[u] = progs  # even if empty; we'll log it
 
         await asyncio.gather(*(task(u) for u in urls))
 
@@ -187,14 +190,36 @@ async def main():
     urls = [u for u in urls if any(urlparse(u).netloc.lower().endswith(h) for h in supported_hosts)]
     urls = _dedupe_keep_order(urls)
 
-    # Purge recent window for these sources so corrected rows replace bad ones
-    purge_window_for_sources(supabase, urls, PURGE_HOURS_BACK, HOURS_AHEAD)
-
+    # 1) Scrape everything first
     programs_by_url = await scrape_all(urls)
+
+    # Log per-URL results so you can see which ones produced rows
+    total = 0
+    empty = []
+    for u, progs in programs_by_url.items():
+        n = len(progs)
+        total += n
+        print(f"[parsed] {n:3d} × {u}")
+        if n == 0:
+            empty.append(u)
+
+    # 2) Purge ONLY sources that produced results (safer)
+    if not DRY_RUN_PURGE:
+        nonempty_sources = [u for u, progs in programs_by_url.items() if progs]
+        if nonempty_sources:
+            purge_window_for_sources(supabase, nonempty_sources, PURGE_HOURS_BACK, HOURS_AHEAD)
+        else:
+            print("[warn] Purge skipped: no sources produced rows")
+
+    # 3) Upsert the new rows
     rows = to_rows(programs_by_url)
     upsert_rows(supabase, rows)
 
     print(f"[done] total rows: {len(rows)}")
+    if empty:
+        print("[note] these sources returned 0 rows and were not purged:")
+        for u in empty:
+            print("       -", u)
 
 if __name__ == "__main__":
     asyncio.run(main())
