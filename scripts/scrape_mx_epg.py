@@ -1,64 +1,80 @@
 from __future__ import annotations
-import os, asyncio, csv, sys, math
+
+import os
+import asyncio
+import csv
 from typing import List, Dict
 from urllib.parse import urlparse
-from datetime import datetime, timedelta
-import pytz
 
+import pytz
 from supabase import create_client, Client
 from playwright.async_api import async_playwright
-import httpx
 
 from .parsers import ALL_PARSERS
 from .parsers.base import Programme
 
+# --------- Config via env ---------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-INPUT_MODE = os.getenv("INPUT_MODE", "supabase").lower()
+INPUT_MODE = os.getenv("INPUT_MODE", "supabase").lower()  # "supabase" or "csv"
 CSV_PATH = os.getenv("CSV_PATH", "manual_tv_input.csv")
 LOCAL_TZ = os.getenv("LOCAL_TZ", "America/Mexico_City")
 HOURS_AHEAD = int(os.getenv("HOURS_AHEAD", "36"))
 SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "3"))
 
+
+# --------- Helpers ---------
 def get_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
+def _dedupe_keep_order(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in seq:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# --------- Inputs ---------
 async def read_links_from_supabase(supabase: Client) -> List[str]:
-    # Expect a table manual_tv_input(programme_source_link TEXT PRIMARY KEY) in public schema
-    # Optionally you may have a country column to filter: add .eq('country','MX') if applicable
-    res = supabase.table("manual_tv_input").select("programme_source_link, program_source_link").execute()
-    links = [normalize_link_row(row) for row in res.data if normalize_link_row(row)]
-    # Basic dedupe + MX-only domains we know
-    return list(dict.fromkeys(links))
+    """
+    Pull only the *real* column your table has:
+    public.manual_tv_input.programme_source_link (PK)
+    """
+    res = supabase.table("manual_tv_input").select("programme_source_link").execute()
+    links = [row.get("programme_source_link") for row in res.data if row.get("programme_source_link")]
+    return _dedupe_keep_order(links)
+
 
 def read_links_from_csv(path: str) -> List[str]:
-    out = []
+    """
+    CSV fallback. Accept either 'programme_source_link' or legacy 'program_source_link' header.
+    """
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         key = None
-        # try common variants
-        for cand in ("programme_source_link", "programme_source_link", "source_link", "url"):
+        for cand in ("programme_source_link", "program_source_link", "source_link", "url"):
             if cand in reader.fieldnames:
                 key = cand
                 break
         if not key:
             raise RuntimeError(f"CSV missing programme_source_link column; fields={reader.fieldnames}")
-        for row in reader:
-            u = row.get(key)
-            if u:
-                out.append(u.strip())
-    return list(dict.fromkeys(out))
+        rows = [r.get(key) for r in reader if r.get(key)]
+    return _dedupe_keep_order(rows)
 
+
+# --------- Parsing orchestration ---------
 def pick_parser(url: str):
     for p in ALL_PARSERS:
         if p.matches(url):
             return p
     return None
+
 
 async def scrape_one(url: str, page, *, tzname: str, hours_ahead: int) -> List[Programme]:
     parser = pick_parser(url)
@@ -70,16 +86,17 @@ async def scrape_one(url: str, page, *, tzname: str, hours_ahead: int) -> List[P
         print(f"[warn] failed to parse {url}: {e}")
         return []
 
+
 async def scrape_all(urls: List[str]) -> Dict[str, List[Programme]]:
-    results = {}
-    # Playwright context shared
+    results: Dict[str, List[Programme]] = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])  # GH runners
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(ignore_https_errors=True)
         page = await context.new_page()
 
         sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
-        async def task(u):
+
+        async def task(u: str):
             async with sem:
                 progs = await scrape_one(u, page, tzname=LOCAL_TZ, hours_ahead=HOURS_AHEAD)
                 if progs:
@@ -91,33 +108,39 @@ async def scrape_all(urls: List[str]) -> Dict[str, List[Programme]]:
         await browser.close()
     return results
 
+
 def to_rows(programs_by_url: Dict[str, List[Programme]]):
     rows = []
     for url, progs in programs_by_url.items():
         for p in progs:
-            rows.append({
-                "programme_source_link": url,
-                "programme_start_time": p.start.isoformat(),
-                "programme_end_time": p.end.isoformat(),
-                "programme_title": p.title,
-            })
+            rows.append(
+                {
+                    "programme_source_link": url,
+                    "programme_start_time": p.start.isoformat(),
+                    "programme_end_time": p.end.isoformat(),
+                    "programme_title": p.title,
+                }
+            )
     return rows
+
 
 def upsert_rows(supabase: Client, rows):
     if not rows:
         print("[info] nothing to upsert")
         return
-    # Batch in chunks (PostgREST upsert limit)
     CHUNK = 500
     for i in range(0, len(rows), CHUNK):
-        chunk = rows[i:i+CHUNK]
-        res = supabase.table("mx_epg_scrape").upsert(chunk, on_conflict="programme_source_link,programme_start_time").execute()
-        if res.error:
+        chunk = rows[i : i + CHUNK]
+        res = supabase.table("mx_epg_scrape").upsert(
+            chunk, on_conflict="programme_source_link,programme_start_time"
+        ).execute()
+        if getattr(res, "error", None):
             print("[error]", res.error)
         else:
             print(f"[upsert] {len(chunk)} rows")
 
 
+# --------- Main ---------
 async def main():
     supabase = get_supabase()
     if INPUT_MODE == "csv":
@@ -125,7 +148,7 @@ async def main():
     else:
         urls = await read_links_from_supabase(supabase)
 
-    # Filter only domains we support for now
+    # Filter to domains we support (based on registered parsers)
     supported_hosts = tuple([d for parser in ALL_PARSERS for d in parser.domains])
     urls = [u for u in urls if any(urlparse(u).netloc.lower().endswith(h) for h in supported_hosts)]
 
@@ -137,4 +160,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
