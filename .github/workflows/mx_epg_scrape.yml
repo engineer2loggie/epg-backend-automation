@@ -1,4 +1,3 @@
-# .github/workflows/mx_epg_scrape.yml
 name: MX-EPG-SCRAPE
 
 on:
@@ -36,7 +35,19 @@ jobs:
           PYTHONUNBUFFERED: "1"
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          # Scraper behavior
+          LOCAL_TZ: "America/Mexico_City"
+          HOURS_AHEAD: "36"
           SCRAPE_CONCURRENCY: "4"
+
+          # Replace stale rows in the recent window so fixes overwrite bad data
+          PURGE_HOURS_BACK: "24"
+
+          # OnTVTonight timezone alignment:
+          # - "shift": keep clock time from the guide but reinterpret in LOCAL_TZ (good if guide is off by 1h)
+          # - "convert": normal tz conversion (preserve instant)
+          ONTV_ALIGN_MODE: "shift"
         run: |
           set -euo pipefail
           mkdir -p logs
