@@ -1,2 +1,8 @@
-requests
+beautifulsoup4
+lxml
+python-dateutil
+pytz
+httpx
+playwright
 supabase
+requests
