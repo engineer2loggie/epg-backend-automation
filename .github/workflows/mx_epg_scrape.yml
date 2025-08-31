@@ -32,15 +32,18 @@ jobs:
 
       - name: Run scraper
         env:
+          PYTHONUNBUFFERED: "1"
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python scripts/scrape_mx_epg.py
+          set -euo pipefail
+          mkdir -p logs
+          # Run as a module so 'scripts' behaves like a package
+          python -m scripts.scrape_mx_epg 2>&1 | tee "logs/scrape_${{ github.run_id }}.log"
 
       - name: Upload logs (always)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: mx-epg-scrape-logs
-          path: |
-            **/*.log
+          path: logs/*.log
