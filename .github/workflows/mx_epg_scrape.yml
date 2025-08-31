@@ -1,3 +1,4 @@
+# .github/workflows/mx_epg_scrape.yml
 name: MX-EPG-SCRAPE
 
 on:
@@ -35,10 +36,10 @@ jobs:
           PYTHONUNBUFFERED: "1"
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPE_CONCURRENCY: "4"
         run: |
           set -euo pipefail
           mkdir -p logs
-          # run as a module so 'scripts' package imports resolve
           python -m scripts.scrape_mx_epg 2>&1 | tee "logs/scrape_${{ github.run_id }}.log"
 
       - name: Upload logs (always)
