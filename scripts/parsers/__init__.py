@@ -1,4 +1,4 @@
 from .gatotv import GatoTVParser
-from .mvstv import MVSTVParser
+from .ontvtonight import OnTVTonightParser
 
-ALL_PARSERS = [GatoTVParser(), MVSTVParser()]
+ALL_PARSERS = [GatoTVParser(), OnTVTonightParser()]
