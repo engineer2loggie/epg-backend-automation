@@ -41,13 +41,17 @@ jobs:
           HOURS_AHEAD: "36"
           SCRAPE_CONCURRENCY: "4"
 
-          # Replace stale rows in the recent window so fixes overwrite bad data
+          # Replace stale rows only after a successful parse (script handles purge-after-success)
           PURGE_HOURS_BACK: "24"
 
           # OnTVTonight timezone alignment:
-          # - "shift": keep clock time from the guide but reinterpret in LOCAL_TZ (good if guide is off by 1h)
+          # - "shift": keep clock time from the guide but reinterpret in LOCAL_TZ
           # - "convert": normal tz conversion (preserve instant)
           ONTV_ALIGN_MODE: "shift"
+
+          # Optional for a single run (uncomment to use):
+          # DEBUG_ONTV: "1"
+          # DRY_RUN_PURGE: "1"   # parse without deleting existing rows
         run: |
           set -euo pipefail
           mkdir -p logs
