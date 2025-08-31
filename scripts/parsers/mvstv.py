@@ -2,7 +2,7 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, date
-import pytz, re, os
+import pytz, re
 from .base import Parser, Programme
 from ..util.timeparse import parse_spanish_time, normalize_window
 
@@ -10,7 +10,9 @@ DATE_RX = re.compile(
     r"^(Lunes|Martes|Mi[eí]rcoles|Jueves|Viernes|S[aá]bado|Domingo),?\s+(\d{1,2})\s+de\s+([A-Za-z\.]+)$",
     re.I,
 )
+TIME_RX = re.compile(r"\b(\d{1,2}:\d{2})(?:\s*(AM|PM))?\b", re.I)
 ONLY_MERIDIEM_RX = re.compile(r"^(AM|PM|A\.M\.|P\.M\.)$", re.I)
+SKIP_RX = re.compile(r"(EN VIVO|DESCARGA LA APP|PROGRAMACI[ÓO]N|DEPORTES)", re.I)
 
 MONTHS = {
     "ene": 1, "enero": 1,
@@ -44,125 +46,93 @@ def _parse_es_date(line: str, tzname: str) -> date | None:
     return cand
 
 def _looks_like_title(s: str) -> bool:
-    s = (s or "").strip()
+    s = s.strip()
     if not s:
         return False
     if ONLY_MERIDIEM_RX.match(s):
         return False
     if DATE_RX.match(s):
         return False
-    # must contain letters; avoid pure tokens
-    return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s))
+    # must contain letters (allow accents) and not be just a time
+    if not re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s):
+        return False
+    if TIME_RX.fullmatch(s):
+        return False
+    return True
+
+def _merge_split_time(lines, idx):
+    """If time is like ['9:30','AM'] merge into a single string."""
+    base = lines[idx]
+    m = TIME_RX.search(base)
+    if m and not m.group(2):  # missing AM/PM
+        for k in (idx + 1, idx + 2):  # look ahead a couple lines
+            if k < len(lines) and ONLY_MERIDIEM_RX.match(lines[k]):
+                return f"{base} {lines[k]}"
+    return base
 
 class MVSTVParser(Parser):
     domains = ["mvstv.com"]
 
     async def fetch_and_parse(self, url: str, *, tzname: str, hours_ahead: int, page=None):
-        """
-        DOM-scoped extraction per program card:
-        - Find each card by locating the 'AGENDAR' button and walking to its container.
-        - Inside that container, read:
-            * time: first text node matching \d{1,2}:\d{2} with optional AM/PM
-            * date: 'Domingo, 31 de Ago' style line
-            * title: first heading (h1-h4/strong) or non-time, non-date text
-        - End time = next start (same local date) else +60 min.
-        """
         if not page:
             return []
 
         await page.goto(url, wait_until="domcontentloaded")
-        # allow lazy content to mount
-        await page.wait_for_timeout(1500)
-
-        # Get HTML for evaluation (we still rely on Playwright's render)
+        await page.wait_for_timeout(1600)  # allow lazy content
         html = await page.content()
+
         soup = BeautifulSoup(html, "lxml")
+        raw_lines = [ln.strip() for ln in soup.get_text("\n", strip=True).splitlines()]
+        # strip obvious chrome
+        raw_lines = [ln for ln in raw_lines if ln and not SKIP_RX.search(ln)]
 
-        # Each card has an 'AGENDAR' button — use it to anchor the card container
-        agenda_nodes = soup.find_all(string=re.compile(r"\bAGENDAR\b", re.I))
-        cards = []
-        for node in agenda_nodes:
-            el = getattr(node, "parent", None)
-            container = None
-            # Walk up to a reasonable card container
-            for _ in range(8):
-                if not el:
-                    break
-                # Heuristic: container should contain both a time and a date line
-                block_text = el.get_text("\n", strip=True)
-                if re.search(r"\b\d{1,2}:\d{2}\s*(AM|PM)?\b", block_text, re.I) and DATE_RX.search(block_text):
-                    container = el
-                    break
-                el = getattr(el, "parent", None)
-            if container:
-                cards.append(container)
+        # Partition by "AGENDAR" — each card contains that button
+        segments, cur = [], []
+        for ln in raw_lines:
+            if ln.upper().startswith("AGENDAR"):
+                # end of a card
+                segments.append(cur[:])
+                cur = []
+            else:
+                cur.append(ln)
+        if cur:  # tail (if any)
+            segments.append(cur)
 
-        # Fallback: if no cards found, parse nothing (avoid global text that caused PM/AM titles)
-        if not cards:
-            return []
-
-        programmes = []
-        debug = os.getenv("DEBUG_MVSTV") == "1"
-
-        def extract_card(card_el):
-            text_lines = [ln.strip() for ln in card_el.get_text("\n", strip=True).splitlines() if ln.strip()]
-            # 1) TIME: merge split time tokens like ["9:30", "AM"] => "9:30 AM"
-            time_txt = None
-            i = 0
-            while i < len(text_lines):
-                t = text_lines[i]
-                m = re.search(r"\b(\d{1,2}:\d{2})\b", t)
-                if m:
-                    # try to append meridiem from next line
-                    mer = None
-                    if i + 1 < len(text_lines) and ONLY_MERIDIEM_RX.match(text_lines[i + 1]):
-                        mer = text_lines[i + 1]
-                        i += 1
-                    time_txt = m.group(1) + (f" {mer}" if mer else "")
-                    break
-                i += 1
-
-            # 2) DATE
-            date_txt = next((ln for ln in text_lines if DATE_RX.match(ln)), None)
-            date_local = _parse_es_date(date_txt, tzname) if date_txt else None
-
-            # 3) TITLE
-            # Prefer heading-like elements
-            title_txt = None
-            for h in card_el.select("h1,h2,h3,h4,strong"):
-                tt = h.get_text(" ", strip=True)
-                if _looks_like_title(tt):
-                    title_txt = tt
-                    break
-            if not title_txt:
-                # fallback: first non-time, non-date, non-meridiem line with letters
-                for ln in text_lines:
-                    if DATE_RX.match(ln) or ONLY_MERIDIEM_RX.match(ln) or re.search(r"\b\d{1,2}:\d{2}\b", ln):
-                        continue
-                    if _looks_like_title(ln):
-                        title_txt = ln
-                        break
-
-            return time_txt, date_local, title_txt
-
+        # Parse each segment as [time][date][title...]
         items = []
-        for card in cards:
-            t_txt, d_local, title = extract_card(card)
-            if not (t_txt and d_local and title):
-                if debug:
-                    print("[mvstv skip]", t_txt, d_local, title)
+        for seg in segments:
+            if not seg:
                 continue
-            local_midnight = datetime(d_local.year, d_local.month, d_local.day, 0, 0, 0)
-            try:
-                start_utc = parse_spanish_time(t_txt, local_midnight, tzname)
-            except Exception:
-                if debug:
-                    print("[mvstv bad time]", t_txt)
+            # find first time
+            t_idx = next((i for i, s in enumerate(seg) if TIME_RX.search(s)), None)
+            if t_idx is None:
                 continue
-            items.append({"date": d_local, "title": title, "start_utc": start_utc})
+            time_str = _merge_split_time(seg, t_idx)
 
-        # Order and build end times (next start on same day; else +60m)
-        items.sort(key=lambda x: (x["date"], x["start_utc"]))
+            # find first date after time
+            d_idx = next((i for i in range(t_idx + 1, len(seg)) if DATE_RX.match(seg[i])), None)
+            if d_idx is None:
+                continue
+            date_local = _parse_es_date(seg[d_idx], tzname)
+            if not date_local:
+                continue
+
+            # first valid title after date
+            title = None
+            for i in range(d_idx + 1, len(seg)):
+                if _looks_like_title(seg[i]):
+                    title = seg[i]
+                    break
+            if not title:
+                continue
+
+            # construct start UTC
+            local_midnight = datetime(date_local.year, date_local.month, date_local.day, 0, 0, 0)
+            start_utc = parse_spanish_time(time_str, local_midnight, tzname)
+            items.append({"date": date_local, "title": title, "start_utc": start_utc})
+
+        # end = next start on same local date, else +60m
+        programmes = []
         for idx, it in enumerate(items):
             start_utc = it["start_utc"]
             end_utc = None
