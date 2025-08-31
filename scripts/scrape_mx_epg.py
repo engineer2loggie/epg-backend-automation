@@ -1,162 +1,72 @@
-from __future__ import annotations
+name: Start MX-EPG-SCRAPE (Manual)
 
-import os
-import asyncio
-import csv
-from typing import List, Dict
-from urllib.parse import urlparse
+on:
+  workflow_dispatch:
+    inputs:
+      INPUT_MODE:
+        description: "supabase or csv"
+        required: false
+        default: "supabase"
+      CSV_PATH:
+        description: "Path to CSV when INPUT_MODE=csv"
+        required: false
+        default: "manual_tv_input.csv"
+      LOCAL_TZ:
+        description: "IANA timezone"
+        required: false
+        default: "America/Mexico_City"
+      HOURS_AHEAD:
+        description: "Hours to scrape"
+        required: false
+        default: "36"
+      SCRAPE_CONCURRENCY:
+        description: "Parallel pages (safe)"
+        required: false
+        default: "4"
 
-import pytz
-from supabase import create_client, Client
-from playwright.async_api import async_playwright
+concurrency:
+  group: mx-epg-scrape
+  cancel-in-progress: false
 
-from .parsers import ALL_PARSERS
-from .parsers.base import Programme
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-# --------- Config via env ---------
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-INPUT_MODE = os.getenv("INPUT_MODE", "supabase").lower()  # "supabase" or "csv"
-CSV_PATH = os.getenv("CSV_PATH", "manual_tv_input.csv")
-LOCAL_TZ = os.getenv("LOCAL_TZ", "America/Mexico_City")
-HOURS_AHEAD = int(os.getenv("HOURS_AHEAD", "36"))
-SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "3"))
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
+      - name: "Install dependencies (Option A: explicit Playwright)"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install playwright
+          python -m playwright install --with-deps chromium
 
-# --------- Helpers ---------
-def get_supabase() -> Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+      - name: Run scraper
+        env:
+          PYTHONUNBUFFERED: "1"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INPUT_MODE: ${{ github.event.inputs.INPUT_MODE }}
+          CSV_PATH: ${{ github.event.inputs.CSV_PATH }}
+          LOCAL_TZ: ${{ github.event.inputs.LOCAL_TZ }}
+          HOURS_AHEAD: ${{ github.event.inputs.HOURS_AHEAD }}
+          SCRAPE_CONCURRENCY: ${{ github.event.inputs.SCRAPE_CONCURRENCY }}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          python -m scripts.scrape_mx_epg 2>&1 | tee "logs/scrape_${{ github.run_id }}.log"
 
-
-def _dedupe_keep_order(seq: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for s in seq:
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-# --------- Inputs ---------
-async def read_links_from_supabase(supabase: Client) -> List[str]:
-    """
-    Pull only the *real* column your table has:
-    public.manual_tv_input.programme_source_link (PK)
-    """
-    res = supabase.table("manual_tv_input").select("programme_source_link").execute()
-    links = [row.get("programme_source_link") for row in res.data if row.get("programme_source_link")]
-    return _dedupe_keep_order(links)
-
-
-def read_links_from_csv(path: str) -> List[str]:
-    """
-    CSV fallback. Accept either 'programme_source_link' or legacy 'program_source_link' header.
-    """
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        key = None
-        for cand in ("programme_source_link", "program_source_link", "source_link", "url"):
-            if cand in reader.fieldnames:
-                key = cand
-                break
-        if not key:
-            raise RuntimeError(f"CSV missing programme_source_link column; fields={reader.fieldnames}")
-        rows = [r.get(key) for r in reader if r.get(key)]
-    return _dedupe_keep_order(rows)
-
-
-# --------- Parsing orchestration ---------
-def pick_parser(url: str):
-    for p in ALL_PARSERS:
-        if p.matches(url):
-            return p
-    return None
-
-
-async def scrape_one(url: str, page, *, tzname: str, hours_ahead: int) -> List[Programme]:
-    parser = pick_parser(url)
-    if not parser:
-        return []
-    try:
-        return await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=page)
-    except Exception as e:
-        print(f"[warn] failed to parse {url}: {e}")
-        return []
-
-
-async def scrape_all(urls: List[str]) -> Dict[str, List[Programme]]:
-    results: Dict[str, List[Programme]] = {}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(ignore_https_errors=True)
-        page = await context.new_page()
-
-        sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
-
-        async def task(u: str):
-            async with sem:
-                progs = await scrape_one(u, page, tzname=LOCAL_TZ, hours_ahead=HOURS_AHEAD)
-                if progs:
-                    results[u] = progs
-
-        await asyncio.gather(*(task(u) for u in urls))
-
-        await context.close()
-        await browser.close()
-    return results
-
-
-def to_rows(programs_by_url: Dict[str, List[Programme]]):
-    rows = []
-    for url, progs in programs_by_url.items():
-        for p in progs:
-            rows.append(
-                {
-                    "programme_source_link": url,
-                    "programme_start_time": p.start.isoformat(),
-                    "programme_end_time": p.end.isoformat(),
-                    "programme_title": p.title,
-                }
-            )
-    return rows
-
-
-def upsert_rows(supabase: Client, rows):
-    if not rows:
-        print("[info] nothing to upsert")
-        return
-    CHUNK = 500
-    for i in range(0, len(rows), CHUNK):
-        chunk = rows[i : i + CHUNK]
-        res = supabase.table("mx_epg_scrape").upsert(
-            chunk, on_conflict="programme_source_link,programme_start_time"
-        ).execute()
-        if getattr(res, "error", None):
-            print("[error]", res.error)
-        else:
-            print(f"[upsert] {len(chunk)} rows")
-
-
-# --------- Main ---------
-async def main():
-    supabase = get_supabase()
-    if INPUT_MODE == "csv":
-        urls = read_links_from_csv(CSV_PATH)
-    else:
-        urls = await read_links_from_supabase(supabase)
-
-    # Filter to domains we support (based on registered parsers)
-    supported_hosts = tuple([d for parser in ALL_PARSERS for d in parser.domains])
-    urls = [u for u in urls if any(urlparse(u).netloc.lower().endswith(h) for h in supported_hosts)]
-
-    programs_by_url = await scrape_all(urls)
-    rows = to_rows(programs_by_url)
-    upsert_rows(supabase, rows)
-    print(f"[done] total rows: {len(rows)}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+      - name: Upload logs (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-epg-scrape-logs
+          path: logs/*.log
