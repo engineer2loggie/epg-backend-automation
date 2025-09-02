@@ -30,6 +30,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
+      # --- (UNCHANGED) Your existing MX scrape step ---
       - name: Run scraper
         env:
           PYTHONUNBUFFERED: "1"
@@ -57,9 +58,42 @@ jobs:
           mkdir -p logs
           python -m scripts.scrape_mx_epg 2>&1 | tee "logs/scrape_${{ github.run_id }}.log"
 
+      # --- (ADDED) PR TvTV scraper step ---
+      - name: Run PR TVTV scraper
+        env:
+          PYTHONUNBUFFERED: "1"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          # Scraper behavior
+          LOCAL_TZ: "America/Puerto_Rico"
+          HOURS_AHEAD: "36"
+          SCRAPE_CONCURRENCY: "4"   # (unused by this script but fine to keep)
+
+          # TvTV targeting (envs are optional — you can pass flags instead)
+          CITY_SLUG: "bayamon"
+          LINEUP_ID: "luUSA-PR68592-X"
+          STATION_IDS: "43726"      # comma-separated to scrape multiple
+          # PROGRAM_REGEX: 'PR\\s*en\\s*Vivo'  # optional filter
+        run: |
+          set -euo pipefail
+          mkdir -p logs out
+          python -m scripts.parsers.scrape_pr_tvtv \
+            --output "out/pr_tvtv_${{ github.run_id }}.jsonl" \
+            2>&1 | tee "logs/pr_tvtv_${{ github.run_id }}.log"
+
+      # --- (UNCHANGED) Logs upload ---
       - name: Upload logs (always)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: mx-epg-scrape-logs
           path: logs/*.log
+
+      # --- (ADDED, OPTIONAL) Upload PR TvTV NDJSON output ---
+      - name: Upload PR TvTV EPG (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-tvtv-epg-${{ github.run_id }}
+          path: out/pr_tvtv_*.jsonl
