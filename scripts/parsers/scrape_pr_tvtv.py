@@ -2,32 +2,20 @@
 """
 Scrape TV schedules from tvtv.us Puerto Rico pages using Playwright.
 
-Why Playwright? tvtv.us is client-rendered (Next.js). We extract the
-`__NEXT_DATA__` JSON (or fall back to sniffing JSON XHRs) and parse out
-program items for one or more station pages.
+- Navigates EXACTLY to: https://www.tvtv.us/pr/<city>/<lineup>/stn/<stationId>
+- Extracts Next.js __NEXT_DATA__ or falls back to JSON XHRs
+- Normalizes times to UTC and a provided LOCAL_TZ
+- Optional PROGRAM_REGEX filter
+- Debug mode can dump the captured JSON for inspection
 
-Usage (module):
-  python -m scripts.scrape_pr_tvtv \
+Example:
+  python -m scripts.parsers.scrape_pr_tvtv \
     --city bayamon \
     --lineup luUSA-PR68592-X \
     --station 43726 \
     --hours-ahead 36 \
-    --program "PR\\s*en\\s*Vivo" \
     --local-tz America/Puerto_Rico \
-    --output out/pr_en_vivo.jsonl
-
-Or via env (good for GitHub Actions):
-  CITY_SLUG=bayamon LINEUP_ID=luUSA-PR68592-X STATION_IDS=43726 \
-  HOURS_AHEAD=36 LOCAL_TZ=America/Puerto_Rico \
-  python -m scripts.scrape_pr_tvtv
-
-Notes:
-- We keep output simple: newline-delimited JSON with normalized fields.
-- If PROGRAM_REGEX is set (CLI or env), results are filtered to matches.
-- Times are exported as both UTC and local tz strings.
-- Caching/sign-in is NOT required.
-
-Requires: playwright (Chromium). In CI, run `python -m playwright install --with-deps chromium`.
+    --output out/pr_tvtv.jsonl --debug
 """
 from __future__ import annotations
 
@@ -42,11 +30,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from playwright.async_api import async_playwright, Browser, Page
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
 try:
-    # Py3.9+
-    from zoneinfo import ZoneInfo  # type: ignore
+    from zoneinfo import ZoneInfo  # py3.9+
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
@@ -61,9 +48,9 @@ class Program:
     title: str
     subtitle: Optional[str]
     description: Optional[str]
-    start_utc: str  # ISO8601 UTC
-    end_utc: Optional[str]  # ISO8601 UTC
-    start_local: str  # ISO8601 with local tz offset
+    start_utc: str
+    end_utc: Optional[str]
+    start_local: str
     end_local: Optional[str]
     season: Optional[int] = None
     episode: Optional[int] = None
@@ -83,16 +70,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--base-url", default=_env("BASE_URL", "https://www.tvtv.us/pr"))
     p.add_argument("--city", default=_env("CITY_SLUG", "bayamon"), help="City slug (e.g., bayamon)")
     p.add_argument("--lineup", default=_env("LINEUP_ID", "luUSA-PR68592-X"), help="Lineup id segment")
-    p.add_argument(
-        "--station", action="append", dest="stations", default=None,
-        help="Station id (repeatable). If omitted, reads STATION_IDS=comma,separated",
-    )
+    p.add_argument("--station", action="append", dest="stations", default=None, help="Station id (repeatable)")
     p.add_argument("--hours-ahead", type=int, default=int(_env("HOURS_AHEAD", "36")), help="Horizon hours")
     p.add_argument("--local-tz", default=_env("LOCAL_TZ", "America/Puerto_Rico"))
     p.add_argument("--program", default=_env("PROGRAM_REGEX"), help="Regex filter for program title (optional)")
     p.add_argument("--output", default=_env("OUTPUT_JSONL", None), help="Write NDJSON to this path (optional)")
     p.add_argument("--headless", default=_env("HEADLESS", "true"))
-    p.add_argument("--timeout-ms", type=int, default=int(_env("NAV_TIMEOUT_MS", "30000")))
+    p.add_argument("--timeout-ms", type=int, default=int(_env("NAV_TIMEOUT_MS", "35000")))
+    p.add_argument("--debug", action="store_true", default=bool(int(_env("DEBUG_TVTV", "0"))), help="Dump captured JSON")
     return p.parse_args(argv)
 
 
@@ -102,7 +87,6 @@ def _parse_station_list(args: argparse.Namespace) -> List[str]:
     env_ids = _env("STATION_IDS")
     if env_ids:
         return [s.strip() for s in env_ids.split(",") if s.strip()]
-    # Fallback to TeleMundo PR example from the convo (can be overridden)
     return ["43726"]
 
 
@@ -121,33 +105,43 @@ def _to_iso(dt: datetime) -> str:
 
 
 def _parse_time_loosely(val: Any) -> Optional[datetime]:
-    """Parse a variety of time formats to aware UTC datetime when possible.
-    Supports:
-    - epoch seconds/millis
-    - ISO strings with/without Z (assumed UTC if Z / offset provided)
-    - fallback: None
+    """Parse many time formats into a datetime. Returns UTC-aware if possible.
+    Supports: epoch sec/ms, ISO (with/without Z), "H:MM" and "H:MM AM/PM" (naive),
+    and minutes-from-midnight (<= 1440).
     """
     if val is None:
         return None
-    # numbers
     if isinstance(val, (int, float)):
         x = float(val)
+        # minutes-from-midnight heuristic
+        if 0 <= x <= 24 * 60:
+            return datetime(1970, 1, 1, 0, 0) + timedelta(minutes=int(x))  # naive
         if x > 1e12:  # ms
             return datetime.fromtimestamp(x / 1000.0, tz=timezone.utc)
         if x > 1e10:  # sec (far future)
             return datetime.fromtimestamp(x, tz=timezone.utc)
-        # too small to be epoch; ignore
         return None
-    # strings
     if isinstance(val, str):
         s = val.strip()
-        # ISO-ish
+        # time-only like "1:00 PM" or "13:00"
+        m = re.fullmatch(r"^([0-9]{1,2}):([0-9]{2})(?:[ ]*([AP]M))?$", s, flags=re.IGNORECASE)
+        if m:
+            h = int(m.group(1))
+            mm = int(m.group(2))
+            ampm = m.group(3)
+            if ampm:
+                ampm = ampm.upper()
+                if ampm == "PM" and h != 12:
+                    h += 12
+                if ampm == "AM" and h == 12:
+                    h = 0
+            return datetime(1970, 1, 1, h, mm)  # naive
         try:
             if s.endswith("Z"):
                 return datetime.fromisoformat(s.replace("Z", "+00:00"))
             if "+" in s[10:]:  # contains offset
                 return datetime.fromisoformat(s)
-            # bare ISO assume local? we can't know; treat as naive UTC
+            # bare ISO treated as UTC
             return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
         except Exception:
             pass
@@ -155,14 +149,18 @@ def _parse_time_loosely(val: Any) -> Optional[datetime]:
 
 
 def _rec_find_program_nodes(obj: Any) -> Iterable[Dict[str, Any]]:
-    """Yield dicts that look like program items (have title and start/time-ish keys)."""
+    """Yield dicts that look like program items."""
     def looks_like_program(d: Dict[str, Any]) -> bool:
         if not isinstance(d, dict):
             return False
-        keys = set(k.lower() for k in d.keys())
-        if "title" not in keys:
+        keys = {k.lower() for k in d.keys()}
+        if not ("title" in keys or "programtitle" in keys or "name" in keys):
             return False
-        time_keys = {"start", "end", "starttime", "endtime", "startdatetime", "enddatetime"}
+        time_keys = {
+            "start", "end", "starttime", "endtime", "startdatetime", "enddatetime",
+            "airingstarttime", "airingendtime", "start_minutes", "startminutes",
+            "minutes", "startmin", "duration", "lengthminutes"
+        }
         return len(keys & time_keys) >= 1
 
     if isinstance(obj, dict):
@@ -176,7 +174,6 @@ def _rec_find_program_nodes(obj: Any) -> Iterable[Dict[str, Any]]:
 
 
 def _rec_find_station_name(obj: Any) -> Optional[str]:
-    # Try common fields
     if isinstance(obj, dict):
         name = obj.get("stationName") or obj.get("callSign") or obj.get("station") or obj.get("channelName")
         if isinstance(name, str) and len(name) >= 2:
@@ -194,49 +191,51 @@ def _rec_find_station_name(obj: Any) -> Optional[str]:
 
 
 async def _extract_next_data_json(page: Page) -> Optional[Dict[str, Any]]:
-    # Primary: __NEXT_DATA__ script tag
+    """Try multiple strategies to get rich JSON from a Next.js page.
+    1) __NEXT_DATA__
+    2) JSON XHRs captured during/after navigation (schedule/grid/etc)
+    """
+    # 1) __NEXT_DATA__
     try:
-        el = await page.wait_for_selector("script#__NEXT_DATA__", timeout=5000)
+        el = await page.wait_for_selector("script#__NEXT_DATA__", timeout=12000)
         txt = await el.text_content()
         if txt:
             return json.loads(txt)
     except Exception:
         pass
 
-    # Fallback: sniff JSON XHR responses that look rich
+    # 2) Capture JSON responses
     captured: List[Dict[str, Any]] = []
 
-    def on_response(resp):
+    async def on_response(resp):
         try:
             ct = resp.headers.get("content-type", "")
             if "application/json" in ct:
-                # schedule requests tend to be larger
-                if resp.request and any(k in resp.url for k in ["schedule", "listing", "grid", "stn", "lineup", "_next", "data"]):
-                    asyncio.create_task(_collect_json(resp, captured))
+                if any(k in resp.url for k in ["schedule", "listing", "grid", "stn", "lineup", "_next", "data"]):
+                    try:
+                        data = await resp.json()
+                        if isinstance(data, dict) and data:
+                            captured.append(data)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
     page.on("response", on_response)
-    # give it a chance
-    await page.wait_for_timeout(2000)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(3000)
     page.off("response", on_response)
-    # Pick the biggest JSON blob
+
     if captured:
         captured.sort(key=lambda d: len(json.dumps(d, ensure_ascii=False)), reverse=True)
         return captured[0]
     return None
 
 
-async def _collect_json(resp, bucket: List[Dict[str, Any]]):
-    try:
-        data = await resp.json()
-        if isinstance(data, dict) and data:
-            bucket.append(data)
-    except Exception:
-        pass
-
-
-async def fetch_station_programs(base_url: str, city: str, lineup: str, station_id: str, hours_ahead: int, local_tz: str, headless: bool, timeout_ms: int) -> Tuple[str, List[Program]]:
+async def fetch_station_programs(base_url: str, city: str, lineup: str, station_id: str, hours_ahead: int, local_tz: str, headless: bool, timeout_ms: int, debug: bool = False, dump_dir: Optional[Path] = None) -> Tuple[str, List[Program]]:
     url = f"{base_url.rstrip('/')}/{city}/{lineup}/stn/{station_id}"
     print(f"[INFO] Fetching station {station_id} → {url}")
 
@@ -245,12 +244,23 @@ async def fetch_station_programs(base_url: str, city: str, lineup: str, station_
 
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(headless=(str(headless).lower() != "false"))
-        page: Page = await browser.new_page()
+        ctx: BrowserContext = await browser.new_context(
+            locale="en-US",
+            timezone_id=local_tz,
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+            ),
+        )
+        page: Page = await ctx.new_page()
         page.set_default_timeout(timeout_ms)
         await page.goto(url, wait_until="domcontentloaded")
-        # Let the client do its data pulls
-        await page.wait_for_load_state("networkidle")
         data = await _extract_next_data_json(page)
+        if debug and dump_dir and data:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            sample = dump_dir / f"tvtv_{station_id}.json"
+            sample.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        await ctx.close()
         await browser.close()
 
     if not data:
@@ -260,30 +270,74 @@ async def fetch_station_programs(base_url: str, city: str, lineup: str, station_
     station_name = _rec_find_station_name(data)
     programs: List[Program] = []
 
+    # Try to infer a context date (e.g., gridDate: YYYY-MM-DD) for time-only values
+    payload_text = json.dumps(data, ensure_ascii=False)
+    m_date = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", payload_text)
+    context_date = m_date.group(1) if m_date else None
+
+    def attach_date_if_time_only(dt_like: datetime) -> datetime:
+        if dt_like.tzinfo is not None:
+            return dt_like
+        base = context_date or datetime.now(tz).date().isoformat()
+        y, mo, d = map(int, base.split("-"))
+        dt_local = datetime(y, mo, d, dt_like.hour, dt_like.minute, tzinfo=tz)
+        return dt_local.astimezone(timezone.utc)
+
     for node in _rec_find_program_nodes(data):
-        title = str(node.get("title") or node.get("programTitle") or "").strip()
+        title = (str(node.get("title") or node.get("programTitle") or node.get("name") or "")).strip()
+        if not title:
+            prog = node.get("program") if isinstance(node, dict) else None
+            if isinstance(prog, dict):
+                title = (str(prog.get("title") or prog.get("name") or "")).strip()
         if not title:
             continue
+
         subtitle = node.get("subtitle") or node.get("episodeTitle")
+        if not subtitle and isinstance(node.get("program"), dict):
+            subtitle = node["program"].get("episodeTitle")
+
         desc = node.get("description") or node.get("desc") or node.get("synopsis")
+        if not desc and isinstance(node.get("program"), dict):
+            desc = node["program"].get("synopsis")
+
         s_num = node.get("season") or node.get("seasonNumber")
         e_num = node.get("episode") or node.get("episodeNumber")
-        start_raw = node.get("start") or node.get("startTime") or node.get("startDateTime")
-        end_raw = node.get("end") or node.get("endTime") or node.get("endDateTime")
+
+        start_raw = (
+            node.get("start") or node.get("startTime") or node.get("startDateTime") or
+            node.get("airingStartTime") or node.get("start_minutes") or node.get("startMinutes") or
+            node.get("startMin") or node.get("minutes")
+        )
+        end_raw = (
+            node.get("end") or node.get("endTime") or node.get("endDateTime") or node.get("airingEndTime")
+        )
+        duration_min = node.get("duration") or node.get("lengthMinutes") or node.get("dur")
 
         start_dt_utc = _parse_time_loosely(start_raw)
         end_dt_utc = _parse_time_loosely(end_raw)
 
+        # Handle naive times / minutes-from-midnight
+        if start_dt_utc and start_dt_utc.tzinfo is None:
+            start_dt_utc = attach_date_if_time_only(start_dt_utc)
+        elif isinstance(start_raw, (int, float)) and float(start_raw) <= 24 * 60:
+            minutes = int(float(start_raw))
+            base = context_date or datetime.now(tz).date().isoformat()
+            y, mo, d = map(int, base.split("-"))
+            dt_local = datetime(y, mo, d, 0, 0, tzinfo=tz) + timedelta(minutes=minutes)
+            start_dt_utc = dt_local.astimezone(timezone.utc)
+
         if not start_dt_utc:
-            # Some datasets encode minutes-since-midnight + date; try other hints
             continue
 
-        # Filter by horizon
-        if start_dt_utc.tzinfo is None:
-            start_dt_utc = start_dt_utc.replace(tzinfo=timezone.utc)
         if end_dt_utc and end_dt_utc.tzinfo is None:
-            end_dt_utc = end_dt_utc.replace(tzinfo=timezone.utc)
+            end_dt_utc = attach_date_if_time_only(end_dt_utc)
+        if not end_dt_utc and duration_min:
+            try:
+                end_dt_utc = start_dt_utc + timedelta(minutes=int(float(duration_min)))
+            except Exception:
+                end_dt_utc = None
 
+        # Horizon filter
         if start_dt_utc > horizon_utc:
             continue
 
@@ -339,6 +393,8 @@ async def main(argv: Optional[List[str]] = None) -> int:
 
     all_rows: List[Program] = []
 
+    dump_dir = Path("logs/_tvtv_debug") if args.debug else None
+
     for stn in stations:
         try:
             _, rows = await fetch_station_programs(
@@ -350,29 +406,27 @@ async def main(argv: Optional[List[str]] = None) -> int:
                 local_tz=args.local_tz,
                 headless=args.headless,
                 timeout_ms=args.timeout_ms,
+                debug=args.debug,
+                dump_dir=dump_dir,
             )
         except Exception as e:
             print(f"[ERROR] Station {stn}: {e}")
             continue
 
-        # Optional filter by title regex
         if prog_re:
             rows = [r for r in rows if prog_re.search(r.title or "")]
         all_rows.extend(rows)
 
-    # Sort by start time
     all_rows.sort(key=lambda r: r.start_utc)
 
-    # Human summary
     print("\n[SUMMARY]")
     if not all_rows:
         print("No programs found for the given criteria.")
     else:
-        for r in all_rows[:20]:  # cap spam
+        for r in all_rows[:30]:
             name = r.station_name or r.station_id
             print(f"{r.start_local} — {r.title} ({name})")
 
-    # Emit NDJSON
     def to_dict(p: Program) -> Dict[str, Any]:
         return {
             "station_id": p.station_id,
