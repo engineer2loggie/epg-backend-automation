@@ -60,27 +60,21 @@ jobs:
 
       # --- (ADDED) PR TvTV scraper step ---
       - name: Run PR TVTV scraper
-        env:
-          PYTHONUNBUFFERED: "1"
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
-          # Scraper behavior
-          LOCAL_TZ: "America/Puerto_Rico"
-          HOURS_AHEAD: "36"
-          SCRAPE_CONCURRENCY: "4"   # (unused by this script but fine to keep)
-
-          # TvTV targeting (envs are optional — you can pass flags instead)
-          CITY_SLUG: "bayamon"
-          LINEUP_ID: "luUSA-PR68592-X"
-          STATION_IDS: "43726"      # comma-separated to scrape multiple
-          # PROGRAM_REGEX: 'PR\\s*en\\s*Vivo'  # optional filter
-        run: |
-          set -euo pipefail
-          mkdir -p logs out
-          python -m scripts.parsers.scrape_pr_tvtv \
-            --output "out/pr_tvtv_${{ github.run_id }}.jsonl" \
-            2>&1 | tee "logs/pr_tvtv_${{ github.run_id }}.log"
+  env:
+    PYTHONUNBUFFERED: "1"
+    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    LOCAL_TZ: "America/Puerto_Rico"
+    HOURS_AHEAD: "36"
+    CITY_SLUG: "bayamon"
+    LINEUP_ID: "luUSA-PR68592-X"
+    STATION_IDS: "43726"
+  run: |
+    set -euo pipefail
+    mkdir -p logs out
+    python -m scripts.parsers.scrape_pr_tvtv \
+      --output "out/pr_tvtv_${{ github.run_id }}.jsonl" \
+      --debug 2>&1 | tee "logs/pr_tvtv_${{ github.run_id }}.log"
 
       # --- (UNCHANGED) Logs upload ---
       - name: Upload logs (always)
