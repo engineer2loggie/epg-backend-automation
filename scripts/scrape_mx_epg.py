@@ -32,7 +32,7 @@ INPUT_MODE = os.getenv("INPUT_MODE", "supabase").lower()
 CSV_PATH = os.getenv("CSV_PATH", "manual_tv_input.csv")
 
 # Fallback timezone if one isn't specified in your input source.
-LOCAL_TZ = os.getenv("LOCAL_TZ", "America/Mexico_City")
+LOCAL_TZ = os.getenv("LOCAL_TZ", "America/Mexico_city")
 HOURS_AHEAD = int(os.getenv("HOURS_AHEAD", "36"))
 SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "4"))
 
@@ -71,9 +71,14 @@ def purge_window_for_sources(supabase: Client, sources: list[str], hours_back: i
 
 # -------------------- Inputs --------------------
 async def read_links_from_supabase(supabase: Client) -> List[Dict[str, str]]:
-    """Reads links and their timezones. Expects a 'timezone' column in 'manual_tv_input'."""
-    res = supabase.table("manual_tv_input").select("programme_source_link, timezone").execute()
+    """
+    Reads links from Supabase. It fetches all columns to avoid errors if 'timezone'
+    is missing, but will use it if it exists.
+    """
+    # FIX: Select all columns (*) to prevent an error if 'timezone' does not exist.
+    res = supabase.table("manual_tv_input").select("*").execute()
     links = [
+        # The .get() method safely handles a missing 'timezone' key.
         {"url": row.get("programme_source_link"), "tz": row.get("timezone") or LOCAL_TZ}
         for row in res.data if row.get("programme_source_link")
     ]
