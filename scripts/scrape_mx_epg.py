@@ -111,20 +111,26 @@ def read_links_from_csv(path: str) -> List[Dict[str, str]]:
 
 # -------------------- Orchestration --------------------
 def pick_parser(url: str):
-    """Selects the correct parser class for a given URL."""
+    """
+    Selects the correct parser for a given URL by instantiating and checking each one.
+    """
+    # FIX: Instantiate the parser class before calling .matches() to prevent TypeError.
     for p_class in ALL_PARSERS:
-        if p_class.matches(url):
-            return p_class()
+        parser_instance = p_class()
+        if parser_instance.matches(url):
+            return parser_instance # Return the instance
     return None
 
 async def scrape_one(source_info: Dict[str, str], *, hours_ahead: int) -> List[Programme]:
     """Scrapes a single source using its specific timezone."""
     url, tzname = source_info["url"], source_info["tz"]
+    # FIX: pick_parser now returns an instance directly.
     parser = pick_parser(url)
     if not parser:
         print(f"[warn] No parser found for {url}")
         return []
     try:
+        # 'parser' is already an instance, so we call the method on it.
         return await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=None) or []
     except Exception as e:
         print(f"[error] Failed to parse {url}: {e}")
