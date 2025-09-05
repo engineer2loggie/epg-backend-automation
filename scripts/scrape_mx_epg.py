@@ -156,16 +156,17 @@ def to_rows(programs_by_url: Dict[str, List[Programme]]) -> List[Dict]:
         for p in progs:
             # --- Start of Schema-Specific Logic ---
             # Build the combined title string
-            # 1. Start with the base title
             full_title = p.title if p.title else "No Title"
 
-            # 2. Add category if it exists
-            if p.category:
-                full_title += f" [{p.category}]"
+            # FIX: Use getattr() to safely access optional attributes. This prevents
+            # the AttributeError when a programme from an older parser is processed.
+            category = getattr(p, 'category', None)
+            description = getattr(p, 'description', None)
 
-            # 3. Add description if it exists
-            if p.description:
-                full_title += f" - {p.description}"
+            if category:
+                full_title += f" [{category}]"
+            if description:
+                full_title += f" - {description}"
             # --- End of Schema-Specific Logic ---
 
             # Your schema requires a non-null end time. If a parser fails to find one,
