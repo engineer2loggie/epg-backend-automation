@@ -12,15 +12,15 @@ from supabase import create_client, Client
 
 # --- PARSER INTEGRATION ---
 # IMPORTANT: Import all your parser classes and the Programme object here.
-# The script assumes your parsers live in a `scripts/parsers/` directory.
-# You will need to create/update a `scripts/parsers/__init__.py` file
-# to make these imports work seamlessly.
+# This setup assumes your parsers live in a `scripts/parsers/` directory.
 from .parsers.gatotv import GatoTVParser # Assumed existing parser
+from .parsers.ontvtonight import OnTVTonightParser # Restoring your existing parser
 from .parsers.tvguia_parser import TvGuiaParser, Programme # Your new parser and its Programme class
 
-# This list powers the whole script. Add any new parser classes here.
+# This list powers the script. Add any new parser classes here.
 ALL_PARSERS = [
     GatoTVParser,
+    OnTVTonightParser,
     TvGuiaParser,
 ]
 
@@ -31,7 +31,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 INPUT_MODE = os.getenv("INPUT_MODE", "supabase").lower()
 CSV_PATH = os.getenv("CSV_PATH", "manual_tv_input.csv")
 
-# This is now a FALLBACK timezone if one isn't specified in your input source.
+# Fallback timezone if one isn't specified in your input source.
 LOCAL_TZ = os.getenv("LOCAL_TZ", "America/Mexico_City")
 HOURS_AHEAD = int(os.getenv("HOURS_AHEAD", "36"))
 SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "4"))
@@ -71,7 +71,7 @@ def purge_window_for_sources(supabase: Client, sources: list[str], hours_back: i
 
 # -------------------- Inputs --------------------
 async def read_links_from_supabase(supabase: Client) -> List[Dict[str, str]]:
-    """Reads links and their timezones. Expects a 'timezone' column."""
+    """Reads links and their timezones. Expects a 'timezone' column in 'manual_tv_input'."""
     res = supabase.table("manual_tv_input").select("programme_source_link, timezone").execute()
     links = [
         {"url": row.get("programme_source_link"), "tz": row.get("timezone") or LOCAL_TZ}
@@ -92,7 +92,7 @@ def read_links_from_csv(path: str) -> List[Dict[str, str]]:
         url_key = next((k for k in ("programme_source_link", "url") if k in reader.fieldnames), None)
         if not url_key:
             raise RuntimeError(f"CSV missing a URL column; fields={reader.fieldnames}")
-        
+
         for r in reader:
             if r.get(url_key):
                 items.append({"url": r.get(url_key).strip(), "tz": r.get("timezone", "").strip() or LOCAL_TZ})
@@ -109,21 +109,18 @@ def pick_parser(url: str):
     """Selects the correct parser class for a given URL."""
     for p_class in ALL_PARSERS:
         if p_class.matches(url):
-            return p_class() # Return an instance of the parser
+            return p_class()
     return None
 
 async def scrape_one(source_info: Dict[str, str], *, hours_ahead: int) -> List[Programme]:
     """Scrapes a single source using its specific timezone."""
-    url = source_info["url"]
-    tzname = source_info["tz"]
-    
+    url, tzname = source_info["url"], source_info["tz"]
     parser = pick_parser(url)
     if not parser:
         print(f"[warn] No parser found for {url}")
         return []
     try:
-        progs = await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=None)
-        return progs or []
+        return await parser.fetch_and_parse(url, tzname=tzname, hours_ahead=hours_ahead, page=None) or []
     except Exception as e:
         print(f"[error] Failed to parse {url}: {e}")
         return []
@@ -132,28 +129,43 @@ async def scrape_all(sources: List[Dict[str, str]]) -> Dict[str, List[Programme]
     """Runs scraping concurrently for all provided sources."""
     results: Dict[str, List[Programme]] = {}
     sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
-
     async def task(source: Dict[str, str]):
         async with sem:
-            progs = await scrape_one(source, hours_ahead=HOURS_AHEAD)
-            results[source["url"]] = progs
-
+            results[source["url"]] = await scrape_one(source, hours_ahead=HOURS_AHEAD)
     await asyncio.gather(*(task(s) for s in sources))
     return results
 
 def to_rows(programs_by_url: Dict[str, List[Programme]]) -> List[Dict]:
-    """Converts Programme objects to dictionaries for Supabase, including new fields."""
+    """
+    SCHEMA-COMPLIANT: Converts Programme objects to dictionaries for Supabase.
+    It combines title, category, and description into the single programme_title field.
+    """
     rows = []
     for url, progs in programs_by_url.items():
         for p in progs:
+            # --- Start of Schema-Specific Logic ---
+            # Build the combined title string
+            # 1. Start with the base title
+            full_title = p.title if p.title else "No Title"
+
+            # 2. Add category if it exists
+            if p.category:
+                full_title += f" [{p.category}]"
+
+            # 3. Add description if it exists
+            if p.description:
+                full_title += f" - {p.description}"
+            # --- End of Schema-Specific Logic ---
+
+            # Your schema requires a non-null end time. If a parser fails to find one,
+            # we'll add a default 30-minute duration as a safe fallback.
+            end_time = p.end if p.end else p.start + timedelta(minutes=30)
+
             rows.append({
                 "programme_source_link": url,
                 "programme_start_time": p.start.isoformat(),
-                "programme_end_time": p.end.isoformat() if p.end else None,
-                "programme_title": p.title,
-                # Ensure your Supabase table has these columns
-                "programme_desc": p.description,
-                "programme_category": p.category,
+                "programme_end_time": end_time.isoformat(),
+                "programme_title": full_title,
             })
     return rows
 
@@ -163,7 +175,7 @@ def upsert_rows(supabase: Client, rows: List[Dict]):
     if not rows:
         print("[info] Nothing to upsert.")
         return
-        
+
     print(f"[info] Upserting {len(rows)} rows to Supabase...")
     CHUNK = 500
     for i in range(0, len(rows), CHUNK):
@@ -190,7 +202,7 @@ async def main():
     print(f"[info] Parsers active: {[p.__name__ for p in ALL_PARSERS]}")
     print(f"[info] Found {len(supported_sources)} supported sources to scrape.")
 
-    # 1) Scrape all sources to get fresh data
+    # 1) Scrape all sources
     programs_by_url = await scrape_all(supported_sources)
 
     # Log results
@@ -202,7 +214,7 @@ async def main():
             print(f"[parsed] FAIL ✗ 0 programmes from {url}")
             empty_sources.append(url)
 
-    # 2) Purge the database ONLY for sources that returned new data
+    # 2) Purge the database for sources that returned new data
     if not DRY_RUN_PURGE:
         non_empty_sources = [u for u, p in programs_by_url.items() if p]
         if non_empty_sources:
@@ -212,7 +224,7 @@ async def main():
     else:
         print("[info] Dry run: purge step skipped.")
 
-    # 3) Upsert the new rows
+    # 3) Convert to rows and upsert
     rows = to_rows(programs_by_url)
     upsert_rows(supabase, rows)
 
@@ -224,3 +236,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
