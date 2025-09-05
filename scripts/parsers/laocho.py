@@ -1,5 +1,8 @@
 from __future__ import annotations
 import re
+import os
+import time
+import random
 import asyncio
 from dataclasses import dataclass
 from typing import List, Optional, Iterable
@@ -8,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup, Tag
+
 
 # ----------------------------
 # Data model (unchanged API)
@@ -32,6 +36,7 @@ class LaochoParser:
 
     # HH:MM - HH:MM
     _TIME_RE = re.compile(r"\b(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\b")
+
     _UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -39,7 +44,7 @@ class LaochoParser:
     )
 
     # Words we keep in caps even after normalization
-    _PRESERVE_ALLCAPS = {"TV", "UHD", "HD", "4K", "3D", "TP", "PR", "MX", "ES", "USA"}
+    _PRESERVE_ALLCAPS = {"TV", "UHD", "HD", "4K", "3D", "TP", "PR", "MX", "ES", "USA", "RTVE"}
     # Common leading labels
     _LEADING_LABELS = ("SINOPSIS:", "SINOPSI:", "SYNOPSIS:", "DESCRIPCIÓN:", "DESCRIPCION:")
 
@@ -76,20 +81,66 @@ class LaochoParser:
         hours_ahead: int = 36,
         page: str | None = None,
     ) -> List[Programme]:
-        # network + parse in a thread to avoid blocking
         html = page or await asyncio.to_thread(self._fetch_html, url)
-        items = self._parse_html(html, tzname=tzname, hours_ahead=hours_ahead)
-        return items
+        return self._parse_html(html, tzname=tzname, hours_ahead=hours_ahead)
 
     # -------------- Internals --------------
     def _fetch_html(self, url: str) -> str:
-        r = requests.get(
-            url,
-            timeout=30,
-            headers={"User-Agent": self._UA, "Cache-Control": "no-cache"},
-        )
-        r.raise_for_status()
-        return r.text
+        """
+        Resilient fetch: retries with exponential backoff + jitter, cache-busting param,
+        optional Playwright fallback when USE_PLAYWRIGHT_FOR_LAOCHO=1.
+        """
+        attempts = int(os.getenv("LAOCHO_HTTP_RETRIES", "4"))
+        base = float(os.getenv("LAOCHO_HTTP_BACKOFF", "0.75"))  # seconds
+        force_requests = os.getenv("LAOCHO_FORCE_REQUESTS", "0") == "1"
+        last_err = None
+
+        for i in range(attempts):
+            try:
+                # Cache-busting on retries to dodge intermediate caches/WAFs
+                bust = "" if i == 0 else (("&cb=%d" % int(time.time() * 1000)))
+                target = url + bust
+                r = requests.get(
+                    target,
+                    timeout=30,
+                    headers={
+                        "User-Agent": self._UA,
+                        "Cache-Control": "no-cache",
+                        "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
+                    },
+                )
+                r.raise_for_status()
+                return r.text
+            except Exception as e:
+                last_err = e
+                sleep = base * (2 ** i) + random.uniform(0, 0.25)
+                time.sleep(sleep)
+
+        # Optional: Playwright fallback
+        if not force_requests and os.getenv("USE_PLAYWRIGHT_FOR_LAOCHO", "0") == "1":
+            html = self._fetch_with_playwright(url)
+            if html:
+                return html
+
+        # Still failing
+        raise last_err
+
+    def _fetch_with_playwright(self, url: str) -> str | None:
+        """Headless Chromium fallback; requires Playwright to be installed on runner."""
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                ctx = browser.new_context(user_agent=self._UA, java_script_enabled=True)
+                page = ctx.new_page()
+                page.set_default_timeout(30000)
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_timeout(1500)  # small idle wait
+                html = page.content()
+                browser.close()
+                return html
+        except Exception:
+            return None
 
     @staticmethod
     def _neighbors_until(nodes: Iterable[Tag], stop_pred) -> List[Tag]:
@@ -106,7 +157,6 @@ class LaochoParser:
 
         tz_es = ZoneInfo("Europe/Madrid")
         tz_target = ZoneInfo(tzname)
-
         today_es = datetime.now(tz_es).date()
 
         # Pair each TITLE node (h2/h3/h4) with the *next* node containing a time range.
@@ -120,7 +170,7 @@ class LaochoParser:
         for title_node in title_nodes:
             raw_title = title_node.get_text(" ", strip=True)
 
-            # find the next sibling-ish element that contains a time range
+            # Next element containing HH:MM - HH:MM
             time_node = title_node.find_next(
                 lambda t: t and isinstance(t, Tag)
                 and t.name in ("h5", "h6", "p", "div", "span")
@@ -135,34 +185,31 @@ class LaochoParser:
                 continue
 
             sh, sm, eh, em = m.groups()
-            start_es = datetime(
-                today_es.year, today_es.month, today_es.day, int(sh), int(sm), tzinfo=tz_es
-            )
-            end_es = datetime(
-                today_es.year, today_es.month, today_es.day, int(eh), int(em), tzinfo=tz_es
-            )
-            # Handle overnight wrap
+            start_es = datetime(today_es.year, today_es.month, today_es.day, int(sh), int(sm), tzinfo=tz_es)
+            end_es = datetime(today_es.year, today_es.month, today_es.day, int(eh), int(em), tzinfo=tz_es)
             if end_es <= start_es:
                 end_es += timedelta(days=1)
 
-            # Build description from the run of following blocks up to the next title/time block.
+            # Description: walk *sibling* tags after time_node until next title/time block
             def _is_stop(t: Tag) -> bool:
                 if not isinstance(t, Tag):
                     return False
                 text = t.get_text(" ", strip=True)
                 if not text:
                     return False
-                # Stop if we see another title or a time block
                 if t.name in ("h2", "h3", "h4"):
                     return True
                 if self._TIME_RE.search(text):
                     return True
                 return False
 
-            desc_blocks = self._neighbors_until(time_node.find_all_next(recursive=False), _is_stop)
-            # Fallback: also consider immediate siblings (DOMs vary)
-            if not desc_blocks:
-                desc_blocks = self._neighbors_until(time_node.next_siblings, _is_stop)
+            desc_blocks: List[Tag] = []
+            for sib in time_node.next_siblings:
+                if not isinstance(sib, Tag):
+                    continue
+                if _is_stop(sib):
+                    break
+                desc_blocks.append(sib)
 
             desc_text = " ".join(
                 b.get_text(" ", strip=True) for b in desc_blocks if isinstance(b, Tag)
@@ -184,7 +231,7 @@ class LaochoParser:
                 description=desc_norm
             ))
 
-        # Filter to requested horizon (relative to now in target tz)
+        # Horizon filter in target tz
         now_tz = datetime.now(tz_target)
         horizon_hi = now_tz + timedelta(hours=hours_ahead)
         items = [p for p in items if (p.end > now_tz and p.start < horizon_hi)]
@@ -197,7 +244,7 @@ class LaochoParser:
                 dedup[k] = p
         items = list(dedup.values())
 
-        # Sort chronologically
+        # Sort
         items.sort(key=lambda p: (p.start, p.title))
         return items
 
@@ -211,7 +258,6 @@ class LaochoParser:
             return s
 
         txt = " ".join(s.split())
-        # Remove leading 'SINOPSIS:'-like labels once
         up = txt.upper()
         for lbl in self._LEADING_LABELS:
             if up.startswith(lbl):
@@ -227,22 +273,17 @@ class LaochoParser:
         # Restore acronyms inside punctuation
         out_words = []
         for w in txt.split():
-            # keep punctuation like TP) intact
             prefix = ""
             suffix = ""
             core = w
-            # strip leading punctuation
             while core and not core[0].isalnum():
                 prefix += core[0]
                 core = core[1:]
-            # strip trailing punctuation
             while core and not core[-1].isalnum():
                 suffix = core[-1] + suffix
                 core = core[:-1]
-
             if core.upper() in self._PRESERVE_ALLCAPS:
                 core = core.upper()
-
             out_words.append(prefix + core + suffix)
 
         return " ".join(out_words)
@@ -256,9 +297,9 @@ class LaochoParser:
             return raw_title, None
 
         t = " ".join(raw_title.split())
+        category = None
 
         # Extract "CATEGORY: rest" if ALL-CAPS prefix and colon present
-        category = None
         if ":" in t:
             left, right = t.split(":", 1)
             left_uc = left.strip().upper()
@@ -268,7 +309,6 @@ class LaochoParser:
 
         # If still ALL-CAPS, soften
         if self._looks_all_caps(t):
-            # keep "Category: ..." format, normalize only the right side
             if category and ":" in t:
                 cat, rest = t.split(":", 1)
                 rest_norm = self._normalize_sentence(rest.strip())
