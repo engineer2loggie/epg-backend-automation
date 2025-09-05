@@ -1,6 +1,8 @@
+# scripts/parsers/laocho.py
 from __future__ import annotations
-import re
+
 import os
+import re
 import time
 import random
 import asyncio
@@ -12,28 +14,60 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup, Tag
 
-
+# ============================================================
+# Public data model (kept consistent with other parsers)
+# ============================================================
 @dataclass
 class Programme:
     title: str
-    start: datetime
-    end: datetime
+    start: datetime       # tz-aware
+    end: datetime         # tz-aware
     category: Optional[str] = None
     description: Optional[str] = None
 
 
 class LaochoParser:
+    """
+    Parser for https://laocho.tv/tv-programacion/
+
+    Behavior:
+    - Times listed on page are in Europe/Madrid. We convert to the caller's tz (tzname).
+    - Returns items within `hours_ahead` relative to *now in target tz*.
+    - Title casing is normalized (ALL-CAPS → human-friendly), preserving acronyms.
+    - Description capture is conservative and OFF by default (env LAOCHO_DESC_POLICY).
+      * none  (default): no description is saved
+      * short: first sentence (~160 chars)
+      * full : multi-block text until next title/time block
+    - Resilient fetching: retries with jitter and optional Playwright fallback.
+
+    Env toggles (optional):
+      LAOCHO_HTTP_RETRIES   (default "4")
+      LAOCHO_HTTP_BACKOFF   (seconds, default "0.75")
+      LAOCHO_FORCE_REQUESTS ("1" to disable Playwright fallback)
+      USE_PLAYWRIGHT_FOR_LAOCHO ("1" to enable Playwright fallback)
+      LAOCHO_DESC_POLICY    ("none" | "short" | "full", default "none")
+    """
     domains = ["laocho.tv"]
 
-    _TIME_RE = re.compile(r"\b(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\b")
+    # --- HTTP ---
     _UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0 Safari/537.36"
     )
 
-    _PRESERVE_ALLCAPS = {"TV", "UHD", "HD", "4K", "3D", "TP", "PR", "MX", "ES", "USA", "RTVE"}
+    # --- Parsing helpers ---
+    _TIME_RE = re.compile(r"\b(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\b")
+
+    # Words/acronyms to preserve in uppercase after normalization
+    _PRESERVE_ALLCAPS = {
+        "TV", "UHD", "HD", "4K", "3D", "TP", "PR", "MX", "ES", "USA", "RTVE"
+    }
+
+    # Leading labels to strip from blurbs
     _LEADING_LABELS = ("SINOPSIS:", "SINOPSI:", "SYNOPSIS:", "DESCRIPCIÓN:", "DESCRIPCION:")
+
+    # Common category prefixes that the site might use (ALL-CAPS)
     _CATEGORY_MAP = {
         "CINE": "Cine",
         "SERIE": "Serie",
@@ -50,6 +84,10 @@ class LaochoParser:
         "MAGAZINE": "Magazine",
     }
 
+    # Default to NO descriptions unless explicitly enabled
+    os.environ.setdefault("LAOCHO_DESC_POLICY", "none")
+
+    # -------------- Public API --------------
     def matches(self, url: str) -> bool:
         try:
             from urllib.parse import urlparse
@@ -67,14 +105,20 @@ class LaochoParser:
         html = page or await asyncio.to_thread(self._fetch_html, url)
         return self._parse_html(html, tzname=tzname, hours_ahead=hours_ahead)
 
-    # ---------- fetch with retries + optional Playwright ----------
+    # -------------- Networking (resilient) --------------
     def _fetch_html(self, url: str) -> str:
+        """
+        Resilient fetch with exponential backoff + jitter and cache-busting.
+        Falls back to Playwright if enabled and requests fail.
+        """
         attempts = int(os.getenv("LAOCHO_HTTP_RETRIES", "4"))
         base = float(os.getenv("LAOCHO_HTTP_BACKOFF", "0.75"))
         force_requests = os.getenv("LAOCHO_FORCE_REQUESTS", "0") == "1"
         last_err = None
+
         for i in range(attempts):
             try:
+                # Cache-busting param on retries to avoid intermediary caches/WAF
                 bust = "" if i == 0 else (f"?cb={int(time.time()*1000)}")
                 target = url + bust
                 r = requests.get(
@@ -91,13 +135,16 @@ class LaochoParser:
             except Exception as e:
                 last_err = e
                 time.sleep(base * (2 ** i) + random.uniform(0, 0.25))
+
         if not force_requests and os.getenv("USE_PLAYWRIGHT_FOR_LAOCHO", "0") == "1":
             html = self._fetch_with_playwright(url)
             if html:
                 return html
+
         raise last_err
 
     def _fetch_with_playwright(self, url: str) -> str | None:
+        """Optional headless Chromium fallback (requires Playwright to be installed)."""
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
@@ -113,19 +160,32 @@ class LaochoParser:
         except Exception:
             return None
 
-    # ---------- parsing ----------
+    # -------------- Parsing --------------
+    @staticmethod
+    def _neighbors_until(nodes: Iterable[Tag], stop_pred) -> List[Tag]:
+        """Collect consecutive siblings until stop_pred(tag) is True."""
+        out = []
+        for n in nodes:
+            if stop_pred(n):
+                break
+            out.append(n)
+        return out
+
     def _parse_html(self, html: str, tzname: str, hours_ahead: int) -> List[Programme]:
         soup = BeautifulSoup(html, "html.parser")
+
         tz_es = ZoneInfo("Europe/Madrid")
         tz_target = ZoneInfo(tzname)
         today_es = datetime.now(tz_es).date()
 
+        # Title blocks are typically h2/h3/h4; each followed by a time range somewhere nearby.
         title_nodes = [n for n in soup.find_all(["h2", "h3", "h4"]) if n.get_text(strip=True)]
         items: list[Programme] = []
 
         for title_node in title_nodes:
             raw_title = title_node.get_text(" ", strip=True)
 
+            # Find the next element that contains <HH:MM - HH:MM>
             time_node = title_node.find_next(
                 lambda t: t and isinstance(t, Tag)
                 and t.name in ("h5", "h6", "p", "div", "span")
@@ -141,16 +201,16 @@ class LaochoParser:
             sh, sm, eh, em = m.groups()
             start_es = datetime(today_es.year, today_es.month, today_es.day, int(sh), int(sm), tzinfo=tz_es)
             end_es = datetime(today_es.year, today_es.month, today_es.day, int(eh), int(em), tzinfo=tz_es)
-            if end_es <= start_es:
+            if end_es <= start_es:  # overnight wrap
                 end_es += timedelta(days=1)
 
-            # Conservative description extraction
-            desc_policy = os.getenv("LAOCHO_DESC_POLICY", "short").lower()
+            # Description (conservative) — governed by env policy (default 'none')
+            desc_policy = os.getenv("LAOCHO_DESC_POLICY", "none").lower()
             desc_text = self._extract_description(time_node, policy=desc_policy)
 
-            # Normalize
+            # Normalize title and optional description
             title_norm, category = self._normalize_title_and_category(raw_title)
-            desc_norm = self._normalize_sentence(desc_text) if desc_text else None
+            desc_norm = self._normalize_sentence(desc_text) if (desc_text and desc_policy != "none") else None
 
             # Convert to target tz
             start_target = start_es.astimezone(tz_target)
@@ -164,28 +224,32 @@ class LaochoParser:
                 description=desc_norm
             ))
 
-        # Window filter
+        # Window filter (relative to now in target tz)
         now_tz = datetime.now(tz_target)
         horizon_hi = now_tz + timedelta(hours=hours_ahead)
         items = [p for p in items if (p.end > now_tz and p.start < horizon_hi)]
 
-        # De-dupe + sort
-        seen = {}
+        # De-duplicate by (title, start)
+        dedup = {}
         for p in items:
-            key = (p.title, p.start)
-            if key not in seen:
-                seen[key] = p
-        items = sorted(seen.values(), key=lambda p: (p.start, p.title))
+            k = (p.title, p.start)
+            if k not in dedup:
+                dedup[k] = p
+        items = list(dedup.values())
+
+        # Sort chronologically
+        items.sort(key=lambda p: (p.start, p.title))
         return items
 
-    # ---------- description policy ----------
-    def _extract_description(self, time_node: Tag, policy: str = "short") -> Optional[str]:
+    # -------------- Description policy --------------
+    def _extract_description(self, time_node: Tag, policy: str = "none") -> Optional[str]:
         """
         Conservative description builder:
-        - 'none'  : no description
-        - 'short' : first sentence only, max ~160 chars
-        - 'full'  : previous multi-block behavior (up to first next title/time)
+          - 'none'  : no description (default)
+          - 'short' : first sentence only, ~160 chars, avoids promo/host bios
+          - 'full'  : concatenates siblings until next title/time block
         """
+        policy = (policy or "none").lower()
         if policy == "none":
             return None
 
@@ -201,7 +265,7 @@ class LaochoParser:
                 return True
             return False
 
-        # Grab only the very next paragraph-like sibling
+        # Take at most the *immediate* simple paragraph-like sibling
         next_text = None
         for sib in time_node.next_siblings:
             if not isinstance(sib, Tag):
@@ -211,21 +275,20 @@ class LaochoParser:
                 continue
             if is_stop(sib):
                 break
-            # only accept simple <p>/<div>/<span>, avoid nested blocks / lists
-            if sib.name in ("p", "div", "span"):
+            if sib.name in ("p", "div", "span"):  # conservative
                 next_text = txt
                 break
 
         if not next_text:
             return None
 
-        # Hard filters: skip promo/host bios (your example)
+        # Skip obvious promos/host bios (e.g., "Presentan ...")
         up = next_text.upper()
-        if up.startswith("PRESENTAN ") or "PRESENTAN " in up or up.startswith("CONDUCEN ") or up.startswith("CON "):
+        if up.startswith("PRESENTAN ") or " PRESENTAN " in up or up.startswith("CONDUCEN ") or up.startswith("CON "):
             return None
 
-        # If policy is full, return trimmed multi-block text up to next program
         if policy == "full":
+            # Concatenate until next title/time block
             blocks: List[str] = []
             for sib in time_node.next_siblings:
                 if not isinstance(sib, Tag):
@@ -236,21 +299,23 @@ class LaochoParser:
                 if txt:
                     blocks.append(txt)
             text = " ".join(blocks).strip()
-            return text if text else None
+            return text or None
 
-        # policy == short: first sentence only, length cap
+        # policy == "short"
         text = next_text
-        # cut at first period followed by space/cap letter; fallback to hard cap
+        # First sentence heuristic (period followed by space + capital)
         m = re.search(r"\.(?=\s+[A-ZÁÉÍÓÚÜÑ])", text)
         if m:
             text = text[: m.end()].strip()
+        # Length cap (~160 chars)
         if len(text) > 160:
             text = text[:157].rstrip() + "…"
         return text or None
 
-    # ---------- normalization helpers ----------
+    # -------------- Normalization helpers --------------
     def _looks_all_caps(self, s: str) -> bool:
-        return bool(s) and not any(ch.islower() for ch in s)
+        # ALL-CAPS if there are letters and none are lowercase (handles accents)
+        return bool(s) and any(ch.isalpha() for ch in s) and not any(ch.islower() for ch in s)
 
     def _normalize_sentence(self, s: str) -> str:
         if not s:
@@ -263,9 +328,14 @@ class LaochoParser:
                 break
         if not self._looks_all_caps(txt):
             return txt
-        txt = txt.capitalize()
+
+        lowered = txt.lower()
+        if lowered:
+            lowered = lowered[0].upper() + lowered[1:]
+
+        # Restore acronyms in uppercase while preserving punctuation
         out_words = []
-        for w in txt.split():
+        for w in lowered.split():
             prefix = ""
             suffix = ""
             core = w
@@ -281,21 +351,39 @@ class LaochoParser:
         return " ".join(out_words)
 
     def _normalize_title_and_category(self, raw_title: str) -> tuple[str, Optional[str]]:
+        """
+        Normalize titles like:
+          'SERIE: LOS ÁNGELES...'  or  'Serie: LOS ÁNGELES...'
+        → 'Serie: Los ángeles...'
+        Extract a category when the left part matches known keys (case-insensitive).
+        """
         if not raw_title:
             return raw_title, None
+
         t = " ".join(raw_title.split())
-        category = None
         if ":" in t:
             left, right = t.split(":", 1)
-            left_uc = left.strip().upper()
-            if left_uc in self._CATEGORY_MAP and self._looks_all_caps(left):
-                category = self._CATEGORY_MAP[left_uc]
-                t = f"{category}: {right.strip()}"
-        if self._looks_all_caps(t):
-            if category and ":" in t:
-                cat, rest = t.split(":", 1)
-                rest_norm = self._normalize_sentence(rest.strip())
-                return f"{cat}: {rest_norm}", category
+            left_clean = left.strip()
+            right_clean = right.strip()
+
+            # Map known categories case-insensitively
+            left_key = left_clean.upper()
+            category = self._CATEGORY_MAP.get(left_key)
+
+            # De-shout the right side if it's ALL-CAPS
+            if self._looks_all_caps(right_clean):
+                right_norm = self._normalize_sentence(right_clean)
             else:
-                return self._normalize_sentence(t), category
-        return t, category
+                right_norm = right_clean
+
+            if category:
+                return f"{category}: {right_norm}", category
+            else:
+                # Left isn't a known category; still normalize the right side if needed
+                return f"{left_clean}: {right_norm}", None
+
+        # No colon: soften whole title if ALL-CAPS
+        if self._looks_all_caps(t):
+            return self._normalize_sentence(t), None
+
+        return t, None
