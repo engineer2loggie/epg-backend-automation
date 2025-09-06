@@ -76,40 +76,37 @@ def fetch_html(url: str, timeout: int = 20) -> str:
     r.raise_for_status()
     return r.text
 
+def find_iframe_url(html: str) -> Optional[str]:
+    """Finds the restream.io player URL from the iframe."""
+    m = re.search(r'<iframe src="(https?://player\.restream\.io/[^"]+)"', html)
+    if m:
+        return m.group(1)
+    return None
+
 def find_m3u8_in_html(html: str, base_url: str) -> Optional[str]:
     """
     Try several strategies:
-    1) NEW: Regex for 'var videoSrc = ...' JavaScript variable in a <script> tag.
-    2) <source type="application/x-mpegURL" src="...m3u8"> (Fallback)
-    3) any tag with src/href endswith .m3u8 (Fallback)
-    4) raw regex of absolute .m3u8 URLs (Fallback)
+    1) Regex for Clappr player source: '...' in iframe.
+    2) Regex for 'var videoSrc = ...' as a fallback.
+    3) BeautifulSoup parsing for <source> tags.
     """
-    # 1) NEW STRATEGY: Parse the JS variable directly from the raw HTML.
+    # 1) Primary Strategy: Find the source URL in the Clappr player script
+    m_clappr = re.search(r"source:\s*'(https?://[^']+\.m3u8[^']*)'", html)
+    if m_clappr:
+        return m_clappr.group(1)
+
+    # 2) Fallback Strategy 1: Look for a 'videoSrc' variable
     m_js = re.search(r"var videoSrc = '(https?://[^']+\.m3u8[^']*)';", html)
     if m_js:
         return m_js.group(1)
 
-    # --- Original strategies (kept as fallbacks just in case) ---
+    # 3) Fallback Strategy 2: Parse HTML tags
     soup = BeautifulSoup(html, "html.parser")
-
-    # 2) canonical <source type="application/x-mpegURL" src="...">
     for s in soup.find_all("source"):
         t = (s.get("type") or "").lower()
         src = s.get("src") or ""
         if "mpegurl" in t and ".m3u8" in src.lower():
             return src
-
-    # 3) any tag with src/href containing .m3u8
-    for tag in soup.find_all(True):
-        for attr in ("src", "href", "data-src"):
-            v = tag.get(attr)
-            if v and ".m3u8" in v.lower():
-                return v
-
-    # 4) absolute URLs in the text
-    m = re.search(r"https?://[^\s'\"<>]+\.m3u8[^\s'\"<>]*", html, re.IGNORECASE)
-    if m:
-        return m.group(0)
 
     return None
 
@@ -188,33 +185,40 @@ def main():
                 print(f"[info] current URL still above threshold ({left}s left). No refresh needed.")
                 sys.exit(0)
 
-    # 3) Fetch the page and try to parse a fresh m3u8
+    # 3) Fetch the page and find the iframe URL
     try:
-        html = fetch_html(args.page)
+        print(f"[info] Fetching main page: {args.page}")
+        html_main = fetch_html(args.page)
     except Exception as e:
-        # Graceful exit; do not fail the whole workflow if page is temporarily down
         print(f"[error] failed to fetch {args.page}: {e}")
         sys.exit(0)
 
-    new_m3u8 = find_m3u8_in_html(html, args.page)
-    if not new_m3u8:
-        # --- START OF MODIFICATION ---
-        # Add these lines to print the received HTML for debugging
-        print("[debug] The scraper failed to find the m3u8 URL.")
-        print("[debug] The HTML content received by the script was:")
-        print("------------------- HTML START -------------------")
-        print(html)
-        print("-------------------- HTML END --------------------")
-        # --- END OF MODIFICATION ---
-        print("[info] No .m3u8 found on the page right now. Nothing to update.")
+    iframe_url = find_iframe_url(html_main)
+    if not iframe_url:
+        print("[error] Could not find restream.io iframe on the main page.")
+        sys.exit(0)
+    
+    print(f"[info] Found iframe URL: {iframe_url}")
+
+    # 4) Fetch the iframe content and find the m3u8
+    try:
+        print(f"[info] Fetching iframe content...")
+        html_iframe = fetch_html(iframe_url)
+    except Exception as e:
+        print(f"[error] failed to fetch iframe URL {iframe_url}: {e}")
         sys.exit(0)
 
-    # 4) Compare vs current (if provided)
+    new_m3u8 = find_m3u8_in_html(html_iframe, iframe_url)
+    if not new_m3u8:
+        print("[info] No .m3u8 found on the iframe page right now. Nothing to update.")
+        sys.exit(0)
+
+    # 5) Compare vs current (if provided)
     if args.current and new_m3u8 == args.current:
         print("[info] Found same URL as current. Nothing to update.")
         sys.exit(0)
 
-    # 5) Decode expiry for the new URL (if present), just for logging
+    # 6) Decode expiry for the new URL (if present), just for logging
     new_exp = decode_cloudflare_exp_from_url(new_m3u8)
     if new_exp:
         print(f"[info] new exp: {new_exp.strftime('%Y-%m-%d %H:%M:%S %Z')}  ({seconds_left(new_exp)}s left)")
@@ -226,7 +230,7 @@ def main():
         print(new_m3u8)
         sys.exit(0)
 
-    # 6) Write to Supabase if requested
+    # 7) Write to Supabase if requested
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -251,3 +255,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
