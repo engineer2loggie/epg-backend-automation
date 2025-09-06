@@ -95,18 +95,11 @@ def find_js_url(html: str, base_url: str) -> Optional[str]:
 def find_api_path_in_js(js_code: str) -> Optional[str]:
     """
     Finds the API endpoint path in the javascript code.
-    The variable name can change, so we look for the known path itself.
+    This searches for the known path string directly, which is more robust.
     """
-    # New strategy: Search for the known API path directly in the code.
-    m = re.search(r'["\'](/api/v2/player/info)["\']', js_code)
+    m = re.search(r'(/api/v2/player/info)', js_code)
     if m:
         return m.group(1)
-    
-    # Original strategy as a fallback
-    m_fallback = re.search(r'embeddedPlayerApiUrl:"([^"]+)"', js_code)
-    if m_fallback:
-        return m_fallback.group(1)
-
     return None
 
 def extract_token(iframe_url: str) -> Optional[str]:
@@ -226,7 +219,7 @@ def main():
             print("[error] Could not extract token from iframe URL.")
             sys.exit(0)
         
-        api_url = urljoin(iframe_url, api_path)
+        api_url = urljoin("https://api.restream.io", api_path)
         full_api_url = f"{api_url}?token={token}"
         print(f"[info] 4/5: Calling final API: {full_api_url}")
         
