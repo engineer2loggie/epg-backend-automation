@@ -93,10 +93,20 @@ def find_js_url(html: str, base_url: str) -> Optional[str]:
     return urljoin(base_url, relative_path)
 
 def find_api_path_in_js(js_code: str) -> Optional[str]:
-    """Finds the API endpoint path in the javascript code."""
-    m = re.search(r'embeddedPlayerApiUrl:"([^"]+)"', js_code)
+    """
+    Finds the API endpoint path in the javascript code.
+    The variable name can change, so we look for the known path itself.
+    """
+    # New strategy: Search for the known API path directly in the code.
+    m = re.search(r'["\'](/api/v2/player/info)["\']', js_code)
     if m:
         return m.group(1)
+    
+    # Original strategy as a fallback
+    m_fallback = re.search(r'embeddedPlayerApiUrl:"([^"]+)"', js_code)
+    if m_fallback:
+        return m_fallback.group(1)
+
     return None
 
 def extract_token(iframe_url: str) -> Optional[str]:
