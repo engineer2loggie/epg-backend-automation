@@ -97,9 +97,9 @@ def find_api_path_in_js(js_code: str) -> Optional[str]:
     Finds the API endpoint path in the javascript code.
     This searches for the known path string directly, which is more robust.
     """
-    m = re.search(r'(/api/v2/player/info)', js_code)
+    m = re.search(r'/api/v2/player/info', js_code)
     if m:
-        return m.group(1)
+        return m.group(0)
     return None
 
 def extract_token(iframe_url: str) -> Optional[str]:
