@@ -70,7 +70,7 @@ def fetch_html(url: str, timeout: int = 20) -> str:
             "Chrome/124.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.google.com/",
+        "Referer": "https://cdn.teleonce.com/en-vivo/",
     }
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
@@ -210,6 +210,13 @@ def main():
 
     new_m3u8 = find_m3u8_in_html(html_iframe, iframe_url)
     if not new_m3u8:
+        # --- START OF DEBUG MODIFICATION ---
+        print("[debug] Failed to find m3u8 in iframe content.")
+        print("[debug] The HTML from the iframe was:")
+        print("------------------- IFRAME HTML START -------------------")
+        print(html_iframe)
+        print("-------------------- IFRAME HTML END --------------------")
+        # --- END OF DEBUG MODIFICATION ---
         print("[info] No .m3u8 found on the iframe page right now. Nothing to update.")
         sys.exit(0)
 
