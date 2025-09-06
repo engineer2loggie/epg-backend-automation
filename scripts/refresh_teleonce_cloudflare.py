@@ -58,8 +58,15 @@ def fetch(session: requests.Session, url: str, is_json: bool = False, params: di
     r.raise_for_status()
     return r.json() if is_json else r.text
 
+def find_cloudflare_stream_url(html: str) -> Optional[str]:
+    """Strategy 1: Find the Cloudflare stream URL directly from a <source> tag."""
+    m = re.search(r'<source type="application/x-mpegURL" src="([^"]+customer-gllhkkbamkskdl1p\.cloudflarestream\.com[^"]+)"', html)
+    if m:
+        return m.group(1)
+    return None
+
 def find_iframe_url(html: str) -> Optional[str]:
-    """Finds the restream.io player URL from the iframe using regex."""
+    """Strategy 2: Find the restream.io player URL from the iframe using regex."""
     m = re.search(r'<iframe src="(https?://player\.restream\.io/[^"]+)"', html)
     if m:
         return m.group(1)
@@ -159,44 +166,49 @@ def main():
         )
     })
 
+    new_m3u8 = None
     try:
-        # 1) Fetch the main page and find the iframe URL
-        print(f"[info] 1/3: Fetching main page: {args.page}")
+        print(f"[info] Fetching main page: {args.page}")
         session.headers.update({"Referer": args.page})
         html_main = fetch(session, args.page)
-        iframe_url = find_iframe_url(html_main)
-        if not iframe_url:
-            print("[error] Could not find restream.io iframe on the main page.")
-            sys.exit(0)
-        print(f"[info] 1/3: Found iframe URL: {iframe_url}")
 
-        # 2) Extract token from iframe URL
-        token = extract_token_from_iframe_url(iframe_url)
-        if not token:
-            print("[error] Could not extract token from iframe URL.")
-            sys.exit(0)
-        print(f"[info] 2/3: Extracted token.")
+        # Strategy 1: Look for a direct Cloudflare stream URL
+        new_m3u8 = find_cloudflare_stream_url(html_main)
+        if new_m3u8:
+            print("[info] Success! Found direct Cloudflare stream URL.")
+        else:
+            # Strategy 2 (Fallback): Use the iframe and Restream API
+            print("[info] No direct URL found, falling back to iframe method.")
+            iframe_url = find_iframe_url(html_main)
+            if not iframe_url:
+                print("[error] Could not find restream.io iframe on the main page.")
+                sys.exit(0)
+            print(f"[info] Found iframe URL: {iframe_url}")
 
-        # 3) Build the final API url and call it with the correct headers and params
-        # This information is based on the working example script.
-        session.headers.update({
-            'authority': 'player-backend.restream.io',
-            'origin': 'https://player.restream.io',
-            'referer': 'https://player.restream.io/',
-        })
-        
-        api_url = f"https://player-backend.restream.io/public/videos/{token}"
-        params = {'instant': 'true'}
+            token = extract_token_from_iframe_url(iframe_url)
+            if not token:
+                print("[error] Could not extract token from iframe URL.")
+                sys.exit(0)
+            print(f"[info] Extracted token.")
 
-        print(f"[info] 3/3: Calling final API: {api_url}")
-        
-        api_data = fetch(session, api_url, is_json=True, params=params)
-        
-        new_m3u8 = api_data.get("hlsUrl")
-        if not new_m3u8:
-            print(f"[error] Could not find 'hlsUrl' in API response. Full response: {api_data}")
-            sys.exit(0)
-        print(f"[info] Success! Found M3U8 URL.")
+            session.headers.update({
+                'authority': 'player-backend.restream.io',
+                'origin': 'https://player.restream.io',
+                'referer': 'https://player.restream.io/',
+            })
+            
+            api_url = f"https://player-backend.restream.io/public/videos/{token}"
+            params = {'instant': 'true'}
+
+            print(f"[info] Calling final API: {api_url}")
+            
+            api_data = fetch(session, api_url, is_json=True, params=params)
+            
+            new_m3u8 = api_data.get("hlsUrl")
+            if not new_m3u8:
+                print(f"[error] Could not find 'hlsUrl' in API response. Full response: {api_data}")
+                sys.exit(0)
+            print(f"[info] Success! Found M3U8 URL via API.")
 
     except requests.exceptions.RequestException as e:
         print(f"[error] Scraping process failed: {e}")
