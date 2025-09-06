@@ -9,7 +9,7 @@ import re
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
@@ -25,14 +25,11 @@ def _b64url_pad(s: str) -> str:
 def decode_cloudflare_exp_from_url(url: str) -> Optional[datetime]:
     """
     Extract JWT segment from Cloudflare Stream URL path and read exp (unix epoch).
-    Example path piece starts with 'eyJ...' (header.payload.signature style).
     We don't verify signature; we just parse `exp`.
     """
     try:
-        # Find the first base64url-looking chunk (payload is the 2nd part of a JWT)
         m = re.search(r"/([A-Za-z0-9_\-]+=*?)/manifest/", url)
         if not m:
-            # Fallback: find any eyJ... then expand to header.payload.signature if present in path
             chunks = [c for c in url.split('/') if c.startswith("eyJ")]
             if not chunks:
                 return None
@@ -40,14 +37,9 @@ def decode_cloudflare_exp_from_url(url: str) -> Optional[datetime]:
         else:
             token_like = m.group(1)
 
-        # If it's a full JWT (with dots), use the payload; otherwise try as a single compact token
         parts = token_like.split('.')
-        if len(parts) >= 2:
-            payload_b64 = parts[1]
-            payload = json.loads(base64.urlsafe_b64decode(_b64url_pad(payload_b64)).decode('utf-8', 'ignore'))
-        else:
-            # Some providers cram everything in one segment; try to decode as JSON
-            payload = json.loads(base64.urlsafe_b64decode(_b64url_pad(token_like)).decode('utf-8', 'ignore'))
+        payload_b64 = parts[1] if len(parts) >= 2 else token_like
+        payload = json.loads(base64.urlsafe_b64decode(_b64url_pad(payload_b64)).decode('utf-8', 'ignore'))
 
         exp = payload.get("exp")
         if isinstance(exp, (int, float)):
@@ -60,9 +52,9 @@ def seconds_left(expiry_utc: datetime) -> int:
     now = datetime.now(timezone.utc)
     return int((expiry_utc - now).total_seconds())
 
-def fetch(session: requests.Session, url: str, is_json: bool = False, timeout: int = 20):
+def fetch(session: requests.Session, url: str, is_json: bool = False, params: dict = None, timeout: int = 20):
     """Uses a requests.Session to make HTTP requests."""
-    r = session.get(url, timeout=timeout)
+    r = session.get(url, timeout=timeout, params=params)
     r.raise_for_status()
     return r.json() if is_json else r.text
 
@@ -73,12 +65,11 @@ def find_iframe_url(html: str) -> Optional[str]:
         return m.group(1)
     return None
 
-def extract_token(iframe_url: str) -> Optional[str]:
+def extract_token_from_iframe_url(iframe_url: str) -> Optional[str]:
     """Extracts the token from the iframe URL's query parameters."""
     parsed_url = urlparse(iframe_url)
     query_params = parse_qs(parsed_url.query)
     return query_params.get('token', [None])[0]
-
 
 # -----------------------------
 # Supabase helpers (optional)
@@ -92,11 +83,7 @@ def supabase_update_stream(
     match_where: dict,
     new_stream_url: str,
 ) -> Tuple[bool, str]:
-    """
-    Update `stream_url` in `table` with `web:<new_stream_url>` using Supabase REST (PostgREST).
-    match_where: dict of equality filters to identify row(s), e.g. {"channel_name": "Tele Once"}
-    Returns (ok, message).
-    """
+    """Updates a stream_url in Supabase."""
     try:
         if not supabase_url.endswith("/"):
             supabase_url += "/"
@@ -105,16 +92,32 @@ def supabase_update_stream(
         params = [(f"{k}", f"eq.{v}") for k, v in match_where.items()]
         body = {"stream_url": f"web:{new_stream_url}"}
 
+        # Temporarily remove API-specific headers for Supabase request
+        original_headers = session.headers.copy()
+        session.headers.update({
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        })
+        # Remove headers that are specific to the restream API
+        session.headers.pop('authority', None)
+        session.headers.pop('origin', None)
+
+
         r = session.patch(postgrest_url, params=params, json=body, timeout=20)
         r.raise_for_status()
         updated_rows = r.json()
         
+        session.headers = original_headers # Restore original headers
+
         if not updated_rows:
              return False, "No rows matched your selector to update."
         
         return True, f"Updated {len(updated_rows)} row(s)."
 
     except requests.exceptions.RequestException as e:
+        session.headers = original_headers # Restore original headers on error
         return False, f"Supabase update failed: {e}"
 
 # -----------------------------
@@ -125,14 +128,14 @@ def main():
     ap = argparse.ArgumentParser(description="Refresh TeleOnce Cloudflare Stream URL (graceful).")
     ap.add_argument("--page", required=True, help="The page that embeds the player (e.g. https://cdn.teleonce.com/en-vivo/)")
     ap.add_argument("--threshold", type=int, default=3*60*60, help="Seconds remaining below which we refresh (default 10800 = 3h)")
-    ap.add_argument("--current", help="Current stream URL (optional). If omitted, script will just try to fetch a new one and report.")
+    ap.add_argument("--current", help="Current stream URL (optional).")
     ap.add_argument("--write", action="store_true", help="If set, write the refreshed URL back to Supabase.")
-    ap.add_argument("--table", default="manual_tv_input", help="Supabase table to update (default manual_tv_input)")
-    ap.add_argument("--match-field", default="channel_name", help="Column used to match the row (default channel_name)")
-    ap.add_argument("--match-value", default="Tele Once", help="Value used to match the row (default 'Tele Once')")
+    ap.add_argument("--table", default="manual_tv_input", help="Supabase table to update.")
+    ap.add_argument("--match-field", default="channel_name", help="Column used to match the row.")
+    ap.add_argument("--match-value", default="Tele Once", help="Value used to match the row.")
     args = ap.parse_args()
 
-    # 1) If we have a current URL, report its expiry (if any)
+    # 1) If we have a current URL, report its expiry
     if args.current:
         exp = decode_cloudflare_exp_from_url(args.current)
         if exp:
@@ -141,31 +144,25 @@ def main():
         else:
             print("[warn] Could not decode expiry from --current URL.")
 
-    # 2) If current is still “healthy” (above threshold), we can exit gracefully
-    if args.current:
-        exp = decode_cloudflare_exp_from_url(args.current)
-        if exp:
-            left = seconds_left(exp)
-            if left > args.threshold:
-                print(f"[info] current URL still above threshold ({left}s left). No refresh needed.")
-                sys.exit(0)
+    # 2) If current is still “healthy” (above threshold), exit gracefully
+    if args.current and (exp := decode_cloudflare_exp_from_url(args.current)):
+        if seconds_left(exp) > args.threshold:
+            print(f"[info] current URL still above threshold. No refresh needed.")
+            sys.exit(0)
 
     # Create a session for efficient, repeated requests.
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*, text/html,application/xhtml+xml,application/xml;q=0.9",
-        "Referer": "https://cdn.teleonce.com/en-vivo/",
+            "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/102.0.0.0 Safari/537.36"
+        )
     })
 
-    # --- SIMPLIFIED SCRAPING LOGIC ---
     try:
         # 1) Fetch the main page and find the iframe URL
         print(f"[info] 1/3: Fetching main page: {args.page}")
+        session.headers.update({"Referer": args.page})
         html_main = fetch(session, args.page)
         iframe_url = find_iframe_url(html_main)
         if not iframe_url:
@@ -174,22 +171,27 @@ def main():
         print(f"[info] 1/3: Found iframe URL: {iframe_url}")
 
         # 2) Extract token from iframe URL
-        token = extract_token(iframe_url)
+        token = extract_token_from_iframe_url(iframe_url)
         if not token:
             print("[error] Could not extract token from iframe URL.")
             sys.exit(0)
         print(f"[info] 2/3: Extracted token.")
 
-        # 3) Build the final API url and call it
-        # The API endpoint is hardcoded for reliability as it's unlikely to change,
-        # even if the JS that calls it does.
-        api_url = "https://player.restream.io/api/v2/player/info"
-        full_api_url = f"{api_url}?token={token}"
-        print(f"[info] 3/3: Calling final API: {full_api_url}")
+        # 3) Build the final API url and call it with the correct headers and params
+        # This information is based on the working example script.
+        session.headers.update({
+            'authority': 'player-backend.restream.io',
+            'origin': 'https://player.restream.io',
+            'referer': 'https://player.restream.io/',
+        })
         
-        api_data = fetch(session, full_api_url, is_json=True)
+        api_url = f"https://player-backend.restream.io/public/videos/{token}"
+        params = {'instant': 'true'}
+
+        print(f"[info] 3/3: Calling final API: {api_url}")
         
-        # Extract the m3u8 url from the API JSON response
+        api_data = fetch(session, api_url, is_json=True, params=params)
+        
         new_m3u8 = api_data.get("hlsUrl")
         if not new_m3u8:
             print(f"[error] Could not find 'hlsUrl' in API response. Full response: {api_data}")
@@ -197,17 +199,15 @@ def main():
         print(f"[info] Success! Found M3U8 URL.")
 
     except requests.exceptions.RequestException as e:
-        # Graceful exit for network errors; do not fail the whole workflow
-        print(f"[error] Scraping process failed due to a network error: {e}")
+        print(f"[error] Scraping process failed: {e}")
         sys.exit(0)
 
-
-    # 4) Compare vs current (if provided)
+    # 4) Compare vs current
     if args.current and new_m3u8 == args.current:
         print("[info] Found same URL as current. Nothing to update.")
         sys.exit(0)
 
-    # 5) Decode expiry for the new URL (if present), just for logging
+    # 5) Decode expiry for the new URL for logging
     new_exp = decode_cloudflare_exp_from_url(new_m3u8)
     if new_exp:
         print(f"[info] new exp: {new_exp.strftime('%Y-%m-%d %H:%M:%S %Z')}  ({seconds_left(new_exp)}s left)")
@@ -227,13 +227,6 @@ def main():
         print("[error] --write given, but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set.")
         sys.exit(1)
 
-    session.headers.update({
-        "apikey": supabase_key,
-        "Authorization": f"Bearer {supabase_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    })
-
     ok, msg = supabase_update_stream(
         session=session,
         supabase_url=supabase_url,
@@ -247,10 +240,9 @@ def main():
     else:
         print(f"[error] {msg}")
     
-    # Gracefully exit 0 even on supabase failure to be non-disruptive
+    # Gracefully exit 0 even on supabase failure
     sys.exit(0)
 
 if __name__ == "__main__":
     main()
-
 
