@@ -110,6 +110,7 @@ def supabase_update_stream(
         # Remove headers that are specific to the restream API
         session.headers.pop('authority', None)
         session.headers.pop('origin', None)
+        session.headers.pop('player-version', None)
 
 
         r = session.patch(postgrest_url, params=params, json=body, timeout=20)
@@ -191,9 +192,12 @@ def main():
                 sys.exit(0)
             print(f"[info] Extracted token.")
 
+            # Mimic the headers from the working script
             session.headers.update({
                 'authority': 'player-backend.restream.io',
+                'content-type': 'application/json',
                 'origin': 'https://player.restream.io',
+                'player-version': '0.9.2',
                 'referer': 'https://player.restream.io/',
             })
             
