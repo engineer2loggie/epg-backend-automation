@@ -9,6 +9,7 @@ import re
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -62,19 +63,19 @@ def seconds_left(expiry_utc: datetime) -> int:
     now = datetime.now(timezone.utc)
     return int((expiry_utc - now).total_seconds())
 
-def fetch_html(url: str, timeout: int = 20) -> str:
+def fetch(url: str, is_json: bool = False, timeout: int = 20):
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "application/json, text/plain, */*" if is_json else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": "https://cdn.teleonce.com/en-vivo/",
     }
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
-    return r.text
+    return r.json() if is_json else r.text
 
 def find_iframe_url(html: str) -> Optional[str]:
     """Finds the restream.io player URL from the iframe."""
@@ -83,32 +84,27 @@ def find_iframe_url(html: str) -> Optional[str]:
         return m.group(1)
     return None
 
-def find_m3u8_in_html(html: str, base_url: str) -> Optional[str]:
-    """
-    Try several strategies:
-    1) Regex for Clappr player source: '...' in iframe.
-    2) Regex for 'var videoSrc = ...' as a fallback.
-    3) BeautifulSoup parsing for <source> tags.
-    """
-    # 1) Primary Strategy: Find the source URL in the Clappr player script
-    m_clappr = re.search(r"source:\s*'(https?://[^']+\.m3u8[^']*)'", html)
-    if m_clappr:
-        return m_clappr.group(1)
+def find_js_url(html: str, base_url: str) -> Optional[str]:
+    """Finds the relative JS file URL from a script tag and makes it absolute."""
+    m = re.search(r'<script src="(/[^"]+\.js)"', html)
+    if not m:
+        return None
+    relative_path = m.group(1)
+    return urljoin(base_url, relative_path)
 
-    # 2) Fallback Strategy 1: Look for a 'videoSrc' variable
-    m_js = re.search(r"var videoSrc = '(https?://[^']+\.m3u8[^']*)';", html)
-    if m_js:
-        return m_js.group(1)
-
-    # 3) Fallback Strategy 2: Parse HTML tags
-    soup = BeautifulSoup(html, "html.parser")
-    for s in soup.find_all("source"):
-        t = (s.get("type") or "").lower()
-        src = s.get("src") or ""
-        if "mpegurl" in t and ".m3u8" in src.lower():
-            return src
-
+def find_api_path_in_js(js_code: str) -> Optional[str]:
+    """Finds the API endpoint path in the javascript code."""
+    m = re.search(r'embeddedPlayerApiUrl:"([^"]+)"', js_code)
+    if m:
+        return m.group(1)
     return None
+
+def extract_token(iframe_url: str) -> Optional[str]:
+    """Extracts the token from the iframe URL's query parameters."""
+    parsed_url = urlparse(iframe_url)
+    query_params = parse_qs(parsed_url.query)
+    return query_params.get('token', [None])[0]
+
 
 # -----------------------------
 # Supabase helpers (optional)
@@ -185,47 +181,65 @@ def main():
                 print(f"[info] current URL still above threshold ({left}s left). No refresh needed.")
                 sys.exit(0)
 
-    # 3) Fetch the page and find the iframe URL
+    # --- NEW MULTI-STEP SCRAPING LOGIC ---
     try:
-        print(f"[info] Fetching main page: {args.page}")
-        html_main = fetch_html(args.page)
+        # 3a) Fetch the main page and find the iframe URL
+        print(f"[info] 1/5: Fetching main page: {args.page}")
+        html_main = fetch(args.page)
+        iframe_url = find_iframe_url(html_main)
+        if not iframe_url:
+            print("[error] Could not find restream.io iframe on the main page.")
+            sys.exit(0)
+        print(f"[info] 1/5: Found iframe URL: {iframe_url}")
+
+        # 3b) Fetch the iframe's HTML to find the script URL
+        print(f"[info] 2/5: Fetching iframe content...")
+        html_iframe = fetch(iframe_url)
+        js_url = find_js_url(html_iframe, iframe_url)
+        if not js_url:
+            print("[error] Could not find JS file URL in iframe HTML.")
+            sys.exit(0)
+        print(f"[info] 2/5: Found JS file: {js_url}")
+        
+        # 3c) Fetch the JS file to find the API path
+        print(f"[info] 3/5: Fetching JS content...")
+        js_code = fetch(js_url)
+        api_path = find_api_path_in_js(js_code)
+        if not api_path:
+            print("[error] Could not find API path in JS file.")
+            sys.exit(0)
+        print(f"[info] 3/5: Found API path: {api_path}")
+        
+        # 3d) Build the final API url and call it
+        token = extract_token(iframe_url)
+        if not token:
+            print("[error] Could not extract token from iframe URL.")
+            sys.exit(0)
+        
+        api_url = urljoin(iframe_url, api_path)
+        full_api_url = f"{api_url}?token={token}"
+        print(f"[info] 4/5: Calling final API: {full_api_url}")
+        
+        api_data = fetch(full_api_url, is_json=True)
+        
+        # 3e) Extract the m3u8 url from the API JSON response
+        new_m3u8 = api_data.get("hlsUrl")
+        if not new_m3u8:
+            print(f"[error] Could not find 'hlsUrl' in API response. Full response: {api_data}")
+            sys.exit(0)
+        print(f"[info] 5/5: Success! Found M3U8 URL.")
+
     except Exception as e:
-        print(f"[error] failed to fetch {args.page}: {e}")
+        print(f"[error] Scraping process failed: {e}")
         sys.exit(0)
 
-    iframe_url = find_iframe_url(html_main)
-    if not iframe_url:
-        print("[error] Could not find restream.io iframe on the main page.")
-        sys.exit(0)
-    
-    print(f"[info] Found iframe URL: {iframe_url}")
 
-    # 4) Fetch the iframe content and find the m3u8
-    try:
-        print(f"[info] Fetching iframe content...")
-        html_iframe = fetch_html(iframe_url)
-    except Exception as e:
-        print(f"[error] failed to fetch iframe URL {iframe_url}: {e}")
-        sys.exit(0)
-
-    new_m3u8 = find_m3u8_in_html(html_iframe, iframe_url)
-    if not new_m3u8:
-        # --- START OF DEBUG MODIFICATION ---
-        print("[debug] Failed to find m3u8 in iframe content.")
-        print("[debug] The HTML from the iframe was:")
-        print("------------------- IFRAME HTML START -------------------")
-        print(html_iframe)
-        print("-------------------- IFRAME HTML END --------------------")
-        # --- END OF DEBUG MODIFICATION ---
-        print("[info] No .m3u8 found on the iframe page right now. Nothing to update.")
-        sys.exit(0)
-
-    # 5) Compare vs current (if provided)
+    # 4) Compare vs current (if provided)
     if args.current and new_m3u8 == args.current:
         print("[info] Found same URL as current. Nothing to update.")
         sys.exit(0)
 
-    # 6) Decode expiry for the new URL (if present), just for logging
+    # 5) Decode expiry for the new URL (if present), just for logging
     new_exp = decode_cloudflare_exp_from_url(new_m3u8)
     if new_exp:
         print(f"[info] new exp: {new_exp.strftime('%Y-%m-%d %H:%M:%S %Z')}  ({seconds_left(new_exp)}s left)")
@@ -237,7 +251,7 @@ def main():
         print(new_m3u8)
         sys.exit(0)
 
-    # 7) Write to Supabase if requested
+    # 6) Write to Supabase if requested
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -257,7 +271,6 @@ def main():
         sys.exit(0)
     else:
         print(f"[error] {msg}")
-        # still exit 0 to be non-disruptive if you prefer:
         sys.exit(0)
 
 if __name__ == "__main__":
