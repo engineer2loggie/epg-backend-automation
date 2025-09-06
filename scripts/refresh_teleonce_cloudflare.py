@@ -78,27 +78,37 @@ def fetch_html(url: str, timeout: int = 20) -> str:
 def find_m3u8_in_html(html: str, base_url: str) -> Optional[str]:
     """
     Try several strategies:
-    1) <source type="application/x-mpegURL" src="...m3u8">
-    2) any tag with src/href endswith .m3u8
-    3) raw regex of absolute .m3u8 URLs
+    1) NEW: Regex for 'var videoSrc = ...' JavaScript variable in a <script> tag.
+    2) <source type="application/x-mpegURL" src="...m3u8"> (Fallback)
+    3) any tag with src/href endswith .m3u8 (Fallback)
+    4) raw regex of absolute .m3u8 URLs (Fallback)
     """
+
+    # 1) NEW STRATEGY: Parse the JS variable directly from the raw HTML.
+    # This is the primary method for this specific site.
+    m_js = re.search(r"var videoSrc = '(https?://[^']+\.m3u8[^']*)';", html)
+    if m_js:
+        # Found it in the script block
+        return m_js.group(1)
+
+    # --- Original strategies (kept as fallbacks just in case) ---
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) canonical <source type="application/x-mpegURL" src="...">
+    # 2) canonical <source type="application/x-mpegURL" src="...">
     for s in soup.find_all("source"):
         t = (s.get("type") or "").lower()
         src = s.get("src") or ""
         if "mpegurl" in t and ".m3u8" in src.lower():
             return src
 
-    # 2) any tag with src/href containing .m3u8
+    # 3) any tag with src/href containing .m3u8
     for tag in soup.find_all(True):
         for attr in ("src", "href", "data-src"):
             v = tag.get(attr)
             if v and ".m3u8" in v.lower():
                 return v
 
-    # 3) absolute URLs in the text
+    # 4) absolute URLs in the text
     m = re.search(r"https?://[^\s'\"<>]+\.m3u8[^\s'\"<>]*", html, re.IGNORECASE)
     if m:
         return m.group(0)
