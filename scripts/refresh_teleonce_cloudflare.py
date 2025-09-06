@@ -183,7 +183,7 @@ def main():
         # 3) Build the final API url and call it
         # The API endpoint is hardcoded for reliability as it's unlikely to change,
         # even if the JS that calls it does.
-        api_url = "https://player-backend.restream.io/api/v2/player/info"
+        api_url = "https://player.restream.io/api/v2/player/info"
         full_api_url = f"{api_url}?token={token}"
         print(f"[info] 3/3: Calling final API: {full_api_url}")
         
@@ -252,4 +252,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
