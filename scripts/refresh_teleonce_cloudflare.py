@@ -73,24 +73,6 @@ def find_iframe_url(html: str) -> Optional[str]:
         return m.group(1)
     return None
 
-def find_js_url(html: str, base_url: str) -> Optional[str]:
-    """Finds the relative JS file URL from a script tag and makes it absolute."""
-    m = re.search(r'<script src="(/[^"]+\.js)"', html)
-    if not m:
-        return None
-    relative_path = m.group(1)
-    return urljoin(base_url, relative_path)
-
-def find_api_path_in_js(js_code: str) -> Optional[str]:
-    """
-    Finds the API endpoint URL in the javascript code.
-    This searches for the full URL containing the API path.
-    """
-    m = re.search(r'"(https?://[^"]*/api/v2/player/info)"', js_code)
-    if m:
-        return m.group(1)  # Return the full URL
-    return None
-
 def extract_token(iframe_url: str) -> Optional[str]:
     """Extracts the token from the iframe URL's query parameters."""
     parsed_url = urlparse(iframe_url)
@@ -180,52 +162,39 @@ def main():
         "Referer": "https://cdn.teleonce.com/en-vivo/",
     })
 
-    # --- NEW MULTI-STEP SCRAPING LOGIC ---
+    # --- SIMPLIFIED SCRAPING LOGIC ---
     try:
-        # 3a) Fetch the main page and find the iframe URL
-        print(f"[info] 1/5: Fetching main page: {args.page}")
+        # 1) Fetch the main page and find the iframe URL
+        print(f"[info] 1/3: Fetching main page: {args.page}")
         html_main = fetch(session, args.page)
         iframe_url = find_iframe_url(html_main)
         if not iframe_url:
             print("[error] Could not find restream.io iframe on the main page.")
             sys.exit(0)
-        print(f"[info] 1/5: Found iframe URL: {iframe_url}")
+        print(f"[info] 1/3: Found iframe URL: {iframe_url}")
 
-        # 3b) Fetch the iframe's HTML to find the script URL
-        print(f"[info] 2/5: Fetching iframe content...")
-        html_iframe = fetch(session, iframe_url)
-        js_url = find_js_url(html_iframe, iframe_url)
-        if not js_url:
-            print("[error] Could not find JS file URL in iframe HTML.")
-            sys.exit(0)
-        print(f"[info] 2/5: Found JS file: {js_url}")
-        
-        # 3c) Fetch the JS file to find the API path
-        print(f"[info] 3/5: Fetching JS content...")
-        js_code = fetch(session, js_url)
-        api_url = find_api_path_in_js(js_code)
-        if not api_url:
-            print("[error] Could not find API URL in JS file.")
-            sys.exit(0)
-        print(f"[info] 3/5: Found API URL: {api_url}")
-        
-        # 3d) Build the final API url and call it
+        # 2) Extract token from iframe URL
         token = extract_token(iframe_url)
         if not token:
             print("[error] Could not extract token from iframe URL.")
             sys.exit(0)
-        
+        print(f"[info] 2/3: Extracted token.")
+
+        # 3) Build the final API url and call it
+        # The API endpoint is hardcoded for reliability as it's unlikely to change,
+        # even if the JS that calls it does.
+        api_url = "https://player-backend.restream.io/api/v2/player/info"
         full_api_url = f"{api_url}?token={token}"
-        print(f"[info] 4/5: Calling final API: {full_api_url}")
+        print(f"[info] 3/3: Calling final API: {full_api_url}")
         
         api_data = fetch(session, full_api_url, is_json=True)
         
-        # 3e) Extract the m3u8 url from the API JSON response
+        # Extract the m3u8 url from the API JSON response
         new_m3u8 = api_data.get("hlsUrl")
         if not new_m3u8:
             print(f"[error] Could not find 'hlsUrl' in API response. Full response: {api_data}")
             sys.exit(0)
-        print(f"[info] 5/5: Success! Found M3U8 URL.")
+        print(f"[info] Success! Found M3U8 URL.")
 
     except requests.exceptions.RequestException as e:
         # Graceful exit for network errors; do not fail the whole workflow
