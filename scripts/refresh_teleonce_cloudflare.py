@@ -12,7 +12,6 @@ from typing import Optional, Tuple
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
-from bs4 import BeautifulSoup
 
 # -----------------------------
 # Helpers
@@ -31,8 +30,6 @@ def decode_cloudflare_exp_from_url(url: str) -> Optional[datetime]:
     """
     try:
         # Find the first base64url-looking chunk (payload is the 2nd part of a JWT)
-        # Many CF Stream URLs look like .../<JWT>/manifest/video.m3u8
-        # JWT = header.payload.signature (dot separated)
         m = re.search(r"/([A-Za-z0-9_\-]+=*?)/manifest/", url)
         if not m:
             # Fallback: find any eyJ... then expand to header.payload.signature if present in path
@@ -63,22 +60,14 @@ def seconds_left(expiry_utc: datetime) -> int:
     now = datetime.now(timezone.utc)
     return int((expiry_utc - now).total_seconds())
 
-def fetch(url: str, is_json: bool = False, timeout: int = 20):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*" if is_json else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://cdn.teleonce.com/en-vivo/",
-    }
-    r = requests.get(url, headers=headers, timeout=timeout)
+def fetch(session: requests.Session, url: str, is_json: bool = False, timeout: int = 20):
+    """Uses a requests.Session to make HTTP requests."""
+    r = session.get(url, timeout=timeout)
     r.raise_for_status()
     return r.json() if is_json else r.text
 
 def find_iframe_url(html: str) -> Optional[str]:
-    """Finds the restream.io player URL from the iframe."""
+    """Finds the restream.io player URL from the iframe using regex."""
     m = re.search(r'<iframe src="(https?://player\.restream\.io/[^"]+)"', html)
     if m:
         return m.group(1)
@@ -114,6 +103,7 @@ def extract_token(iframe_url: str) -> Optional[str]:
 # -----------------------------
 
 def supabase_update_stream(
+    session: requests.Session,
     supabase_url: str,
     supabase_key: str,
     table: str,
@@ -128,18 +118,12 @@ def supabase_update_stream(
     try:
         if not supabase_url.endswith("/"):
             supabase_url += "/"
-        postgrest = supabase_url + "rest/v1/" + table
+        postgrest_url = supabase_url + "rest/v1/" + table
 
         params = [(f"{k}", f"eq.{v}") for k, v in match_where.items()]
-        headers = {
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        }
         body = {"stream_url": f"web:{new_stream_url}"}
 
-        r = requests.patch(postgrest, headers=headers, params=params, json=body, timeout=20)
+        r = session.patch(postgrest_url, params=params, json=body, timeout=20)
         r.raise_for_status()
         updated_rows = r.json()
         
@@ -148,7 +132,7 @@ def supabase_update_stream(
         
         return True, f"Updated {len(updated_rows)} row(s)."
 
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         return False, f"Supabase update failed: {e}"
 
 # -----------------------------
@@ -184,11 +168,23 @@ def main():
                 print(f"[info] current URL still above threshold ({left}s left). No refresh needed.")
                 sys.exit(0)
 
+    # Create a session for efficient, repeated requests.
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*, text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Referer": "https://cdn.teleonce.com/en-vivo/",
+    })
+
     # --- NEW MULTI-STEP SCRAPING LOGIC ---
     try:
         # 3a) Fetch the main page and find the iframe URL
         print(f"[info] 1/5: Fetching main page: {args.page}")
-        html_main = fetch(args.page)
+        html_main = fetch(session, args.page)
         iframe_url = find_iframe_url(html_main)
         if not iframe_url:
             print("[error] Could not find restream.io iframe on the main page.")
@@ -197,7 +193,7 @@ def main():
 
         # 3b) Fetch the iframe's HTML to find the script URL
         print(f"[info] 2/5: Fetching iframe content...")
-        html_iframe = fetch(iframe_url)
+        html_iframe = fetch(session, iframe_url)
         js_url = find_js_url(html_iframe, iframe_url)
         if not js_url:
             print("[error] Could not find JS file URL in iframe HTML.")
@@ -206,7 +202,7 @@ def main():
         
         # 3c) Fetch the JS file to find the API path
         print(f"[info] 3/5: Fetching JS content...")
-        js_code = fetch(js_url)
+        js_code = fetch(session, js_url)
         api_url = find_api_path_in_js(js_code)
         if not api_url:
             print("[error] Could not find API URL in JS file.")
@@ -222,7 +218,7 @@ def main():
         full_api_url = f"{api_url}?token={token}"
         print(f"[info] 4/5: Calling final API: {full_api_url}")
         
-        api_data = fetch(full_api_url, is_json=True)
+        api_data = fetch(session, full_api_url, is_json=True)
         
         # 3e) Extract the m3u8 url from the API JSON response
         new_m3u8 = api_data.get("hlsUrl")
@@ -231,8 +227,9 @@ def main():
             sys.exit(0)
         print(f"[info] 5/5: Success! Found M3U8 URL.")
 
-    except Exception as e:
-        print(f"[error] Scraping process failed: {e}")
+    except requests.exceptions.RequestException as e:
+        # Graceful exit for network errors; do not fail the whole workflow
+        print(f"[error] Scraping process failed due to a network error: {e}")
         sys.exit(0)
 
 
@@ -261,7 +258,15 @@ def main():
         print("[error] --write given, but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set.")
         sys.exit(1)
 
+    session.headers.update({
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    })
+
     ok, msg = supabase_update_stream(
+        session=session,
         supabase_url=supabase_url,
         supabase_key=supabase_key,
         table=args.table,
@@ -270,12 +275,12 @@ def main():
     )
     if ok:
         print(f"[ok] {msg}")
-        sys.exit(0)
     else:
         print(f"[error] {msg}")
-        sys.exit(0)
+    
+    # Gracefully exit 0 even on supabase failure to be non-disruptive
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
-
 
