@@ -70,6 +70,7 @@ def fetch_html(url: str, timeout: int = 20) -> str:
             "Chrome/124.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
     }
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
@@ -83,12 +84,9 @@ def find_m3u8_in_html(html: str, base_url: str) -> Optional[str]:
     3) any tag with src/href endswith .m3u8 (Fallback)
     4) raw regex of absolute .m3u8 URLs (Fallback)
     """
-
     # 1) NEW STRATEGY: Parse the JS variable directly from the raw HTML.
-    # This is the primary method for this specific site.
     m_js = re.search(r"var videoSrc = '(https?://[^']+\.m3u8[^']*)';", html)
     if m_js:
-        # Found it in the script block
         return m_js.group(1)
 
     # --- Original strategies (kept as fallbacks just in case) ---
@@ -136,33 +134,23 @@ def supabase_update_stream(
             supabase_url += "/"
         postgrest = supabase_url + "rest/v1/" + table
 
-        # Build the ?filters for eq each field
-        params = []
-        for k, v in match_where.items():
-            # PostgREST eq filter
-            params.append((f"{k}", f"eq.{v}"))
-        params.append(("select", "id,stream_url"))
+        params = [(f"{k}", f"eq.{v}") for k, v in match_where.items()]
         headers = {
             "apikey": supabase_key,
             "Authorization": f"Bearer {supabase_key}",
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }
-
-        # 1) fetch matching rows
-        r = requests.get(postgrest, headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return False, "No rows matched your selector."
-
-        # 2) update those rows
-        patch_params = [(f"{k}", f"eq.{v}") for k, v in match_where.items()]
         body = {"stream_url": f"web:{new_stream_url}"}
 
-        r2 = requests.patch(postgrest, headers=headers, params=patch_params, json=body, timeout=20)
-        r2.raise_for_status()
-        return True, f"Updated {len(data)} row(s)."
+        r = requests.patch(postgrest, headers=headers, params=params, json=body, timeout=20)
+        r.raise_for_status()
+        updated_rows = r.json()
+        
+        if not updated_rows:
+             return False, "No rows matched your selector to update."
+        
+        return True, f"Updated {len(updated_rows)} row(s)."
 
     except Exception as e:
         return False, f"Supabase update failed: {e}"
@@ -210,6 +198,14 @@ def main():
 
     new_m3u8 = find_m3u8_in_html(html, args.page)
     if not new_m3u8:
+        # --- START OF MODIFICATION ---
+        # Add these lines to print the received HTML for debugging
+        print("[debug] The scraper failed to find the m3u8 URL.")
+        print("[debug] The HTML content received by the script was:")
+        print("------------------- HTML START -------------------")
+        print(html)
+        print("-------------------- HTML END --------------------")
+        # --- END OF MODIFICATION ---
         print("[info] No .m3u8 found on the page right now. Nothing to update.")
         sys.exit(0)
 
