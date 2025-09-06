@@ -94,12 +94,12 @@ def find_js_url(html: str, base_url: str) -> Optional[str]:
 
 def find_api_path_in_js(js_code: str) -> Optional[str]:
     """
-    Finds the API endpoint path in the javascript code.
-    This searches for the known path string directly, which is more robust.
+    Finds the API endpoint URL in the javascript code.
+    This searches for the full URL containing the API path.
     """
-    m = re.search(r'/api/v2/player/info', js_code)
+    m = re.search(r'"(https?://[^"]*/api/v2/player/info)"', js_code)
     if m:
-        return m.group(0)
+        return m.group(1)  # Return the full URL
     return None
 
 def extract_token(iframe_url: str) -> Optional[str]:
@@ -207,11 +207,11 @@ def main():
         # 3c) Fetch the JS file to find the API path
         print(f"[info] 3/5: Fetching JS content...")
         js_code = fetch(js_url)
-        api_path = find_api_path_in_js(js_code)
-        if not api_path:
-            print("[error] Could not find API path in JS file.")
+        api_url = find_api_path_in_js(js_code)
+        if not api_url:
+            print("[error] Could not find API URL in JS file.")
             sys.exit(0)
-        print(f"[info] 3/5: Found API path: {api_path}")
+        print(f"[info] 3/5: Found API URL: {api_url}")
         
         # 3d) Build the final API url and call it
         token = extract_token(iframe_url)
@@ -219,7 +219,6 @@ def main():
             print("[error] Could not extract token from iframe URL.")
             sys.exit(0)
         
-        api_url = urljoin("https://api.restream.io", api_path)
         full_api_url = f"{api_url}?token={token}"
         print(f"[info] 4/5: Calling final API: {full_api_url}")
         
@@ -278,4 +277,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
