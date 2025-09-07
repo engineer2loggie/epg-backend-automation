@@ -80,6 +80,8 @@ def main():
     ap = argparse.ArgumentParser(description="Refresh TeleOnce iframe URL.")
     ap.add_argument("--page", required=True, help="The page that embeds the player (e.g. https://cdn.teleonce.com/en-vivo/)")
     ap.add_argument("--current", help="Current stream URL from the database (optional).")
+    # The threshold argument is no longer used but is kept for compatibility with the calling workflow
+    ap.add_argument("--threshold", type=int, help="This argument is ignored.")
     ap.add_argument("--write", action="store_true", help="If set, write the refreshed URL back to Supabase.")
     ap.add_argument("--table", default="manual_tv_input", help="Supabase table to update.")
     ap.add_argument("--match-field", default="channel_name", help="Column used to match the row.")
