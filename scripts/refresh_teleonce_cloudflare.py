@@ -50,7 +50,6 @@ def supabase_get_stream(
         params.append(("select", "stream_url"))
         params.append(("limit", "1"))
         
-        # Use a clean header state for the Supabase request
         original_headers = session.headers.copy()
         session.headers.clear()
         session.headers.update({
@@ -62,15 +61,20 @@ def supabase_get_stream(
         r.raise_for_status()
         data = r.json()
         
-        session.headers = original_headers  # Restore original headers
+        session.headers = original_headers
 
         if not data:
             return None, "No row matched your selector."
         
-        return data[0].get("stream_url"), "Successfully fetched current URL."
+        url = data[0].get("stream_url")
+        # Strip "web:" prefix for comparison
+        if url and url.startswith("web:"):
+            url = url[4:]
+            
+        return url, "Successfully fetched current URL."
 
     except requests.exceptions.RequestException as e:
-        session.headers = original_headers # Restore original headers on error
+        session.headers = original_headers
         return None, f"Supabase fetch failed: {e}"
 
 
@@ -82,16 +86,16 @@ def supabase_update_stream(
     match_where: dict,
     new_stream_url: str,
 ) -> Tuple[bool, str]:
-    """Updates a stream_url in Supabase."""
+    """Updates a stream_url in Supabase, adding the 'web:' prefix."""
     try:
         if not supabase_url.endswith("/"):
             supabase_url += "/"
         postgrest_url = supabase_url + "rest/v1/" + table
 
         params = [(f"{k}", f"eq.{v}") for k, v in match_where.items()]
-        body = {"stream_url": new_stream_url}
+        # Add the "web:" prefix back to maintain DB format
+        body = {"stream_url": f"web:{new_stream_url}"}
 
-        # Use a clean header state for the Supabase request
         original_headers = session.headers.copy()
         session.headers.clear()
         session.headers.update({
@@ -105,7 +109,7 @@ def supabase_update_stream(
         r.raise_for_status()
         updated_rows = r.json()
         
-        session.headers = original_headers  # Restore original headers
+        session.headers = original_headers
 
         if not updated_rows:
              return False, "No rows matched your selector to update."
@@ -113,7 +117,7 @@ def supabase_update_stream(
         return True, f"Updated {len(updated_rows)} row(s)."
 
     except requests.exceptions.RequestException as e:
-        session.headers = original_headers  # Restore original headers on error
+        session.headers = original_headers
         return False, f"Supabase update failed: {e}"
 
 # -----------------------------
@@ -127,8 +131,7 @@ def main():
     ap.add_argument("--table", default="manual_tv_input", help="Supabase table to update.")
     ap.add_argument("--match-field", default="channel_name", help="Column used to match the row.")
     ap.add_argument("--match-value", default="Tele Once", help="Value used to match the row.")
-    # The threshold argument is no longer used but is kept for compatibility
-    ap.add_argument("--threshold", type=int, help="This argument is ignored.")
+    ap.add_argument("--threshold", type=int, help="This argument is ignored for compatibility.")
     args = ap.parse_args()
 
     session = requests.Session()
@@ -139,7 +142,6 @@ def main():
         )
     })
 
-    # Get current URL from Supabase first
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -156,11 +158,10 @@ def main():
     )
     print(f"[info] {msg}")
     if current_url:
-        print(f"[info] Current DB URL: {current_url}")
+        print(f"[info] Current DB URL (cleaned): {current_url}")
     else:
         print("[warn] Could not fetch current URL from DB.")
 
-    # Scrape the new URL
     new_iframe_url = None
     try:
         print(f"[info] Fetching main page: {args.page}")
@@ -177,7 +178,6 @@ def main():
         print(f"[error] Scraping process failed: {e}")
         sys.exit(0)
 
-    # Compare scraped URL vs current URL from DB
     if current_url and new_iframe_url == current_url:
         print("[info] Scraped URL is the same as DB URL. Nothing to update.")
         sys.exit(0)
@@ -189,7 +189,6 @@ def main():
         print(new_iframe_url)
         sys.exit(0)
 
-    # Write to Supabase if requested
     ok, msg = supabase_update_stream(
         session=session,
         supabase_url=supabase_url,
