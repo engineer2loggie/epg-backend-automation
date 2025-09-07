@@ -127,7 +127,6 @@ def supabase_update_stream(
 def main():
     ap = argparse.ArgumentParser(description="Refresh TeleOnce iframe URL.")
     ap.add_argument("--page", required=True, help="The page that embeds the player (e.g. https://cdn.teleonce.com/en-vivo/)")
-    ap.add_argument("--write", action="store_true", help="If set, write the refreshed URL back to Supabase.")
     ap.add_argument("--table", default="manual_tv_input", help="Supabase table to update.")
     ap.add_argument("--match-field", default="channel_name", help="Column used to match the row.")
     ap.add_argument("--match-value", default="Tele Once", help="Value used to match the row.")
@@ -183,12 +182,7 @@ def main():
         print("[info] Scraped URL is the same as DB URL. Nothing to update.")
         sys.exit(0)
     
-    print("[info] New or changed URL detected.")
-
-    if not args.write:
-        print("[info] Dry-run (no --write). New URL is:")
-        print(new_iframe_url)
-        sys.exit(0)
+    print("[info] New or changed URL detected. Writing to DB...")
 
     ok, msg = supabase_update_stream(
         session=session,
