@@ -127,6 +127,8 @@ def main():
     ap.add_argument("--table", default="manual_tv_input", help="Supabase table to update.")
     ap.add_argument("--match-field", default="channel_name", help="Column used to match the row.")
     ap.add_argument("--match-value", default="Tele Once", help="Value used to match the row.")
+    # The threshold argument is no longer used but is kept for compatibility
+    ap.add_argument("--threshold", type=int, help="This argument is ignored.")
     args = ap.parse_args()
 
     session = requests.Session()
